@@ -5,9 +5,8 @@
 //! 行缺失时用命令携带的 baseline 播种（leader 从本节点 `account_usage` 缓存取值），
 //! 因此所有副本按同一个值初始化，不依赖各自缓存。
 
-use super::ControlWrite;
 use crate::raft::command::{ControlCommand, ControlResponse, valid_quota_ledger_args};
-use xl_store::control_store::account::AccountTxn;
+use xl_store::control_store::{ControlError, ControlTxn};
 
 enum Mode {
     Reserve,
@@ -16,44 +15,35 @@ enum Mode {
 }
 
 async fn load_ledger(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     account: &str,
-) -> Result<Option<(i64, i64)>, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .account_ledger(account)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+) -> Result<Option<(i64, i64)>, ControlError> {
+    txn.account_ledger(account).await
 }
 
 async fn load_limits(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     account: &str,
-) -> Result<(Option<i64>, Option<i64>), sqlx::Error> {
-    let row = crate::control_store::SqliteControlTxn::new(cw.conn())
-        .account_hard_limits(account)
-        .await
-        .map_err(crate::control_store::to_sqlx)?;
+) -> Result<(Option<i64>, Option<i64>), ControlError> {
+    let row = txn.account_hard_limits(account).await?;
     let (bytes, objects) = row.unwrap_or((None, None));
     Ok((bytes.filter(|q| *q >= 0), objects.filter(|q| *q >= 0)))
 }
 
 async fn write_ledger(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     account: &str,
     bytes: i64,
     objects: i64,
-) -> Result<(), sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .account_ledger_upsert(account, bytes, objects)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+) -> Result<(), ControlError> {
+    txn.account_ledger_upsert(account, bytes, objects).await
 }
 
 /// 账本命令入口；非本组命令返回 `None`。
 pub(super) async fn apply(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     cmd: &ControlCommand,
-) -> Result<Option<ControlResponse>, sqlx::Error> {
+) -> Result<Option<ControlResponse>, ControlError> {
     let (account, bytes, objects, baseline_bytes, baseline_objects, mode) = match cmd {
         ControlCommand::AccountUsageReserve {
             account,
@@ -102,13 +92,13 @@ pub(super) async fn apply(
     if !valid_quota_ledger_args(account, bytes, objects, baseline_bytes, baseline_objects) {
         return Ok(Some(ControlResponse::Invalid));
     }
-    let (mut used, mut count) = match load_ledger(cw, account).await? {
+    let (mut used, mut count) = match load_ledger(txn, account).await? {
         Some(v) => v,
         None => (baseline_bytes, baseline_objects),
     };
     match mode {
         Mode::Reserve => {
-            let (limit_bytes, limit_objects) = load_limits(cw, account).await?;
+            let (limit_bytes, limit_objects) = load_limits(txn, account).await?;
             used = used.saturating_add(bytes).max(0);
             count = count.saturating_add(objects).max(0);
             if limit_bytes.is_some_and(|q| used > q) || limit_objects.is_some_and(|q| count > q) {
@@ -125,7 +115,7 @@ pub(super) async fn apply(
             count = count.saturating_add(objects).max(0);
         }
     }
-    write_ledger(cw, account, used, count).await?;
+    write_ledger(txn, account, used, count).await?;
     Ok(Some(ControlResponse::Ok))
 }
 
@@ -154,14 +144,14 @@ mod tests {
             baseline_bytes: 0,
             baseline_objects: 0,
         };
-        let mut cw = super::super::control_tx(&mut conn);
+        let mut txn = crate::control_store::SqliteControlTxn::new(&mut conn);
         assert_eq!(
-            apply(&mut cw, &reserve(6, 1)).await.unwrap(),
+            apply(&mut txn, &reserve(6, 1)).await.unwrap(),
             Some(ControlResponse::Ok)
         );
         // 并发边界：第二次同量预留超限 → Invalid，账本不变。
         assert_eq!(
-            apply(&mut cw, &reserve(5, 1)).await.unwrap(),
+            apply(&mut txn, &reserve(5, 1)).await.unwrap(),
             Some(ControlResponse::Invalid)
         );
         let release = ControlCommand::AccountUsageRelease {
@@ -172,7 +162,7 @@ mod tests {
             baseline_objects: 0,
         };
         assert_eq!(
-            apply(&mut cw, &release).await.unwrap(),
+            apply(&mut txn, &release).await.unwrap(),
             Some(ControlResponse::Ok)
         );
         let adjust = ControlCommand::AccountUsageAdjust {
@@ -183,11 +173,11 @@ mod tests {
             baseline_objects: 0,
         };
         assert_eq!(
-            apply(&mut cw, &adjust).await.unwrap(),
+            apply(&mut txn, &adjust).await.unwrap(),
             Some(ControlResponse::Ok)
         );
         assert_eq!(
-            load_ledger(&mut cw, "a1").await.unwrap(),
+            load_ledger(&mut txn, "a1").await.unwrap(),
             Some((0, 0)),
             "release/adjust saturate at zero"
         );

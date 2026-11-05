@@ -21,6 +21,7 @@ pub mod identity;
 pub mod membership;
 pub mod metrics;
 pub mod network;
+pub(crate) mod object_sm;
 pub mod repair;
 pub mod routes;
 pub mod runstate;

@@ -26,11 +26,6 @@ use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::SqliteConnection;
-use xl_store::control_store::account::{AccountSnapshotTxn, AccountTxn};
-use xl_store::control_store::bucket::BucketSnapshotTxn;
-use xl_store::control_store::iam::IamSnapshotTxn;
-use xl_store::control_store::inventory::InventoryTxn;
-use xl_store::control_store::lifecycle::LifecycleTxn;
 use xl_store::control_store::{ControlError, ControlTxn, OlapConfigEntry};
 
 use super::compat::{
@@ -193,110 +188,61 @@ fn control_data_err(e: ControlError) -> DataError {
     }
 }
 
-/// 单事务读取 11 张复制表（+ canonical marker 之后的 level-3 账户两表；调用方负责
+/// 单事务读取 11 张复制表（+ canonical 之后 level-3 账户等扩展行；调用方负责
 /// 事务；行序 = checksum/自然键确定性来源）。
-// 逐字段读取各自 reborrow conn；合成一个 struct 表达式反而不可读。
 #[allow(clippy::field_reassign_with_default)]
-pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, DataError> {
+pub(crate) async fn read_txn(
+    txn: &mut dyn ControlTxn,
+    canonical: bool,
+) -> Result<ControlData, ControlError> {
     let mut data = ControlData::default();
-
-    data.users = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.snapshot_users().await.map_err(control_data_err)?
-    };
-
-    data.access_keys = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.snapshot_access_keys().await.map_err(control_data_err)?
-    };
-
-    data.permissions = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.snapshot_permissions().await.map_err(control_data_err)?
-    };
-
-    data.buckets = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.buckets().await.map_err(control_data_err)?
-    };
-
-    data.bucket_policies = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.bucket_policies().await.map_err(control_data_err)?
-    };
-
-    data.lifecycle_rules = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.all_lifecycle_rules().await.map_err(control_data_err)?
-    };
-
-    data.event_configs = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.event_configs().await.map_err(control_data_err)?
-    };
-
-    data.replication_rules = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.replication_rules().await.map_err(control_data_err)?
-    };
-
-    data.access_points = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.access_points().await.map_err(control_data_err)?
-    };
-
-    data.olap_configs = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.olap_configs()
-            .await
-            .map_err(control_data_err)?
-            .into_iter()
-            .map(|e| OlapConfigRow {
-                access_point: e.access_point,
-                kind: e.kind,
-                endpoint: e.endpoint,
-                module_b64: e
-                    .module
-                    .map(|m| base64::engine::general_purpose::STANDARD.encode(m)),
-                module_sha256: e.module_sha256,
-                timeout_ms: e.timeout_ms,
-                max_response_bytes: e.max_response_bytes,
-                updated_at: e.updated_at,
-            })
-            .collect()
-    };
-
-    data.inventory_configs = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        txn.inventory_configs().await.map_err(control_data_err)?
-    };
+    data.users = txn.snapshot_users().await?;
+    data.access_keys = txn.snapshot_access_keys().await?;
+    data.permissions = txn.snapshot_permissions().await?;
+    data.buckets = txn.buckets().await?;
+    data.bucket_policies = txn.bucket_policies().await?;
+    data.lifecycle_rules = txn.all_lifecycle_rules().await?;
+    data.event_configs = txn.event_configs().await?;
+    data.replication_rules = txn.replication_rules().await?;
+    data.access_points = txn.access_points().await?;
+    data.olap_configs = txn
+        .olap_configs()
+        .await?
+        .into_iter()
+        .map(|e| OlapConfigRow {
+            access_point: e.access_point,
+            kind: e.kind,
+            endpoint: e.endpoint,
+            module_b64: e
+                .module
+                .map(|m| base64::engine::general_purpose::STANDARD.encode(m)),
+            module_sha256: e.module_sha256,
+            timeout_ms: e.timeout_ms,
+            max_response_bytes: e.max_response_bytes,
+            updated_at: e.updated_at,
+        })
+        .collect();
+    data.inventory_configs = txn.inventory_configs().await?;
 
     // 账户两表只在 canonical marker 之后进入快照：marker 之前它们可能是节点本地的
     // uid 派生行，复制出去会让其它节点按本地 id 解释（跨节点不可解释）。
-    if accounts_canonical(conn).await? {
-        data.accounts = {
-            let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-            txn.snapshot_accounts().await.map_err(control_data_err)?
-        };
-        data.account_members = {
-            let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-            txn.snapshot_account_members()
-                .await
-                .map_err(control_data_err)?
-        };
-        data.vpc_endpoints = crate::control_store::SqliteControlTxn::new(&mut *conn)
-            .vpc_endpoints()
-            .await
-            .map_err(|e| DataError::Format(format!("control store: {e}")))?;
-        data.account_usage_ledger = {
-            let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-            txn.snapshot_account_usage_ledger()
-                .await
-                .map_err(control_data_err)?
-        };
+    if canonical {
+        data.accounts = txn.snapshot_accounts().await?;
+        data.account_members = txn.snapshot_account_members().await?;
+        data.vpc_endpoints = txn.vpc_endpoints().await?;
+        data.account_usage_ledger = txn.snapshot_account_usage_ledger().await?;
     }
-
     Ok(data)
+}
+
+/// SQLite 包装：canonical marker（`schema_meta.accounts_canonical_v1`）决定账户
+/// 两表是否入快照。
+pub(crate) async fn read_tx(conn: &mut SqliteConnection) -> Result<ControlData, DataError> {
+    let canonical = accounts_canonical(conn).await?;
+    let mut txn = crate::control_store::SqliteControlTxn::new(conn);
+    read_txn(&mut txn, canonical)
+        .await
+        .map_err(control_data_err)
 }
 
 /// 账户表是否已规范化（Task 1 的 `schema_meta.accounts_canonical_v1`）。
@@ -363,14 +309,14 @@ fn report_of(data: &ControlData) -> InstallReport {
 /// FK 安全顺序：先删引用 users 的从属行/目标独有桶，再把保留桶的 owner 置 NULL，
 /// 然后才删 users；插入 users 后按 username 重建 id 映射。桶用 upsert 保留目标已有的
 /// `set_id`（ruling #5），新桶由 DEFAULT 0 落库。
-pub(crate) async fn install_tx(
-    conn: &mut SqliteConnection,
+pub(crate) async fn install_rows(
+    txn: &mut dyn ControlTxn,
     data: &ControlData,
     ctx: &InstallCtx,
-) -> Result<InstallReport, DataError> {
+) -> Result<InstallReport, ControlError> {
     // 混合版本误用：level<3 安装不可能携带账户行；在任何写之前拒绝。
     if !ctx.canonical && (!data.accounts.is_empty() || !data.account_members.is_empty()) {
-        return Err(DataError::Format(
+        return Err(ControlError::Invalid(
             "snapshot carries level-3 account rows but install is not canonical (feature level < 3)"
                 .into(),
         ));
@@ -383,7 +329,7 @@ pub(crate) async fn install_tx(
                 || !matches!(e.state.as_str(), "active" | "disabled")
         })
     {
-        return Err(DataError::Format(
+        return Err(ControlError::Invalid(
             "snapshot carries invalid level-8 vpc_endpoint rows".into(),
         ));
     }
@@ -392,7 +338,7 @@ pub(crate) async fn install_tx(
         .iter()
         .any(|r| r.account_id.trim().is_empty() || r.used_bytes < 0 || r.object_count < 0)
     {
-        return Err(DataError::Format(
+        return Err(ControlError::Invalid(
             "snapshot carries invalid level-9 account_usage_ledger rows".into(),
         ));
     }
@@ -402,7 +348,10 @@ pub(crate) async fn install_tx(
         match &ap.owner {
             OwnerRef::Admin => {
                 if ctx.admin_id.is_none() && !ctx.witness {
-                    return Err(DataError::NoAdminUser);
+                    return Err(ControlError::Invalid(
+                        "no local admin user (admin-owned access point/inventory requires one)"
+                            .into(),
+                    ));
                 }
             }
             OwnerRef::User(name) => {
@@ -411,7 +360,7 @@ pub(crate) async fn install_tx(
                     .iter()
                     .any(|u| u.username.as_str() == name.as_str())
                 {
-                    return Err(DataError::Format(format!(
+                    return Err(ControlError::Invalid(format!(
                         "access point owner {name} not in snapshot"
                     )));
                 }
@@ -423,7 +372,10 @@ pub(crate) async fn install_tx(
         match &inv.owner {
             OwnerRef::Admin => {
                 if ctx.admin_id.is_none() && !ctx.witness {
-                    return Err(DataError::NoAdminUser);
+                    return Err(ControlError::Invalid(
+                        "no local admin user (admin-owned access point/inventory requires one)"
+                            .into(),
+                    ));
                 }
             }
             OwnerRef::User(name) => {
@@ -432,7 +384,7 @@ pub(crate) async fn install_tx(
                     .iter()
                     .any(|u| u.username.as_str() == name.as_str())
                 {
-                    return Err(DataError::Format(format!(
+                    return Err(ControlError::Invalid(format!(
                         "inventory owner {name} not in snapshot"
                     )));
                 }
@@ -440,143 +392,80 @@ pub(crate) async fn install_tx(
         }
     }
     // 1. AP → olap（olap_configs.access_point 外键）。
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_access_points(&[])
-        .await
-        .map_err(control_data_err)?;
+    txn.replace_access_points(&[]).await?;
     // 3. 权限（引用 users）。
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .permissions_clear()
-        .await
-        .map_err(control_data_err)?;
+    txn.permissions_clear().await?;
     // 3b. 账户成员/账户（FK → users/accounts；须先于删 users）。marker 不在此清除：
     // 规范化是单向的（低级别安装不得回退 level-3 已冻结的账户语义）。
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_accounts(&[], &[], false)
-        .await
-        .map_err(control_data_err)?;
+    txn.replace_accounts(&[], &[], false).await?;
     // 4. 目标独有桶（引用 users，须先于删 users）；保留桶 owner 先置 NULL。
     let wanted: Vec<String> = data.buckets.iter().map(|b| b.name.clone()).collect();
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .bucket_install_prepare(&wanted)
-        .await
-        .map_err(control_data_err)?;
+    txn.bucket_install_prepare(&wanted).await?;
     // 5. 非管理员属主 AK 全清（long-term + session/STS；管理员本地 AK 保留）。
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .access_keys_delete_non_admin()
-        .await
-        .map_err(control_data_err)?;
-    // 6. 复制用户（管理员行不动）。`uploads.owner_id` 有 FK 指向 users（本地表），
-    // 与 `delete_user` 同口径先置 NULL，否则有历史上传行的库安装会 FK 失败。
-    sqlx::query(
-        "UPDATE uploads SET owner_id = NULL \
-         WHERE owner_id IN (SELECT id FROM users WHERE is_admin = 0)",
-    )
-    .execute(&mut *conn)
-    .await
-    .map_err(sql)?;
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .users_delete_non_admin()
-        .await
-        .map_err(control_data_err)?;
+    txn.access_keys_delete_non_admin().await?;
+    // 6. 复制用户（管理员行不动）。uploads FK 清空由 SQLite 包装层在同一事务内
+    // 先做；对象后端的本地上传在根 CAS 之后清（D3）。
+    txn.users_delete_non_admin().await?;
 
     // 7. 插入用户并按 username 重建映射。
     let mut ids: HashMap<&str, i64> = HashMap::with_capacity(data.users.len());
     for u in &data.users {
-        let id = crate::control_store::SqliteControlTxn::new(&mut *conn)
-            .user_install(u)
-            .await
-            .map_err(control_data_err)?;
+        let id = txn.user_install(u).await?;
         ids.insert(u.username.as_str(), id);
     }
-    let user_id = |name: &str, what: &str| -> Result<i64, DataError> {
+    let user_id = |name: &str, what: &str| -> Result<i64, ControlError> {
         ids.get(name)
             .copied()
-            .ok_or_else(|| DataError::Format(format!("{what} owner {name} not in snapshot")))
+            .ok_or_else(|| ControlError::Invalid(format!("{what} owner {name} not in snapshot")))
     };
 
     // 7b. 账户两表（level 3）：成员/admin 按 username 映射到本地非管理员 id。
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_accounts(&data.accounts, &data.account_members, ctx.canonical)
-        .await
-        .map_err(control_data_err)?;
+    txn.replace_accounts(&data.accounts, &data.account_members, ctx.canonical)
+        .await?;
 
     // 7c. 动态 VPC 端点（level 8）：无本地 id，account_id 是稳定字符串。
     // 整表替换；事务边界由调用方持有（store 不 begin/commit）。
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_vpc_endpoints(&data.vpc_endpoints)
+    txn.replace_vpc_endpoints(&data.vpc_endpoints)
         .await
-        .map_err(|e| DataError::Format(format!("control store: {e}")))?;
+        .map_err(|e| ControlError::Invalid(format!("control store: {e}")))?;
 
     // 7d. 账户用量账本（level 9）：整表替换；行 key 是稳定账户 id。
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .account_ledger_clear()
-        .await
-        .map_err(control_data_err)?;
+    txn.account_ledger_clear().await?;
     for r in &data.account_usage_ledger {
-        crate::control_store::SqliteControlTxn::new(&mut *conn)
-            .account_ledger_upsert(&r.account_id, r.used_bytes, r.object_count)
-            .await
-            .map_err(control_data_err)?;
+        txn.account_ledger_upsert(&r.account_id, r.used_bytes, r.object_count)
+            .await?;
     }
 
     // 8. AK（快照只含 long-term parent_ak=NULL；按 username 映射本地 id）。
     for k in &data.access_keys {
         let user = user_id(&k.username, "access key")?;
-        crate::control_store::SqliteControlTxn::new(&mut *conn)
-            .access_key_install(k, user)
-            .await
-            .map_err(control_data_err)?;
+        txn.access_key_install(k, user).await?;
     }
 
     // 9. 权限（三档位原样）；目标上管理员目标的残留行清掉。
     for p in &data.permissions {
         let user = user_id(&p.username, "permission")?;
-        crate::control_store::SqliteControlTxn::new(&mut *conn)
-            .permission_install(p, user)
-            .await
-            .map_err(control_data_err)?;
+        txn.permission_install(p, user).await?;
     }
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .permissions_delete_admins()
-        .await
-        .map_err(control_data_err)?;
+    txn.permissions_delete_admins().await?;
 
     // 10. 桶：保留目标 set_id（UPDATE 列不含 set_id）。
     for b in &data.buckets {
-        crate::control_store::SqliteControlTxn::new(&mut *conn)
-            .bucket_upsert_install(b)
-            .await
-            .map_err(control_data_err)?;
+        txn.bucket_upsert_install(b).await?;
     }
 
     // 11. AP（txn 按自然键解析本地 id）/ inventory：Admin 属主 = 本地管理员 id（witness 0）。
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_access_points(&data.access_points)
-        .await
-        .map_err(control_data_err)?;
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_inventory_configs(&data.inventory_configs)
-        .await
-        .map_err(control_data_err)?;
+    txn.replace_access_points(&data.access_points).await?;
+    txn.replace_inventory_configs(&data.inventory_configs)
+        .await?;
 
     // 12. 桶级配置（桶已就位）。
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_bucket_policies(&data.bucket_policies)
-        .await
-        .map_err(control_data_err)?;
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_all_lifecycle_rules(&data.lifecycle_rules)
-        .await
-        .map_err(control_data_err)?;
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_event_configs(&data.event_configs)
-        .await
-        .map_err(control_data_err)?;
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_replication_rules(&data.replication_rules)
-        .await
-        .map_err(control_data_err)?;
+    txn.replace_bucket_policies(&data.bucket_policies).await?;
+    txn.replace_all_lifecycle_rules(&data.lifecycle_rules)
+        .await?;
+    txn.replace_event_configs(&data.event_configs).await?;
+    txn.replace_replication_rules(&data.replication_rules)
+        .await?;
     let olap_entries: Vec<OlapConfigEntry> = data
         .olap_configs
         .iter()
@@ -586,7 +475,7 @@ pub(crate) async fn install_tx(
                 Some(b64) => Some(
                     base64::engine::general_purpose::STANDARD
                         .decode(b64)
-                        .map_err(|e| DataError::Format(format!("olap module base64: {e}")))?,
+                        .map_err(|e| ControlError::Invalid(format!("olap module base64: {e}")))?,
                 ),
             };
             Ok(OlapConfigEntry {
@@ -600,19 +489,34 @@ pub(crate) async fn install_tx(
                 updated_at: o.updated_at,
             })
         })
-        .collect::<Result<Vec<_>, DataError>>()?;
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .replace_olap_configs(&olap_entries)
-        .await
-        .map_err(control_data_err)?;
+        .collect::<Result<Vec<_>, ControlError>>()?;
+    txn.replace_olap_configs(&olap_entries).await?;
 
     // 13. 孤儿 session/STS AK（属主已被替换而残留）。
-    crate::control_store::SqliteControlTxn::new(&mut *conn)
-        .access_keys_delete_orphan_sessions()
-        .await
-        .map_err(control_data_err)?;
+    txn.access_keys_delete_orphan_sessions().await?;
 
     Ok(report_of(data))
+}
+
+/// SQLite 包装：`uploads.owner_id` 有 FK 指向 users（本地表），安装任何数据前
+/// 先把非管理员上传属主置 NULL；随后由 [`install_rows`] 做整表替换。调用方
+/// 持有事务，校验失败时整体回滚。
+pub(crate) async fn install_tx(
+    conn: &mut SqliteConnection,
+    data: &ControlData,
+    ctx: &InstallCtx,
+) -> Result<InstallReport, DataError> {
+    sqlx::query(
+        "UPDATE uploads SET owner_id = NULL \
+         WHERE owner_id IN (SELECT id FROM users WHERE is_admin = 0)",
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(sql)?;
+    let mut txn = crate::control_store::SqliteControlTxn::new(conn);
+    install_rows(&mut txn, data, ctx)
+        .await
+        .map_err(control_data_err)
 }
 
 /// V3 扩展区条目：名字即命名空间（`[a-z0-9._-]{1,64}`，如 `m8.runstate`），载荷是

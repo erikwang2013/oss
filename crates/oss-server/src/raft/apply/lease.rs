@@ -5,10 +5,10 @@
 //! 换 term 必须等旧租约过期才允许接管。任何不合法转换 → `Conflict` 零写入。
 //! 租约 term 单调，旧 term 的迟到命令永远不会覆盖新 leader 的租约。
 
-use super::{ControlWrite, invariant};
+use super::invariant;
 use crate::raft::command::ControlResponse;
 use crate::raft::runstate::ScheduleLeaseRow;
-use xl_store::control_store::jobs::JobTxn;
+use xl_store::control_store::{ControlError, ControlTxn};
 
 /// 当前行 + 日志行的确定性校验；逐字段相同的重复 apply 是 no-op。
 pub(crate) fn lease_row_ok(
@@ -62,31 +62,25 @@ pub(crate) fn lease_row_ok(
     Ok(())
 }
 
-async fn current(cw: &mut ControlWrite<'_>) -> Result<Option<ScheduleLeaseRow>, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .schedule_lease()
-        .await
-        .map_err(crate::control_store::to_sqlx)
+async fn current(txn: &mut dyn ControlTxn) -> Result<Option<ScheduleLeaseRow>, ControlError> {
+    txn.schedule_lease().await
 }
 
-async fn upsert(cw: &mut ControlWrite<'_>, lease: &ScheduleLeaseRow) -> Result<u64, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .schedule_lease_upsert(lease)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+async fn upsert(txn: &mut dyn ControlTxn, lease: &ScheduleLeaseRow) -> Result<u64, ControlError> {
+    txn.schedule_lease_upsert(lease).await
 }
 
 /// 只读预检 → 整行 upsert。预检失败 = 零写入的 `Conflict`。
 pub(crate) async fn apply(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     lease: &ScheduleLeaseRow,
     now: i64,
-) -> Result<ControlResponse, sqlx::Error> {
-    let cur = current(cw).await?;
+) -> Result<ControlResponse, ControlError> {
+    let cur = current(txn).await?;
     if lease_row_ok(cur.as_ref(), lease, now).is_err() {
         return Ok(ControlResponse::Conflict);
     }
-    if upsert(cw, lease).await? != 1 {
+    if upsert(txn, lease).await? != 1 {
         return Err(invariant("schedule_lease upsert affected 0 rows".into()));
     }
     Ok(ControlResponse::Ok)

@@ -4,11 +4,9 @@
 //! 账户表进 OSSCTL3 快照时按 username 规范化（`ControlData`），所以这里绝不把 uid
 //! 写进命令；apply 在本地解析 username → uid。
 
-use super::ControlWrite;
 use crate::raft::command::{ControlCommand, ControlResponse};
 use xl_s3::access::{LEGACY_ACCOUNT, valid_account_id};
-use xl_store::control_store::account::AccountTxn;
-use xl_store::control_store::iam::IamTxn;
+use xl_store::control_store::{ControlError, ControlTxn};
 
 fn valid_account_name(name: &str) -> bool {
     let trimmed = name.trim();
@@ -20,49 +18,37 @@ fn valid_role(role: &str) -> bool {
 }
 
 async fn account_status(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     id: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .account_status(id)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+) -> Result<Option<String>, ControlError> {
+    txn.account_status(id).await
 }
 
 /// 非全局管理员的本地 uid（全局管理员不是任何账户的成员）。
 async fn non_admin_uid(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     username: &str,
-) -> Result<Option<i64>, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .user_uid_non_admin(username)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+) -> Result<Option<i64>, ControlError> {
+    txn.user_uid_non_admin(username).await
 }
 
 async fn member_uid(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     account_id: &str,
     username: &str,
-) -> Result<Option<i64>, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .member_uid(account_id, username)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+) -> Result<Option<i64>, ControlError> {
+    txn.member_uid(account_id, username).await
 }
 
-async fn account_bucket_count(cw: &mut ControlWrite<'_>, id: &str) -> Result<i64, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .account_bucket_count(id)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+async fn account_bucket_count(txn: &mut dyn ControlTxn, id: &str) -> Result<i64, ControlError> {
+    txn.account_bucket_count(id).await
 }
 
 /// 账户/成员命令的 apply 入口；非本组命令返回 `None`。
 pub(super) async fn apply(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     cmd: &ControlCommand,
-) -> Result<Option<ControlResponse>, sqlx::Error> {
+) -> Result<Option<ControlResponse>, ControlError> {
     let response = match cmd {
         ControlCommand::AccountCreate {
             id,
@@ -77,10 +63,9 @@ pub(super) async fn apply(
             {
                 ControlResponse::Invalid
             } else {
-                let inserted = crate::control_store::SqliteControlTxn::new(cw.conn())
+                let inserted = txn
                     .account_insert_if_absent(id, name, *bucket_quota, *created_at, *created_at)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                    .await?;
                 if inserted {
                     ControlResponse::Ok
                 } else {
@@ -103,22 +88,16 @@ pub(super) async fn apply(
             } else {
                 let mut missing = false;
                 if let Some(name) = name {
-                    missing = !crate::control_store::SqliteControlTxn::new(cw.conn())
-                        .account_set_name(id, name, *updated_at)
-                        .await
-                        .map_err(crate::control_store::to_sqlx)?;
+                    missing = !txn.account_set_name(id, name, *updated_at).await?;
                 }
                 if missing {
                     ControlResponse::NotFound
                 } else if let Some(status) = status {
                     // 同 db.rs：停用是原子条件更新，含在册全局管理员的账户拒绝。
-                    let changed = crate::control_store::SqliteControlTxn::new(cw.conn())
-                        .account_set_status(id, status, *updated_at)
-                        .await
-                        .map_err(crate::control_store::to_sqlx)?;
+                    let changed = txn.account_set_status(id, status, *updated_at).await?;
                     if changed {
                         ControlResponse::Ok
-                    } else if account_status(cw, id).await?.is_some() {
+                    } else if account_status(txn, id).await?.is_some() {
                         ControlResponse::Conflict
                     } else {
                         ControlResponse::NotFound
@@ -136,10 +115,9 @@ pub(super) async fn apply(
             if bucket_quota.is_some_and(|q| q < 0) {
                 ControlResponse::Invalid
             } else {
-                let changed = crate::control_store::SqliteControlTxn::new(cw.conn())
+                let changed = txn
                     .account_set_bucket_quota(id, *bucket_quota, *updated_at)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                    .await?;
                 if changed {
                     ControlResponse::Ok
                 } else {
@@ -155,10 +133,9 @@ pub(super) async fn apply(
             if soft_byte_quota.is_some_and(|q| q < 0) {
                 ControlResponse::Invalid
             } else {
-                let changed = crate::control_store::SqliteControlTxn::new(cw.conn())
+                let changed = txn
                     .account_set_soft_quota(id, *soft_byte_quota, *updated_at)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                    .await?;
                 if changed {
                     ControlResponse::Ok
                 } else {
@@ -175,10 +152,9 @@ pub(super) async fn apply(
             if hard_byte_quota.is_some_and(|q| q < 0) || object_quota.is_some_and(|q| q < 0) {
                 ControlResponse::Invalid
             } else {
-                let changed = crate::control_store::SqliteControlTxn::new(cw.conn())
+                let changed = txn
                     .account_set_hard_limits(id, *hard_byte_quota, *object_quota, *updated_at)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                    .await?;
                 if changed {
                     ControlResponse::Ok
                 } else {
@@ -189,20 +165,14 @@ pub(super) async fn apply(
         ControlCommand::AccountDelete { id } => {
             if id == LEGACY_ACCOUNT {
                 ControlResponse::Invalid
-            } else if account_status(cw, id).await?.is_none() {
+            } else if account_status(txn, id).await?.is_none() {
                 ControlResponse::NotFound
             } else {
-                let members = crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .account_member_count(id)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
-                if members != 0 || account_bucket_count(cw, id).await? != 0 {
+                let members = txn.account_member_count(id).await?;
+                if members != 0 || account_bucket_count(txn, id).await? != 0 {
                     ControlResponse::Conflict
                 } else {
-                    crate::control_store::SqliteControlTxn::new(cw.conn())
-                        .account_delete(id)
-                        .await
-                        .map_err(crate::control_store::to_sqlx)?;
+                    txn.account_delete(id).await?;
                     ControlResponse::Ok
                 }
             }
@@ -216,20 +186,16 @@ pub(super) async fn apply(
             if account_id == LEGACY_ACCOUNT || !valid_role(role) {
                 ControlResponse::Invalid
             } else {
-                match account_status(cw, account_id).await? {
+                match account_status(txn, account_id).await? {
                     None => ControlResponse::NotFound,
                     Some(s) if s != "active" => ControlResponse::Invalid,
-                    Some(_) => match non_admin_uid(cw, username).await? {
+                    Some(_) => match non_admin_uid(txn, username).await? {
                         None => ControlResponse::NotFound,
                         Some(uid) => {
-                            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
                             txn.account_member_upsert(account_id, uid, role, *created_at)
-                                .await
-                                .map_err(crate::control_store::to_sqlx)?;
+                                .await?;
                             if role == "admin" {
-                                txn.account_set_admin_if_unset(account_id, uid)
-                                    .await
-                                    .map_err(crate::control_store::to_sqlx)?;
+                                txn.account_set_admin_if_unset(account_id, uid).await?;
                             }
                             ControlResponse::Ok
                         }
@@ -241,14 +207,10 @@ pub(super) async fn apply(
             account_id,
             username,
             active,
-        } => match member_uid(cw, account_id, username).await? {
+        } => match member_uid(txn, account_id, username).await? {
             None => ControlResponse::NotFound,
             Some(uid) => {
-                if crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .user_set_status(uid, *active)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?
-                {
+                if txn.user_set_status(uid, *active).await? {
                     ControlResponse::Ok
                 } else {
                     // 同 set_user_status：目标是最后一个在册管理员（命令路径本不产生）。
@@ -270,17 +232,11 @@ pub(super) async fn apply(
             {
                 ControlResponse::Invalid
             } else {
-                match account_status(cw, account_id).await? {
+                match account_status(txn, account_id).await? {
                     None => ControlResponse::NotFound,
                     Some(s) if s != "active" => ControlResponse::Invalid,
                     Some(_) => {
-                        let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
-                        if txn
-                            .user_by_username(username)
-                            .await
-                            .map_err(crate::control_store::to_sqlx)?
-                            .is_some()
-                        {
+                        if txn.user_by_username(username).await?.is_some() {
                             ControlResponse::Conflict
                         } else {
                             let uid = txn
@@ -290,11 +246,9 @@ pub(super) async fn apply(
                                     false,
                                     *created_at,
                                 )
-                                .await
-                                .map_err(crate::control_store::to_sqlx)?;
+                                .await?;
                             txn.account_member_insert(account_id, uid, role, *created_at)
-                                .await
-                                .map_err(crate::control_store::to_sqlx)?;
+                                .await?;
                             ControlResponse::Ok
                         }
                     }

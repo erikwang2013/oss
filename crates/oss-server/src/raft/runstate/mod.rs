@@ -28,7 +28,9 @@ pub use model::{
     InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow, JobRow, JobTaskRow,
     LifecycleCursorRow, RunState, ScheduleLeaseRow, TierRestoreRow,
 };
-pub use store::{install_runstate_tx, read_runstate, read_runstate_tx};
+pub use store::{
+    install_runstate_rows, install_runstate_tx, read_runstate, read_runstate_tx, read_runstate_txn,
+};
 
 /// OSSCTL3 扩展区中的命名空间（`[a-z0-9._-]{1,64}`）。
 pub const RUNSTATE_EXTENSION: &str = "m8.runstate";

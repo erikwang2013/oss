@@ -4,12 +4,11 @@
 //! 逐行 upsert，且必须恰好影响 1 行。引用完整性（run.job_id）由 leader 在 append 前
 //! 校验，这里不读副本本地的 jobs 表决定结果。
 
-use super::{ControlWrite, invariant};
-use crate::control_store::{SqliteControlTxn, to_sqlx};
+use super::invariant;
+use xl_store::control_store::{ControlError, ControlTxn};
+
 use crate::raft::command::ControlResponse;
 use crate::raft::runstate::{InventoryCursorRow, InventoryIncrementalRow, InventoryRunRow};
-use xl_store::control_store::inventory::InventoryTxn;
-use xl_store::control_store::jobs::JobTxn;
 
 fn run_terminal(state: &str) -> bool {
     matches!(state, "done" | "skipped")
@@ -165,88 +164,66 @@ pub(crate) fn incremental_row_ok(
 }
 
 async fn current_run(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     id: i64,
-) -> Result<Option<InventoryRunRow>, sqlx::Error> {
-    SqliteControlTxn::new(cw.conn())
-        .inventory_run(id)
-        .await
-        .map_err(to_sqlx)
+) -> Result<Option<InventoryRunRow>, ControlError> {
+    txn.inventory_run(id).await
 }
 
 async fn run_key_taken(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     run: &InventoryRunRow,
-) -> Result<bool, sqlx::Error> {
-    let found = SqliteControlTxn::new(cw.conn())
+) -> Result<bool, ControlError> {
+    let found = txn
         .inventory_run_by_key(&run.bucket, &run.config_id, &run.run_key)
-        .await
-        .map_err(to_sqlx)?;
+        .await?;
     Ok(found.is_some_and(|r| r.id != run.id))
 }
 
 async fn current_cursor(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     bucket: &str,
     config_id: &str,
-) -> Result<Option<InventoryCursorRow>, sqlx::Error> {
-    SqliteControlTxn::new(cw.conn())
-        .inventory_cursor(bucket, config_id)
-        .await
-        .map_err(to_sqlx)
+) -> Result<Option<InventoryCursorRow>, ControlError> {
+    txn.inventory_cursor(bucket, config_id).await
 }
 
 async fn current_incremental(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     bucket: &str,
     config_id: &str,
-) -> Result<Option<InventoryIncrementalRow>, sqlx::Error> {
-    SqliteControlTxn::new(cw.conn())
-        .inventory_incremental(bucket, config_id)
-        .await
-        .map_err(to_sqlx)
+) -> Result<Option<InventoryIncrementalRow>, ControlError> {
+    txn.inventory_incremental(bucket, config_id).await
 }
 
-async fn apply_run(cw: &mut ControlWrite<'_>, run: &InventoryRunRow) -> Result<bool, sqlx::Error> {
-    let applied = SqliteControlTxn::new(cw.conn())
-        .inventory_run_upsert(run)
-        .await
-        .map_err(to_sqlx)?;
+async fn apply_run(txn: &mut dyn ControlTxn, run: &InventoryRunRow) -> Result<bool, ControlError> {
+    let applied = txn.inventory_run_upsert(run).await?;
     // 删除（桶删/迁移）后 MAX(id) 会回落；日志事实内推进 meta，杜绝 id 复用。
-    SqliteControlTxn::new(cw.conn())
-        .runstate_meta_next_run_id(run.id + 1)
-        .await
-        .map_err(to_sqlx)?;
+    txn.runstate_meta_next_run_id(run.id + 1).await?;
     Ok(applied)
 }
 
 async fn apply_cursor(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     cursor: &InventoryCursorRow,
-) -> Result<bool, sqlx::Error> {
-    SqliteControlTxn::new(cw.conn())
-        .inventory_cursor_upsert(cursor)
-        .await
-        .map_err(to_sqlx)
+) -> Result<bool, ControlError> {
+    txn.inventory_cursor_upsert(cursor).await
 }
 
 async fn apply_incremental(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     row: &InventoryIncrementalRow,
-) -> Result<bool, sqlx::Error> {
-    SqliteControlTxn::new(cw.conn())
-        .inventory_incremental_upsert(row)
-        .await
-        .map_err(to_sqlx)
+) -> Result<bool, ControlError> {
+    txn.inventory_incremental_upsert(row).await
 }
 
 /// 整批只读预检 → 逐行 upsert。预检失败 = 零写入的 `Conflict`。
 pub(crate) async fn apply(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     runs: &[InventoryRunRow],
     cursors: &[InventoryCursorRow],
     incrementals: &[InventoryIncrementalRow],
-) -> Result<ControlResponse, sqlx::Error> {
+) -> Result<ControlResponse, ControlError> {
     let mut run_ids = std::collections::HashSet::new();
     let mut run_keys = std::collections::HashSet::new();
     for run in runs {
@@ -262,11 +239,11 @@ pub(crate) async fn apply(
         )) {
             return Ok(ControlResponse::Conflict);
         }
-        let cur = current_run(cw, run.id).await?;
+        let cur = current_run(txn, run.id).await?;
         if run_row_ok(cur.as_ref(), run).is_err() {
             return Ok(ControlResponse::Conflict);
         }
-        if cur.is_none() && run_key_taken(cw, run).await? {
+        if cur.is_none() && run_key_taken(txn, run).await? {
             return Ok(ControlResponse::Conflict);
         }
     }
@@ -275,7 +252,7 @@ pub(crate) async fn apply(
         if !cursor_ids.insert((cursor.bucket.clone(), cursor.config_id.clone())) {
             return Ok(ControlResponse::Conflict);
         }
-        let cur = current_cursor(cw, &cursor.bucket, &cursor.config_id).await?;
+        let cur = current_cursor(txn, &cursor.bucket, &cursor.config_id).await?;
         if cursor_row_ok(cur.as_ref(), cursor).is_err() {
             return Ok(ControlResponse::Conflict);
         }
@@ -285,13 +262,13 @@ pub(crate) async fn apply(
         if !incremental_ids.insert((row.bucket.clone(), row.config_id.clone())) {
             return Ok(ControlResponse::Conflict);
         }
-        let cur = current_incremental(cw, &row.bucket, &row.config_id).await?;
+        let cur = current_incremental(txn, &row.bucket, &row.config_id).await?;
         if incremental_row_ok(cur.as_ref(), row).is_err() {
             return Ok(ControlResponse::Conflict);
         }
     }
     for run in runs {
-        if !apply_run(cw, run).await? {
+        if !apply_run(txn, run).await? {
             return Err(invariant(format!(
                 "inventory run {} upsert affected 0 rows",
                 run.id
@@ -299,7 +276,7 @@ pub(crate) async fn apply(
         }
     }
     for cursor in cursors {
-        if !apply_cursor(cw, cursor).await? {
+        if !apply_cursor(txn, cursor).await? {
             return Err(invariant(format!(
                 "inventory cursor {}/{} upsert affected 0 rows",
                 cursor.bucket, cursor.config_id
@@ -307,7 +284,7 @@ pub(crate) async fn apply(
         }
     }
     for row in incrementals {
-        if !apply_incremental(cw, row).await? {
+        if !apply_incremental(txn, row).await? {
             return Err(invariant(format!(
                 "inventory incremental {}/{} upsert affected 0 rows",
                 row.bucket, row.config_id
@@ -319,14 +296,11 @@ pub(crate) async fn apply(
 
 /// 关闭增量：删游标与开关。幂等，重复 apply 为 no-op。
 pub(crate) async fn clear(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     bucket: &str,
     config_id: &str,
-) -> Result<ControlResponse, sqlx::Error> {
-    SqliteControlTxn::new(cw.conn())
-        .inventory_clear(bucket, config_id)
-        .await
-        .map_err(to_sqlx)?;
+) -> Result<ControlResponse, ControlError> {
+    txn.inventory_clear(bucket, config_id).await?;
     Ok(ControlResponse::Ok)
 }
 

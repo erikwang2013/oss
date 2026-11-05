@@ -4,7 +4,8 @@ use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry, BucketTx
 use xl_store::control_store::{ControlError, OwnerRef};
 
 use super::bucket::{
-    BucketRow, CResult, admin_uid, backend, decode_row, encode_row, key1, user_by_name,
+    BucketRow, CResult, admin_uid, backend, decode_row, encode_row, key1, txn_scan_all,
+    user_by_name,
 };
 use super::{ObjectControlTxn, TableId};
 
@@ -37,6 +38,19 @@ async fn resolve_owner(txn: &ObjectControlTxn, owner: &OwnerRef) -> CResult<Opti
             None => Ok(None),
         },
     }
+}
+
+/// UserDelete cascade: buckets owned by `uid` become admin-owned (SQLite's
+/// `UPDATE buckets SET owner_id = NULL`), inside the enclosing root CAS.
+pub(crate) async fn bucket_clear_owner(txn: &mut ObjectControlTxn, uid: i64) -> CResult<()> {
+    for (_, value) in txn_scan_all(txn, TableId::Buckets).await? {
+        let mut row: BucketRow = decode_row(&value)?;
+        if row.owner_uid == Some(uid) {
+            row.owner_uid = None;
+            put_bucket(txn, &row).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn mutate_bucket(

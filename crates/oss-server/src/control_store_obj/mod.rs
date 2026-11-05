@@ -51,6 +51,7 @@ pub use ap_olap::{AccessPointStore, AccessPointTxn};
 // domain modules themselves stay private.
 pub(crate) use account::{AccountRow, LedgerRow, MemberRow};
 pub(crate) use bucket::BucketRow;
+pub(crate) use bucket_write::bucket_clear_owner;
 pub(crate) use iam::{AccessKeyRow, PermissionStorageRow, UserRow};
 pub use inventory::BucketDomainCleanup;
 pub use origin::WriteOrigin;

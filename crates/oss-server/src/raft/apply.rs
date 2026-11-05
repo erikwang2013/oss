@@ -9,14 +9,12 @@ use base64::Engine as _;
 use std::collections::HashSet;
 
 use sqlx::SqliteConnection;
-use xl_store::control_store::account::AccountTxn;
-use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry, BucketTxn};
+use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry};
 use xl_store::control_store::iam::IamTxn;
-use xl_store::control_store::inventory::{InventoryConfigEntry, InventoryTxn};
-use xl_store::control_store::jobs::JobTxn;
-use xl_store::control_store::lifecycle::LifecycleTxn;
-use xl_store::control_store::tier::TierTxn;
-use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
+use xl_store::control_store::inventory::InventoryConfigEntry;
+use xl_store::control_store::{
+    AccessPointEntry, ControlError, ControlTxn, OlapConfigEntry, OwnerRef,
+};
 
 mod accounts;
 pub(crate) mod inventory;
@@ -29,7 +27,7 @@ use super::command::{
     ControlCommand, ControlResponse, LifecycleRuleCmd, PermissionBits, validate_job_purge,
 };
 use super::runstate::{JobRow, JobTaskRow, TierRestoreRow};
-use crate::db::{Db, LifecycleRuleRow};
+use crate::db::LifecycleRuleRow;
 
 /// 控制表写入令牌。字段对 crate 内 raw writer 可见；模块私有，外部无法构造。
 pub(crate) struct ControlWrite<'a> {
@@ -96,8 +94,8 @@ pub(crate) fn effects_for(cmd: &ControlCommand) -> Vec<SideEffect> {
     }
 }
 
-fn invariant(msg: String) -> sqlx::Error {
-    sqlx::Error::Protocol(msg)
+fn invariant(msg: String) -> ControlError {
+    ControlError::Invalid(msg)
 }
 
 fn valid_user_status(s: &str) -> bool {
@@ -112,36 +110,24 @@ fn valid_lock_mode(s: Option<&str>) -> bool {
     matches!(s, None | Some("GOVERNANCE") | Some("COMPLIANCE"))
 }
 
-async fn uid(cw: &mut ControlWrite<'_>, username: &str) -> Result<Option<i64>, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .user_uid(username)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+async fn uid(txn: &mut dyn ControlTxn, username: &str) -> Result<Option<i64>, ControlError> {
+    txn.user_uid(username).await
 }
 
 /// M1：管理员用户/AK 是站点本地状态，IAM 命令不得复制它们（S6b 处理器留本地）。
-async fn username_is_admin(cw: &mut ControlWrite<'_>, username: &str) -> Result<bool, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .user_is_admin(username)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+async fn username_is_admin(txn: &mut dyn ControlTxn, username: &str) -> Result<bool, ControlError> {
+    txn.user_is_admin(username).await
 }
 
 async fn access_key_owner_is_admin(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     access_key: &str,
-) -> Result<bool, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .access_key_owner_is_admin(access_key)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+) -> Result<bool, ControlError> {
+    txn.access_key_owner_is_admin(access_key).await
 }
 
-async fn bucket_exists(cw: &mut ControlWrite<'_>, bucket: &str) -> Result<bool, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .bucket_exists(bucket)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+async fn bucket_exists(txn: &mut dyn ControlTxn, bucket: &str) -> Result<bool, ControlError> {
+    txn.bucket_exists(bucket).await
 }
 
 fn permissions_rows(bits: &[PermissionBits]) -> Vec<xl_store::control_store::iam::PermissionRow> {
@@ -210,25 +196,24 @@ fn lifecycle_rows_v2(
     rows
 }
 
-/// apply 的 fail-stop 语义：`ControlError` 一律视为内部不变量破坏（同旧 SQL `?`）。
-fn control_err(e: xl_store::control_store::ControlError) -> sqlx::Error {
-    sqlx::Error::Protocol(e.to_string())
-}
-
-/// 应用一条命令。业务拒绝 = `Ok(Applied{response})`；内部错误 = `Err`（事务回滚，fail-stop）。
-pub(crate) async fn apply_command(
-    cw: &mut ControlWrite<'_>,
+/// 后端无关的 apply：一个已开启的控制事务内应用一条命令。
+///
+/// 除响应/副作用外返回 `finish`：`UserDelete` 需由后端在删除用户行前清空
+/// 桶/上传属主（SQLite 的 FK 与本地 uploads 的时序不同），由调用方收尾。
+pub(crate) async fn apply_command_txn(
+    txn: &mut dyn ControlTxn,
     cmd: &ControlCommand,
-) -> Result<Applied, sqlx::Error> {
+) -> Result<(Applied, Option<i64>), ControlError> {
     let effects = effects_for(cmd);
     // Level-3 账户/成员命令有独立的业务约束集合（自然键 + 账户不变量）。
-    if let Some(response) = accounts::apply(cw, cmd).await? {
-        return Ok(Applied { response, effects });
+    if let Some(response) = accounts::apply(txn, cmd).await? {
+        return Ok((Applied { response, effects }, None));
     }
     // feature 9：用量账本（无副作用；判定全部在事务内完成）。
-    if let Some(response) = quota::apply(cw, cmd).await? {
-        return Ok(Applied { response, effects });
+    if let Some(response) = quota::apply(txn, cmd).await? {
+        return Ok((Applied { response, effects }, None));
     }
+    let mut user_delete = None;
     let response = match cmd {
         ControlCommand::UserCreate {
             username,
@@ -238,51 +223,35 @@ pub(crate) async fn apply_command(
         } => {
             if username.is_empty() || password_hash.is_empty() || !valid_user_status(status) {
                 ControlResponse::Invalid
-            } else if uid(cw, username).await?.is_some() {
+            } else if uid(txn, username).await?.is_some() {
                 ControlResponse::Conflict
             } else {
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .user_create(&xl_store::control_store::iam::UserEntry {
-                        username: username.clone(),
-                        password_hash: password_hash.clone(),
-                        status: status.clone(),
-                        created_at: *created_at,
-                    })
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                txn.user_create(&xl_store::control_store::iam::UserEntry {
+                    username: username.clone(),
+                    password_hash: password_hash.clone(),
+                    status: status.clone(),
+                    created_at: *created_at,
+                })
+                .await?;
                 ControlResponse::Ok
             }
         }
         ControlCommand::UserDelete { username } => {
-            if username_is_admin(cw, username).await? {
+            if username_is_admin(txn, username).await? {
                 ControlResponse::Invalid
             } else {
-                match uid(cw, username).await? {
+                match uid(txn, username).await? {
                     None => ControlResponse::NotFound,
                     Some(id) => {
-                        let guard = crate::control_store::SqliteControlTxn::new(cw.conn())
-                            .user_delete_guard(id)
-                            .await
-                            .map_err(crate::control_store::to_sqlx)?;
+                        let guard = txn.user_delete_guard(id).await?;
                         if !guard {
                             // 守卫拒绝：目标是最后一个在册管理员（命令路径本不产生管理员）。
                             ControlResponse::Conflict
                         } else {
-                            crate::control_store::SqliteControlTxn::new(cw.conn())
-                                .user_delete_access_keys_permissions(id)
-                                .await
-                                .map_err(crate::control_store::to_sqlx)?;
-                            // shortcut: buckets/uploads 属其它域，所有权清空仍在本级联中间执行（D7）。
-                            for sql in [
-                                "UPDATE buckets SET owner_id = NULL WHERE owner_id = ?",
-                                "UPDATE uploads SET owner_id = NULL WHERE owner_id = ?",
-                            ] {
-                                sqlx::query(sql).bind(id).execute(&mut *cw.conn).await?;
-                            }
-                            crate::control_store::SqliteControlTxn::new(cw.conn())
-                                .user_delete(id)
-                                .await
-                                .map_err(crate::control_store::to_sqlx)?;
+                            txn.user_delete_access_keys_permissions(id).await?;
+                            // 桶/上传属主清空与用户行删除由后端收尾：SQLite 在同一事务
+                            // 内做 FK 级联；对象后端在根 CAS 内清桶、CAS 后清本地上传（D3）。
+                            user_delete = Some(id);
                             ControlResponse::Ok
                         }
                     }
@@ -293,17 +262,13 @@ pub(crate) async fn apply_command(
             username,
             password_hash,
         } => {
-            if password_hash.is_empty() || username_is_admin(cw, username).await? {
+            if password_hash.is_empty() || username_is_admin(txn, username).await? {
                 ControlResponse::Invalid
             } else {
-                match uid(cw, username).await? {
+                match uid(txn, username).await? {
                     None => ControlResponse::NotFound,
                     Some(id) => {
-                        if crate::control_store::SqliteControlTxn::new(cw.conn())
-                            .user_set_password(id, password_hash)
-                            .await
-                            .map_err(crate::control_store::to_sqlx)?
-                        {
+                        if txn.user_set_password(id, password_hash).await? {
                             ControlResponse::Ok
                         } else {
                             ControlResponse::NotFound
@@ -313,17 +278,13 @@ pub(crate) async fn apply_command(
             }
         }
         ControlCommand::UserSetStatus { username, status } => {
-            if !valid_user_status(status) || username_is_admin(cw, username).await? {
+            if !valid_user_status(status) || username_is_admin(txn, username).await? {
                 ControlResponse::Invalid
             } else {
-                match uid(cw, username).await? {
+                match uid(txn, username).await? {
                     None => ControlResponse::NotFound,
                     Some(id) => {
-                        if crate::control_store::SqliteControlTxn::new(cw.conn())
-                            .user_set_status(id, status == "active")
-                            .await
-                            .map_err(crate::control_store::to_sqlx)?
-                        {
+                        if txn.user_set_status(id, status == "active").await? {
                             ControlResponse::Ok
                         } else {
                             ControlResponse::Conflict
@@ -336,16 +297,14 @@ pub(crate) async fn apply_command(
             username,
             permissions,
         } => {
-            if username_is_admin(cw, username).await? {
+            if username_is_admin(txn, username).await? {
                 ControlResponse::Invalid
             } else {
-                match uid(cw, username).await? {
+                match uid(txn, username).await? {
                     None => ControlResponse::NotFound,
                     Some(id) => {
-                        crate::control_store::SqliteControlTxn::new(cw.conn())
-                            .permissions_replace(id, &permissions_rows(permissions))
-                            .await
-                            .map_err(crate::control_store::to_sqlx)?;
+                        txn.permissions_replace(id, &permissions_rows(permissions))
+                            .await?;
                         ControlResponse::Ok
                     }
                 }
@@ -363,24 +322,15 @@ pub(crate) async fn apply_command(
             if access_key.is_empty()
                 || secret_key.is_empty()
                 || kind.is_empty()
-                || username_is_admin(cw, username).await?
+                || username_is_admin(txn, username).await?
             {
                 ControlResponse::Invalid
             } else {
-                let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
-                if txn
-                    .access_key_exists(access_key)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?
-                {
+                if txn.access_key_exists(access_key).await? {
                     ControlResponse::Conflict
                 } else {
                     // 属主缺失（非 witness）是不变量破坏：AK 会永远无法鉴权。
-                    let Some(_user_id) = txn
-                        .user_uid(username)
-                        .await
-                        .map_err(crate::control_store::to_sqlx)?
-                    else {
+                    let Some(_user_id) = txn.user_uid(username).await? else {
                         return Err(invariant(format!("access key owner {username} not found")));
                     };
                     txn.access_key_create(&xl_store::control_store::iam::AccessKeyEntry {
@@ -394,33 +344,24 @@ pub(crate) async fn apply_command(
                         session_policy: session_policy.clone(),
                         kind: kind.clone(),
                     })
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                    .await?;
                     ControlResponse::Ok
                 }
             }
         }
         ControlCommand::AccessKeyDelete { access_key } => {
-            if access_key_owner_is_admin(cw, access_key).await? {
+            if access_key_owner_is_admin(txn, access_key).await? {
                 ControlResponse::Invalid
-            } else if crate::control_store::SqliteControlTxn::new(cw.conn())
-                .access_key_delete(access_key)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
-            {
+            } else if txn.access_key_delete(access_key).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
             }
         }
         ControlCommand::AccessKeySetStatus { access_key, status } => {
-            if !valid_user_status(status) || access_key_owner_is_admin(cw, access_key).await? {
+            if !valid_user_status(status) || access_key_owner_is_admin(txn, access_key).await? {
                 ControlResponse::Invalid
-            } else if crate::control_store::SqliteControlTxn::new(cw.conn())
-                .access_key_set_status(access_key, status)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
-            {
+            } else if txn.access_key_set_status(access_key, status).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -448,7 +389,6 @@ pub(crate) async fn apply_command(
                     None => OwnerRef::Admin,
                     Some(name) => OwnerRef::User(name.clone()),
                 };
-                let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
                 match txn
                     .bucket_create(&BucketEntry {
                         name: name.clone(),
@@ -462,8 +402,7 @@ pub(crate) async fn apply_command(
                         replication_mode: replication_mode.clone(),
                         deleting: false,
                     })
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?
+                    .await?
                 {
                     BucketCreateOutcome::ModeConflict => ControlResponse::Conflict,
                     BucketCreateOutcome::Created | BucketCreateOutcome::Updated => {
@@ -473,18 +412,18 @@ pub(crate) async fn apply_command(
             }
         }
         ControlCommand::BucketDelete { name } => {
-            if Db::delete_bucket_cascade(cw, name).await? {
+            txn.delete_access_points_for_bucket(name).await?;
+            txn.delete_lifecycle_inventory_tier_for_bucket(name).await?;
+            txn.permissions_delete_for_bucket(name).await?;
+            txn.delete_bucket_configs_for_bucket(name).await?;
+            if txn.bucket_delete(name).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
             }
         }
         ControlCommand::BucketSetDeleting { name, deleting } => {
-            if crate::control_store::SqliteControlTxn::new(cw.conn())
-                .bucket_set_deleting(name, *deleting)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
-            {
+            if txn.bucket_set_deleting(name, *deleting).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -493,11 +432,7 @@ pub(crate) async fn apply_command(
         ControlCommand::BucketSetVersioning { name, versioning } => {
             if !valid_versioning(versioning) {
                 ControlResponse::Invalid
-            } else if crate::control_store::SqliteControlTxn::new(cw.conn())
-                .bucket_set_versioning(name, versioning)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
-            {
+            } else if txn.bucket_set_versioning(name, versioning).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -511,10 +446,9 @@ pub(crate) async fn apply_command(
         } => {
             if !valid_lock_mode(default_mode.as_deref()) {
                 ControlResponse::Invalid
-            } else if crate::control_store::SqliteControlTxn::new(cw.conn())
+            } else if txn
                 .bucket_set_object_lock(name, *enabled, default_mode.as_deref(), *default_days)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
+                .await?
             {
                 ControlResponse::Ok
             } else {
@@ -528,22 +462,17 @@ pub(crate) async fn apply_command(
         } => {
             if config_json.is_empty() {
                 ControlResponse::Invalid
-            } else if bucket_exists(cw, bucket).await? {
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .bucket_notification_set(bucket, config_json, *updated_at)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+            } else if bucket_exists(txn, bucket).await? {
+                txn.bucket_notification_set(bucket, config_json, *updated_at)
+                    .await?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
             }
         }
         ControlCommand::BucketClearNotification { bucket } => {
-            if bucket_exists(cw, bucket).await? {
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .bucket_notification_delete(bucket)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+            if bucket_exists(txn, bucket).await? {
+                txn.bucket_notification_delete(bucket).await?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -554,12 +483,9 @@ pub(crate) async fn apply_command(
             rules,
             updated_at,
         } => {
-            if bucket_exists(cw, bucket).await? {
+            if bucket_exists(txn, bucket).await? {
                 let rows = lifecycle_rows(bucket, rules, *updated_at);
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .replace_lifecycle_rules(bucket, &rows)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                txn.replace_lifecycle_rules(bucket, &rows).await?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -570,23 +496,17 @@ pub(crate) async fn apply_command(
             rules,
             updated_at,
         } => {
-            if bucket_exists(cw, bucket).await? {
+            if bucket_exists(txn, bucket).await? {
                 let rows = lifecycle_rows_v2(bucket, rules, *updated_at);
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .replace_lifecycle_rules(bucket, &rows)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                txn.replace_lifecycle_rules(bucket, &rows).await?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
             }
         }
         ControlCommand::BucketClearLifecycle { bucket } => {
-            if bucket_exists(cw, bucket).await? {
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .clear_lifecycle_rules(bucket)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+            if bucket_exists(txn, bucket).await? {
+                txn.clear_lifecycle_rules(bucket).await?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -599,22 +519,17 @@ pub(crate) async fn apply_command(
         } => {
             if rules_json.is_empty() {
                 ControlResponse::Invalid
-            } else if bucket_exists(cw, bucket).await? {
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .bucket_replication_rules_set(bucket, rules_json, *updated_at)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+            } else if bucket_exists(txn, bucket).await? {
+                txn.bucket_replication_rules_set(bucket, rules_json, *updated_at)
+                    .await?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
             }
         }
         ControlCommand::BucketClearReplication { bucket } => {
-            if bucket_exists(cw, bucket).await? {
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .bucket_replication_rules_delete(bucket)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+            if bucket_exists(txn, bucket).await? {
+                txn.bucket_replication_rules_delete(bucket).await?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -623,22 +538,14 @@ pub(crate) async fn apply_command(
         ControlCommand::BucketSetDefaultEncryption { bucket, algorithm } => {
             if algorithm.is_empty() {
                 ControlResponse::Invalid
-            } else if crate::control_store::SqliteControlTxn::new(cw.conn())
-                .bucket_set_default_encryption(bucket, algorithm)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
-            {
+            } else if txn.bucket_set_default_encryption(bucket, algorithm).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
             }
         }
         ControlCommand::BucketClearDefaultEncryption { bucket } => {
-            if crate::control_store::SqliteControlTxn::new(cw.conn())
-                .bucket_clear_default_encryption(bucket)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
-            {
+            if txn.bucket_clear_default_encryption(bucket).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -651,22 +558,17 @@ pub(crate) async fn apply_command(
         } => {
             if policy_json.is_empty() {
                 ControlResponse::Invalid
-            } else if bucket_exists(cw, bucket).await? {
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .bucket_policy_set(bucket, policy_json, *updated_at)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+            } else if bucket_exists(txn, bucket).await? {
+                txn.bucket_policy_set(bucket, policy_json, *updated_at)
+                    .await?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
             }
         }
         ControlCommand::BucketDeletePolicy { bucket } => {
-            if bucket_exists(cw, bucket).await? {
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .bucket_policy_delete(bucket)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+            if bucket_exists(txn, bucket).await? {
+                txn.bucket_policy_delete(bucket).await?;
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -681,14 +583,13 @@ pub(crate) async fn apply_command(
             updated_at,
         } => {
             // 预检与 apply 之间桶可能已被删：在 apply 内复核，拒绝悬挂行（M3）。
-            if name.is_empty() || bucket.is_empty() || !bucket_exists(cw, bucket).await? {
+            if name.is_empty() || bucket.is_empty() || !bucket_exists(txn, bucket).await? {
                 ControlResponse::Invalid
             } else {
                 let owner = match owner {
                     None => OwnerRef::Admin,
                     Some(name) => OwnerRef::User(name.clone()),
                 };
-                let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
                 let created = txn
                     .access_point_create(&AccessPointEntry {
                         name: name.clone(),
@@ -698,8 +599,7 @@ pub(crate) async fn apply_command(
                         created_at: *created_at,
                         updated_at: *updated_at,
                     })
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                    .await?;
                 if created {
                     ControlResponse::Ok
                 } else {
@@ -708,12 +608,7 @@ pub(crate) async fn apply_command(
             }
         }
         ControlCommand::AccessPointDelete { name } => {
-            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
-            if txn
-                .access_point_delete(name)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
-            {
+            if txn.access_point_delete(name).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -724,11 +619,9 @@ pub(crate) async fn apply_command(
             policy_json,
             updated_at,
         } => {
-            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
             if txn
                 .access_point_set_policy(name, policy_json.as_deref(), *updated_at)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
+                .await?
             {
                 ControlResponse::Ok
             } else {
@@ -753,25 +646,26 @@ pub(crate) async fn apply_command(
                     Some(b64) => match base64::engine::general_purpose::STANDARD.decode(b64) {
                         Ok(bytes) => Some(bytes),
                         Err(_) => {
-                            return Ok(Applied {
-                                response: ControlResponse::Invalid,
-                                effects,
-                            });
+                            return Ok((
+                                Applied {
+                                    response: ControlResponse::Invalid,
+                                    effects,
+                                },
+                                None,
+                            ));
                         }
                     },
                 };
                 if kind == "wasm" && decoded.is_none() {
-                    return Ok(Applied {
-                        response: ControlResponse::Invalid,
-                        effects,
-                    });
+                    return Ok((
+                        Applied {
+                            response: ControlResponse::Invalid,
+                            effects,
+                        },
+                        None,
+                    ));
                 }
-                let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
-                if !txn
-                    .access_point_exists(access_point)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?
-                {
+                if !txn.access_point_exists(access_point).await? {
                     ControlResponse::NotFound
                 } else {
                     txn.olap_config_upsert(&OlapConfigEntry {
@@ -784,19 +678,13 @@ pub(crate) async fn apply_command(
                         max_response_bytes: *max_response_bytes,
                         updated_at: *updated_at,
                     })
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                    .await?;
                     ControlResponse::Ok
                 }
             }
         }
         ControlCommand::OlapDelete { access_point } => {
-            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
-            if txn
-                .olap_config_delete(access_point)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
-            {
+            if txn.olap_config_delete(access_point).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -813,7 +701,7 @@ pub(crate) async fn apply_command(
             if bucket.is_empty()
                 || id.is_empty()
                 || config_json.is_empty()
-                || !bucket_exists(cw, bucket).await?
+                || !bucket_exists(txn, bucket).await?
             {
                 ControlResponse::Invalid
             } else {
@@ -827,20 +715,12 @@ pub(crate) async fn apply_command(
                     config_json: config_json.clone(),
                     updated_at: *updated_at,
                 };
-                crate::control_store::SqliteControlTxn::new(cw.conn())
-                    .inventory_config_upsert(&row)
-                    .await
-                    .map_err(crate::control_store::to_sqlx)?;
+                txn.inventory_config_upsert(&row).await?;
                 ControlResponse::Ok
             }
         }
         ControlCommand::InventoryDelete { bucket, id } => {
-            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
-            if txn
-                .inventory_config_delete(bucket, id)
-                .await
-                .map_err(crate::control_store::to_sqlx)?
-            {
+            if txn.inventory_config_delete(bucket, id).await? {
                 ControlResponse::Ok
             } else {
                 ControlResponse::NotFound
@@ -871,45 +751,45 @@ pub(crate) async fn apply_command(
         },
         // M8-2：jobs/job_tasks 行复制（确定性 upsert，无时钟/随机）。
         ControlCommand::JobUpsert { job } => {
-            apply_job_batch(cw, std::slice::from_ref(job), &[], &[]).await?
+            apply_job_batch(txn, std::slice::from_ref(job), &[], &[]).await?
         }
         ControlCommand::JobTaskUpsert { task } => {
-            apply_job_batch(cw, &[], std::slice::from_ref(task), &[]).await?
+            apply_job_batch(txn, &[], std::slice::from_ref(task), &[]).await?
         }
         ControlCommand::JobBatch {
             jobs,
             tasks,
             restores,
-        } => apply_job_batch(cw, jobs, tasks, restores).await?,
+        } => apply_job_batch(txn, jobs, tasks, restores).await?,
         // M8-2：inventory 运行态行复制（同批预检，零写入 Conflict）。
         ControlCommand::InventoryBatch {
             runs,
             cursors,
             incrementals,
-        } => inventory::apply(cw, runs, cursors, incrementals).await?,
+        } => inventory::apply(txn, runs, cursors, incrementals).await?,
         ControlCommand::InventoryClear { bucket, config_id } => {
-            inventory::clear(cw, bucket, config_id).await?
+            inventory::clear(txn, bucket, config_id).await?
         }
         // M8-2：lifecycle 扫描游标复制（单行预检，零写入 Conflict）。
-        ControlCommand::LifecycleCursorUpsert { cursor } => lifecycle::apply(cw, cursor).await?,
+        ControlCommand::LifecycleCursorUpsert { cursor } => lifecycle::apply(txn, cursor).await?,
         ControlCommand::LifecycleCursorClear {
             bucket,
             rule_id,
             stage,
             fence_term,
-        } => lifecycle::clear(cw, bucket, rule_id, stage, *fence_term).await?,
+        } => lifecycle::clear(txn, bucket, rule_id, stage, *fence_term).await?,
         // M8-2 level 6：作业历史保留（只删终态行；见 [`purge_jobs`]）。
-        ControlCommand::JobPurge { job_ids } => purge_jobs(cw, job_ids).await?,
+        ControlCommand::JobPurge { job_ids } => purge_jobs(txn, job_ids).await?,
         // level 7：tier restore 后续状态 + 调度租约（确定性、零写入 Conflict）。
-        ControlCommand::TierRestoreUpsert { restore } => tier_restore::apply(cw, restore).await?,
+        ControlCommand::TierRestoreUpsert { restore } => tier_restore::apply(txn, restore).await?,
         ControlCommand::TierRestoreDelete {
             bucket,
             key,
             version_id,
             fence_term,
-        } => tier_restore::delete(cw, bucket, key, version_id, *fence_term).await?,
+        } => tier_restore::delete(txn, bucket, key, version_id, *fence_term).await?,
         ControlCommand::ScheduleLeaseAcquire { lease, now } => {
-            lease::apply(cw, lease, *now).await?
+            lease::apply(txn, lease, *now).await?
         }
         // feature 8：AP 动态 VPC 端点注册（upsert/delete 均幂等）。
         ControlCommand::VpcEndpointUpsert { endpoint } => {
@@ -920,46 +800,22 @@ pub(crate) async fn apply_command(
             {
                 ControlResponse::Invalid
             } else {
-                let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
-                if txn
-                    .account_status(&endpoint.account_id)
-                    .await
-                    .map_err(control_err)?
-                    .as_deref()
-                    != Some("active")
-                {
+                if txn.account_status(&endpoint.account_id).await?.as_deref() != Some("active") {
                     ControlResponse::Invalid
                 } else {
-                    txn.vpc_endpoint_upsert(endpoint)
-                        .await
-                        .map_err(control_err)?;
+                    txn.vpc_endpoint_upsert(endpoint).await?;
                     ControlResponse::Ok
                 }
             }
         }
         ControlCommand::VpcEndpointDelete { vpce_id } => {
-            let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
-            txn.vpc_endpoint_delete(vpce_id)
-                .await
-                .map_err(control_err)?;
+            txn.vpc_endpoint_delete(vpce_id).await?;
             ControlResponse::Ok
         }
+        // 测试专用 raft_kv 只存在于 SQLite 后端；SQLite 包装层拦截这两条命令。
         #[cfg(test)]
-        ControlCommand::Set { key, value } => {
-            sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")
-                .bind(key)
-                .bind(value)
-                .execute(&mut *cw.conn)
-                .await?;
-            ControlResponse::Ok
-        }
-        #[cfg(test)]
-        ControlCommand::Delete { key } => {
-            sqlx::query("DELETE FROM raft_kv WHERE key = ?")
-                .bind(key)
-                .execute(&mut *cw.conn)
-                .await?;
-            ControlResponse::Ok
+        ControlCommand::Set { .. } | ControlCommand::Delete { .. } => {
+            return Err(invariant("raft_kv is sqlite-only".into()));
         }
         // 不触碰任何表：只用于验证 level-2 激活标记与业务拒绝同样写 marker。
         #[cfg(test)]
@@ -971,7 +827,61 @@ pub(crate) async fn apply_command(
             }
         }
     };
-    Ok(Applied { response, effects })
+    Ok((Applied { response, effects }, user_delete))
+}
+
+/// SQLite 后端的旧入口：行级写入走 [`apply_command_txn`]，UserDelete 的跨域
+/// 收尾（桶/上传属主、用户行）仍在同一事务内完成；测试专用 `raft_kv` 在此拦截。
+pub(crate) async fn apply_command(
+    cw: &mut ControlWrite<'_>,
+    cmd: &ControlCommand,
+) -> Result<Applied, sqlx::Error> {
+    #[cfg(test)]
+    match cmd {
+        ControlCommand::Set { key, value } => {
+            sqlx::query("INSERT OR REPLACE INTO raft_kv (key, value) VALUES (?, ?)")
+                .bind(key)
+                .bind(value)
+                .execute(&mut *cw.conn)
+                .await?;
+            return Ok(Applied {
+                response: ControlResponse::Ok,
+                effects: Vec::new(),
+            });
+        }
+        ControlCommand::Delete { key } => {
+            sqlx::query("DELETE FROM raft_kv WHERE key = ?")
+                .bind(key)
+                .execute(&mut *cw.conn)
+                .await?;
+            return Ok(Applied {
+                response: ControlResponse::Ok,
+                effects: Vec::new(),
+            });
+        }
+        _ => {}
+    }
+    let (applied, user_delete) = {
+        let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+        apply_command_txn(&mut txn, cmd)
+            .await
+            .map_err(crate::control_store::to_sqlx)?
+    };
+    if let Some(id) = user_delete {
+        // shortcut: 桶/上传属主仍用裸 UPDATE 走 SQLite 连接（D7 的原级联顺序），
+        // 对象后端在根 CAS 内改桶、CAS 后清本地上传。
+        for sql in [
+            "UPDATE buckets SET owner_id = NULL WHERE owner_id = ?",
+            "UPDATE uploads SET owner_id = NULL WHERE owner_id = ?",
+        ] {
+            sqlx::query(sql).bind(id).execute(&mut *cw.conn).await?;
+        }
+        let mut txn = crate::control_store::SqliteControlTxn::new(cw.conn());
+        txn.user_delete(id)
+            .await
+            .map_err(crate::control_store::to_sqlx)?;
+    }
+    Ok(applied)
 }
 
 fn task_terminal(state: &str) -> bool {
@@ -1116,39 +1026,26 @@ fn task_row_ok(cur: Option<&JobTaskRow>, next: &JobTaskRow) -> Result<(), String
     Ok(())
 }
 
-fn jobs_tx<'a>(cw: &'a mut ControlWrite<'_>) -> crate::control_store::SqliteControlTxn<'a> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-}
-
-async fn current_job(cw: &mut ControlWrite<'_>, id: i64) -> Result<Option<JobRow>, sqlx::Error> {
-    jobs_tx(cw)
-        .job(id)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+async fn current_job(txn: &mut dyn ControlTxn, id: i64) -> Result<Option<JobRow>, ControlError> {
+    txn.job(id).await
 }
 
 async fn current_task(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     job_id: i64,
     task_no: i64,
-) -> Result<Option<JobTaskRow>, sqlx::Error> {
-    jobs_tx(cw)
-        .job_task(job_id, task_no)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+) -> Result<Option<JobTaskRow>, ControlError> {
+    txn.job_task(job_id, task_no).await
 }
 
 /// Restore 行按 `(bucket,key,version_id)` 读取（P2-1：创建行随 JobBatch 复制）。
 async fn current_restore(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     bucket: &str,
     key: &str,
     version_id: &str,
-) -> Result<Option<TierRestoreRow>, sqlx::Error> {
-    crate::control_store::SqliteControlTxn::new(cw.conn())
-        .tier_restore(bucket, key, version_id)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+) -> Result<Option<TierRestoreRow>, ControlError> {
+    txn.tier_restore(bucket, key, version_id).await
 }
 
 /// Restore 行只允许已知状态，且 fence 不得回退（行被更高 term 接管后旧日志不得降级）。
@@ -1179,49 +1076,40 @@ pub(crate) fn restore_row_ok(
 
 /// 去重键唯一（partial unique index）。同 PK 保留自键；冲突是业务拒绝而非 SQL 错误。
 async fn dedupe_taken(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     key: &str,
     job_id: i64,
     task_no: i64,
-) -> Result<bool, sqlx::Error> {
-    jobs_tx(cw)
-        .dedupe_taken(key, job_id, task_no)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+) -> Result<bool, ControlError> {
+    txn.dedupe_taken(key, job_id, task_no).await
 }
 
 /// 按主键 upsert 作业行。防回退判定已由 [`job_row_ok`] 在写入前完成，这里不再
 /// 用 SQL WHERE 静默吞行（避免半批边界）。
-async fn apply_job(cw: &mut ControlWrite<'_>, job: &JobRow) -> Result<u64, sqlx::Error> {
-    jobs_tx(cw)
-        .job_upsert(job)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+async fn apply_job(txn: &mut dyn ControlTxn, job: &JobRow) -> Result<u64, ControlError> {
+    txn.job_upsert(job).await
 }
 
 /// 按 `(job_id, task_no)` upsert。单调/终态判定见 [`task_row_ok`]；终态行恒清
 /// `dedupe_key`（延迟重放的旧行不能把已释放的去重键塞回去）。
-async fn apply_job_task(cw: &mut ControlWrite<'_>, task: &JobTaskRow) -> Result<u64, sqlx::Error> {
-    jobs_tx(cw)
-        .job_task_upsert(task)
-        .await
-        .map_err(crate::control_store::to_sqlx)
+async fn apply_job_task(txn: &mut dyn ControlTxn, task: &JobTaskRow) -> Result<u64, ControlError> {
+    txn.job_task_upsert(task).await
 }
 
 /// 整批语义：先只读校验全部行，任一行不合法 → `Conflict` 且零写入；校验通过后
 /// 每行 upsert 必须恰好影响 1 行（否则内部不变量破坏，fail-stop）。
 async fn apply_job_batch(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     jobs: &[JobRow],
     tasks: &[JobTaskRow],
     restores: &[TierRestoreRow],
-) -> Result<ControlResponse, sqlx::Error> {
+) -> Result<ControlResponse, ControlError> {
     let mut batch_ids = HashSet::new();
     for job in jobs {
         if !batch_ids.insert(job.id) {
             return Ok(ControlResponse::Conflict);
         }
-        let cur = current_job(cw, job.id).await?;
+        let cur = current_job(txn, job.id).await?;
         if job_row_ok(cur.as_ref(), job).is_err() {
             return Ok(ControlResponse::Conflict);
         }
@@ -1232,17 +1120,17 @@ async fn apply_job_batch(
         if !seen.insert((task.job_id, task.task_no)) {
             return Ok(ControlResponse::Conflict);
         }
-        if !batch_ids.contains(&task.job_id) && current_job(cw, task.job_id).await?.is_none() {
+        if !batch_ids.contains(&task.job_id) && current_job(txn, task.job_id).await?.is_none() {
             return Ok(ControlResponse::Conflict);
         }
-        let cur = current_task(cw, task.job_id, task.task_no).await?;
+        let cur = current_task(txn, task.job_id, task.task_no).await?;
         if task_row_ok(cur.as_ref(), task).is_err() {
             return Ok(ControlResponse::Conflict);
         }
         if !task_terminal(&task.state)
             && let Some(key) = &task.dedupe_key
             && (!keys.insert(key.clone())
-                || dedupe_taken(cw, key, task.job_id, task.task_no).await?)
+                || dedupe_taken(txn, key, task.job_id, task.task_no).await?)
         {
             return Ok(ControlResponse::Conflict);
         }
@@ -1260,22 +1148,22 @@ async fn apply_job_batch(
         // 与任务同规则：引用的 job 必须在本批或本地已存在（RunState::validate 不允许悬空）。
         if let Some(job_id) = restore.job_id
             && !batch_ids.contains(&job_id)
-            && current_job(cw, job_id).await?.is_none()
+            && current_job(txn, job_id).await?.is_none()
         {
             return Ok(ControlResponse::Conflict);
         }
-        let cur = current_restore(cw, &restore.bucket, &restore.key, &restore.version_id).await?;
+        let cur = current_restore(txn, &restore.bucket, &restore.key, &restore.version_id).await?;
         if restore_row_ok(cur.as_ref(), restore).is_err() {
             return Ok(ControlResponse::Conflict);
         }
     }
     for job in jobs {
-        if apply_job(cw, job).await? != 1 {
+        if apply_job(txn, job).await? != 1 {
             return Err(invariant(format!("job {} upsert affected 0 rows", job.id)));
         }
     }
     for task in tasks {
-        if apply_job_task(cw, task).await? != 1 {
+        if apply_job_task(txn, task).await? != 1 {
             return Err(invariant(format!(
                 "task {}/{} upsert affected 0 rows",
                 task.job_id, task.task_no
@@ -1283,10 +1171,7 @@ async fn apply_job_batch(
         }
     }
     for restore in restores {
-        let applied = crate::control_store::SqliteControlTxn::new(cw.conn())
-            .tier_restore_upsert(restore)
-            .await
-            .map_err(crate::control_store::to_sqlx)?;
+        let applied = txn.tier_restore_upsert(restore).await?;
         if !applied {
             return Err(invariant(format!(
                 "restore {}/{}/{} upsert affected 0 rows",
@@ -1304,16 +1189,13 @@ async fn apply_job_batch(
 /// - 一行未删且仍有 id 存在（非终态）→ `Conflict`（零写入，保留 queued/running/preempted）；
 /// - 混合时终态行照删并返回 `Ok`，非终态行保留。
 async fn purge_jobs(
-    cw: &mut ControlWrite<'_>,
+    txn: &mut dyn ControlTxn,
     job_ids: &[i64],
-) -> Result<ControlResponse, sqlx::Error> {
+) -> Result<ControlResponse, ControlError> {
     if validate_job_purge(job_ids).is_err() {
         return Ok(ControlResponse::Invalid);
     }
-    let (deleted, non_terminal) = jobs_tx(cw)
-        .purge_terminal_jobs(job_ids)
-        .await
-        .map_err(crate::control_store::to_sqlx)?;
+    let (deleted, non_terminal) = txn.purge_terminal_jobs(job_ids).await?;
     Ok(if deleted > 0 || non_terminal == 0 {
         ControlResponse::Ok
     } else {
@@ -1324,6 +1206,8 @@ async fn purge_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Db;
+    use xl_store::control_store::account::AccountTxn;
 
     /// 状态机白名单必须覆盖 worker 的真实转换（含 paused/preempted 收尾），且终态冻结。
     #[test]

@@ -5821,6 +5821,7 @@ impl Db {
     /// 删桶级联：所有从属行（含 level-4/5 复制的 inventory_runs/tier_restores）都在
     /// 同一条日志/事务内删除；各副本 apply 同一命令，不得由服务节点本地直删。
     /// 返回桶行是否存在（不存在 → NotFound，但仍清残留从属行，幂等）。
+    #[allow(dead_code)] // Direct-apply SQLite façade retained for tests/migration until H1.
     pub(crate) async fn delete_bucket_cascade(
         cw: &mut ControlWrite<'_>,
         bucket: &str,
