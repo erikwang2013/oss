@@ -25,7 +25,7 @@ use crate::raft::runstate::{
 use crate::raft::store::SqliteLogStore;
 
 pub(super) struct Fixture {
-    _dir: tempfile::TempDir,
+    pub(super) _dir: tempfile::TempDir,
     pub control: PathBuf,
     pub raft: PathBuf,
     pub state: PathBuf,
@@ -461,7 +461,7 @@ pub(super) async fn fixture() -> Fixture {
     }
 }
 
-async fn checkpoint(url: &str) {
+pub(super) async fn checkpoint(url: &str) {
     let pool = sqlx::SqlitePool::connect(url).await.unwrap();
     sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
         .execute(&pool)

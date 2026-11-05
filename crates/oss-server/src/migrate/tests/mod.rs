@@ -10,15 +10,43 @@ use openraft::{Entry, Vote};
 use xl_store::control_state::root::Mode;
 use xl_store::control_store::sites::SiteStore;
 
-use super::source::Source;
+use super::source::{self, Source};
 use super::{export, object_install, run};
 use crate::control_store_obj::{ObjectControlStore, RootIo};
 use fixture::{
-    Fixture, fixture, log_id, open_store, raft_checksum, read_control, read_source, source_checksum,
+    Fixture, checkpoint, fixture, log_id, open_store, raft_checksum, read_control, read_source,
+    source_checksum,
 };
 
 async fn apply(f: &Fixture) -> super::Report {
     run(&f.control, &f.state, &f.raft, false).await.unwrap()
+}
+
+/// Schema-only control DB: no control rows and an unseeded runstate. `marker`
+/// sets `schema_meta.raft_feature_level`; `None` leaves it absent (level 1).
+async fn empty_fixture(raft: bool, marker: Option<&str>) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let control = dir.path().join("oss.db");
+    let raft_db = dir.path().join("raft.db");
+    let state = dir.path().join("state");
+    let control_url = format!("sqlite://{}?mode=rwc", control.display());
+    let db = crate::db::Db::connect_site(&control_url, raft, None)
+        .await
+        .unwrap();
+    if let Some(level) = marker {
+        db.schema_meta_set(crate::raft::compat::META_FEATURE_LEVEL, level)
+            .await
+            .unwrap();
+    }
+    db.pool().close().await;
+    drop(db);
+    checkpoint(&control_url).await;
+    Fixture {
+        _dir: dir,
+        control,
+        raft: raft_db,
+        state,
+    }
 }
 
 #[tokio::test]
@@ -88,6 +116,47 @@ async fn apply_boots_and_rerun_is_idempotent() {
         "rerun must not rewrite the root"
     );
     assert_eq!(source_checksum(&f), before);
+}
+
+/// A fresh source has an empty runstate and no activation marker. A fresh Raft
+/// source has no account rows either, so its snapshot must stay level 1 instead
+/// of being rejected for a level-3 extension. Standalone backfill inserts the
+/// system account, so the same empty runstate legitimately reaches level 3.
+#[tokio::test]
+async fn empty_runstate_source_migrates_and_boots() {
+    for (raft, marker, mode, required) in [
+        (true, None, Mode::Raft, 1),
+        (true, Some("1"), Mode::Raft, 1),
+        (false, None, Mode::Standalone, 3),
+    ] {
+        let f = empty_fixture(raft, marker).await;
+        let source = read_source(&f).await;
+        assert!(source.runstate.is_empty(), "fixture must be empty");
+        assert_eq!(source.feature_marker, 1, "marker {marker:?}");
+        assert_eq!(source.mode, mode, "marker {marker:?}");
+        assert_eq!(source::required_feature(&source), required);
+        assert_eq!(source::effective_feature(&source), required);
+
+        let report = apply(&f).await;
+        assert_eq!(report.status, "applied");
+        assert_eq!(report.feature.marker, 1);
+        assert_eq!(report.feature.required, required);
+        assert_eq!(report.feature.effective, required);
+        let object = report.object.as_ref().unwrap();
+        assert_eq!(object.snapshot_sha256, report.source_snapshot_sha256);
+        assert_eq!(object.runstate_sha256, report.source_runstate_sha256);
+
+        let boot =
+            crate::control_backend::ObjectControl::open(open_store(&f.state).await, mode, None)
+                .await
+                .unwrap();
+        let pinned = boot.control.pin().await.unwrap();
+        assert_eq!(pinned.root.meta.mode, mode);
+        assert_eq!(pinned.root.meta.feature_level, u16::from(required));
+        drop(boot);
+
+        assert_eq!(apply(&f).await.status, "already-applied");
+    }
 }
 
 #[tokio::test]

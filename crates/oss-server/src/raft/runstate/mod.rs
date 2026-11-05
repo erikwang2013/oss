@@ -114,14 +114,20 @@ fn decode_envelope(bytes: &[u8], max_version: u32) -> Result<(u32, RunState), Da
     Ok((envelope.version, envelope.runstate))
 }
 
-/// 编码带 `m8.runstate` 扩展的 OSSCTL3 快照；非空运行态要求 `feature_level >= 3`。
+/// 编码带 `m8.runstate` 扩展的快照；非空运行态要求 `feature_level >= 3`。
+///
+/// 空运行态不是 level-3 数据：低于 3 时省略扩展，封套保持 OSSCTL1/V2（与
+/// [`RunState::required_feature_level`] 一致）。level >= 3 仍恒写扩展（空载荷），
+/// 与生产状态机快照及 A8 黄金样本逐字节一致。
 pub fn encode_runstate_snapshot(
     data: &ControlData,
     runstate: &RunState,
     feature_level: u8,
 ) -> Result<Vec<u8>, DataError> {
     let mut extensions = SnapshotExtensions::new();
-    extensions.insert(RUNSTATE_EXTENSION.into(), to_snapshot_extension(runstate)?);
+    if !runstate.is_empty() || feature_level >= crate::raft::compat::FEATURE_LEVEL_3 {
+        extensions.insert(RUNSTATE_EXTENSION.into(), to_snapshot_extension(runstate)?);
+    }
     encode_snapshot_with_extensions(data, feature_level, extensions)
 }
 
