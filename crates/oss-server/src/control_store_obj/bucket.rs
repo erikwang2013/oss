@@ -128,6 +128,7 @@ pub(crate) async fn delete_prefix(
 }
 
 pub(crate) async fn clear_table(txn: &mut ObjectControlTxn, table: TableId) -> CResult<()> {
+    txn.bulk_rebuild(table);
     for (key, _) in txn_scan_all(txn, table).await? {
         txn.delete(table, &key).await.map_err(backend)?;
     }

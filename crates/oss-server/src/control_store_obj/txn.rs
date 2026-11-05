@@ -293,6 +293,21 @@ impl ObjectControlTxn {
         Ok(existed)
     }
 
+    /// Rebuild every table bottom-up at commit. Snapshot install and migrator
+    /// import stage whole tables, so path-copying per row is wasted work.
+    pub(crate) fn bulk_install(&mut self) {
+        for tree in self.trees.values_mut() {
+            tree.bulk_rebuild();
+        }
+    }
+
+    /// Mark one table for a bottom-up rebuild (whole-table replace helpers).
+    pub(crate) fn bulk_rebuild(&mut self, table: TableId) {
+        if let Some(tree) = self.trees.get_mut(&table.as_u16()) {
+            tree.bulk_rebuild();
+        }
+    }
+
     /// Overlay-aware point read; blobs are reassembled and verified.
     pub async fn get(&self, table: TableId, key: &[u8]) -> Result<Option<Vec<u8>>> {
         match self.tree(table).get_leaf(&*self.root, key).await? {

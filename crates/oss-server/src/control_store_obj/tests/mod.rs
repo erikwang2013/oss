@@ -5,6 +5,7 @@ mod account_fixtures;
 mod account_snapshot;
 mod account_write;
 mod basic;
+mod bulk;
 mod conflict;
 mod control_guards;
 mod control_guards_exceptions;

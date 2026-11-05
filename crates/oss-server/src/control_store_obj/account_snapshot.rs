@@ -111,6 +111,8 @@ impl AccountSnapshotTxn for ObjectControlTxn {
         members: &[AccountMemberEntry],
         canonical: bool,
     ) -> Result<(), ControlError> {
+        self.bulk_rebuild(TableId::AccountMembers);
+        self.bulk_rebuild(TableId::Accounts);
         for m in scan_members(self).await? {
             self.delete(TableId::AccountMembers, &uid_key(m.uid))
                 .await

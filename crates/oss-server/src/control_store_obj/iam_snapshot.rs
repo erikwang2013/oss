@@ -186,6 +186,7 @@ impl IamSnapshotTxn for ObjectControlTxn {
     }
 
     async fn permissions_clear(&mut self) -> Result<(), ControlError> {
+        self.bulk_rebuild(TableId::Permissions);
         for row in scan_permissions(self).await? {
             self.delete(
                 TableId::Permissions,

@@ -19,6 +19,7 @@ use super::io::{NodeIo, get_node};
 use super::node::{InternalEntry, LeafEntry, LeafValue, NodeEntries};
 use crate::error::{Error, Result};
 
+mod bulk;
 mod update;
 
 /// Typed per-table key order. Bytewise today; composite keys can plug in here.
@@ -52,6 +53,8 @@ pub struct TableTree {
     bytes: u64,
     staged: BTreeMap<Vec<u8>, LeafValue>,
     cmp: Box<dyn KeyComparator>,
+    /// Rebuild the whole table bottom-up on flush instead of path copying.
+    bulk: bool,
 }
 
 impl Default for TableTree {
@@ -72,7 +75,15 @@ impl TableTree {
             bytes: 0,
             staged: BTreeMap::new(),
             cmp,
+            bulk: false,
         }
+    }
+
+    /// Switch this tree to bulk rebuilds. Snapshot install and migrator import
+    /// stage a whole table, so rebuilding it once writes each node once instead
+    /// of rewriting the root-to-key path per row.
+    pub fn bulk_rebuild(&mut self) {
+        self.bulk = true;
     }
 
     /// Reopen a table from its committed root (`TableRoot {hash, rows, bytes}`).

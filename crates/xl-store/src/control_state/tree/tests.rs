@@ -1,3 +1,5 @@
+mod bulk;
+
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 

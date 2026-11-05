@@ -155,6 +155,7 @@ pub(super) async fn install(
             let data_snapshot = data_snapshot.clone();
             let runstate = runstate.clone();
             Box::pin(async move {
+                txn.bulk_install();
                 let admin_id = txn.admin_id().await.map_err(store_err)?;
                 let ctx = InstallCtx {
                     admin_id,

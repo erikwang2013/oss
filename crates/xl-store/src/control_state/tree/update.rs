@@ -14,6 +14,9 @@ impl TableTree {
         if self.staged.is_empty() {
             return Ok(());
         }
+        if self.bulk {
+            return self.flush_bulk(io).await;
+        }
         let mut staged = std::mem::take(&mut self.staged);
         let mut applied: Vec<(Vec<u8>, LeafValue)> = Vec::with_capacity(staged.len());
         let mut root = self.root;
@@ -268,7 +271,7 @@ impl TableTree {
     }
 }
 
-fn validate_mutation(mutation: Mutation<'_>) -> Result<()> {
+pub(super) fn validate_mutation(mutation: Mutation<'_>) -> Result<()> {
     if let Mutation::Put(value) = mutation {
         match value {
             LeafValue::Row(bytes) if bytes.len() > INLINE_MAX => {
@@ -319,7 +322,7 @@ fn apply_counters(
     }
 }
 
-fn leaf_node(entries: Vec<LeafEntry>) -> Node {
+pub(super) fn leaf_node(entries: Vec<LeafEntry>) -> Node {
     Node {
         kind: NodeKind::Leaf,
         level: 0,
@@ -327,7 +330,7 @@ fn leaf_node(entries: Vec<LeafEntry>) -> Node {
     }
 }
 
-fn internal_node(level: u16, entries: Vec<InternalEntry>) -> Node {
+pub(super) fn internal_node(level: u16, entries: Vec<InternalEntry>) -> Node {
     Node {
         kind: NodeKind::Internal,
         level,
@@ -335,7 +338,7 @@ fn internal_node(level: u16, entries: Vec<InternalEntry>) -> Node {
     }
 }
 
-fn first_key(node: &Node) -> Result<Vec<u8>> {
+pub(super) fn first_key(node: &Node) -> Result<Vec<u8>> {
     match &node.entries {
         NodeEntries::Leaf(entries) => entries
             .first()
@@ -393,7 +396,7 @@ fn entry_size<T: serde::Serialize>(entry: &T) -> Result<usize> {
 }
 
 /// Greedy target split, then hard-cap repair. Order is preserved.
-fn split_leaf(entries: Vec<LeafEntry>) -> Result<Vec<Vec<LeafEntry>>> {
+pub(super) fn split_leaf(entries: Vec<LeafEntry>) -> Result<Vec<Vec<LeafEntry>>> {
     let mut groups: Vec<Vec<LeafEntry>> = Vec::new();
     let mut cur = Vec::new();
     let mut acc = 0;
@@ -423,7 +426,7 @@ fn split_leaf(entries: Vec<LeafEntry>) -> Result<Vec<Vec<LeafEntry>>> {
     Ok(out)
 }
 
-fn split_internal(entries: Vec<InternalEntry>) -> Result<Vec<Vec<InternalEntry>>> {
+pub(super) fn split_internal(entries: Vec<InternalEntry>) -> Result<Vec<Vec<InternalEntry>>> {
     let mut groups: Vec<Vec<InternalEntry>> = Vec::new();
     let mut cur = Vec::new();
     let mut acc = 0;

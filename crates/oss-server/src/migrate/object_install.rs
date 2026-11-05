@@ -58,6 +58,7 @@ pub(crate) async fn install_with(
     let mut txn = control
         .begin_at(pinned, WriteOrigin::snapshot_install())
         .await?;
+    txn.bulk_install();
 
     for row in &source.raw.users {
         put_user(&mut txn, row).await?;

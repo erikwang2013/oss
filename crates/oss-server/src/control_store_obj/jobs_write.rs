@@ -424,6 +424,7 @@ impl JobTxn for ObjectControlTxn {
 impl ObjectControlTxn {
     pub(super) async fn clear_runstate_tables(&mut self) -> Result<(), ControlError> {
         for table in [TableId::Jobs, TableId::JobTasks, TableId::ScheduleLease] {
+            self.bulk_rebuild(table);
             for (key, _) in scan_txn(self, table).await? {
                 self.delete(table, &key).await.map_err(backend)?;
             }

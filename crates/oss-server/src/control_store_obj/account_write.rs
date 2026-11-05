@@ -405,6 +405,7 @@ impl AccountTxn for ObjectControlTxn {
     }
 
     async fn account_ledger_clear(&mut self) -> Result<(), ControlError> {
+        self.bulk_rebuild(TableId::AccountUsageLedger);
         for row in scan_ledger(self).await? {
             self.delete(TableId::AccountUsageLedger, row.account_id.as_bytes())
                 .await

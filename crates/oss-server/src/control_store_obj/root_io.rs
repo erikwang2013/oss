@@ -257,46 +257,29 @@ impl RootIo {
         blob::join(blob, &chunks)
     }
 
+    /// Create a content-addressed object. `expected: None` means version 0, so
+    /// a successful blind put proves the key was absent and needs no read-back.
+    /// Only a conflict (already present) or an indeterminate write reads it to
+    /// check that the existing bytes match.
     async fn create_once(&self, key: &str, bytes: &[u8]) -> Result<()> {
         for _ in 0..CREATE_ATTEMPTS {
-            if let Some(existing) = self.backend.get_local_control(key).await? {
-                if existing.data == bytes {
-                    return Ok(());
-                }
-                return Err(Error::CorruptMeta(format!(
-                    "duplicate create of {key} with different bytes"
-                )));
-            }
             match self
                 .backend
                 .put_local_control(key, bytes, None, self.alloc_fence(1))
                 .await
             {
-                Ok(_) => {
-                    let Some(created) = self.backend.get_local_control(key).await? else {
-                        return Err(Error::CorruptMeta(format!(
-                            "object {key} missing after create"
-                        )));
-                    };
-                    return if created.data == bytes {
-                        Ok(())
-                    } else {
-                        Err(Error::CorruptMeta(format!(
-                            "object {key} read-back mismatch"
-                        )))
-                    };
-                }
-                Err(Error::Conflict(_)) => continue,
-                Err(Error::Indeterminate(_)) => {
-                    if let Some(created) = self.backend.get_local_control(key).await? {
-                        return if created.data == bytes {
+                Ok(_) => return Ok(()),
+                Err(Error::Conflict(_) | Error::Indeterminate(_)) => {
+                    if let Some(existing) = self.backend.get_local_control(key).await? {
+                        return if existing.data == bytes {
                             Ok(())
                         } else {
                             Err(Error::CorruptMeta(format!(
-                                "object {key} read-back mismatch"
+                                "duplicate create of {key} with different bytes"
                             )))
                         };
                     }
+                    // `Indeterminate` with no visible object: retry the create.
                     continue;
                 }
                 Err(e) => return Err(e),
