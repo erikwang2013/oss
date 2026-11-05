@@ -740,7 +740,7 @@ pub async fn run(
             if let Some(q) = &state.audit
                 && let Some(rx) = q.take_rx()
             {
-                crate::audit_queue::spawn_worker(state.db.pool().clone(), rx);
+                crate::audit_queue::spawn_worker(state.db.clone(), rx);
             }
 
             // M3 集群：起节点间 gRPC（独立端口）。绑定期检同 HTTP——失败即退出，不假活。

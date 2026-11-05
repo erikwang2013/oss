@@ -527,6 +527,15 @@ impl Db {
 
     /// `schema_meta` 读（不存在 = None）。
     pub async fn schema_meta(&self, key: &str) -> Result<Option<String>> {
+        // 对象后端的 schema_meta 落在根 meta.markers（迁移原样搬运）。
+        if let Some(object) = self.object.get() {
+            let pinned = object
+                .control
+                .pin()
+                .await
+                .map_err(|e| sqlx::Error::Protocol(format!("对象控制面根读取失败：{e}")))?;
+            return Ok(pinned.root.meta.markers.get(key).cloned());
+        }
         let row = sqlx::query("SELECT value FROM schema_meta WHERE key = ?")
             .bind(key)
             .fetch_optional(&self.pool)
@@ -1470,6 +1479,38 @@ impl Db {
         }
     }
 
+    /// 对象后端「本地域」写入（sync intent 等 `LocalKv`）：单次 begin + commit，
+    /// **不做根 CAS 重试**——本地写已在调用时生效，重放会重复副作用。
+    pub async fn object_local_write<T, F>(&self, actor: &str, f: F) -> Result<T>
+    where
+        T: Send,
+        F: for<'a> FnOnce(
+            &'a mut crate::control_store_obj::ObjectControlTxn,
+        ) -> futures::future::BoxFuture<
+            'a,
+            std::result::Result<T, xl_store::control_store::ControlError>,
+        >,
+    {
+        let Some(object) = self.object.get() else {
+            return Err(sqlx::Error::Protocol("对象控制面未装配".into()));
+        };
+        let mut txn = object
+            .control
+            .begin(crate::control_store_obj::WriteOrigin::local(actor))
+            .await
+            .map_err(|e| sqlx::Error::Protocol(format!("对象控制面事务失败：{e}")))?;
+        let out = f(&mut txn).await;
+        match out {
+            Ok(value) => {
+                txn.commit()
+                    .await
+                    .map_err(|e| sqlx::Error::Protocol(format!("对象控制面提交失败：{e}")))?;
+                Ok(value)
+            }
+            Err(e) => Err(sqlx::Error::Protocol(format!("对象控制面本地写失败：{e}"))),
+        }
+    }
+
     /// 自然键属主 → 本节点数字 id（console JSON 边界用）：`Admin` → 首个管理员；
     /// `User(name)` → `users.id`；缺失（含无管理员）→ 0。
     pub async fn owner_uid(&self, owner: &OwnerRef) -> Result<i64> {
@@ -1504,6 +1545,35 @@ impl Db {
 
     pub async fn create_user(&self, username: &str, password: &str, is_admin: bool) -> Result<i64> {
         let hash = crate::db::hash_password(password);
+        // 对象后端：用户行 + 派生账户/成员同一根 CAS，重复用户名经
+        // `is_unique_violation` 的文本匹配映射为 400。
+        if self.object.get().is_some() {
+            let username = username.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let username = username.clone();
+                    let hash = hash.clone();
+                    Box::pin(async move {
+                        let id = txn
+                            .user_create_default_status(&username, &hash, is_admin, now())
+                            .await?;
+                        if !is_admin && let Some(acct) = xl_s3::access::account_id_of(id) {
+                            txn.account_insert_derived_if_absent(
+                                &acct,
+                                &username,
+                                id,
+                                now(),
+                                now(),
+                            )
+                            .await?;
+                            txn.account_member_insert_if_absent(&acct, id, "owner", now())
+                                .await?;
+                        }
+                        Ok(id)
+                    })
+                })
+                .await;
+        }
         // 旧形状：三条独立自动提交语句（失败可留部分行，不做跨语句回滚）。
         let mut conn = self.pool.acquire().await?;
         let id = crate::control_store::SqliteControlTxn::new(&mut conn)
@@ -2208,6 +2278,35 @@ impl Db {
     /// Raft 模式不得调用（账户表经快照复制，由 leader 用既有 AccountCreate/
     /// AccountMemberAttach 命令修复）。
     pub async fn canonicalize_legacy_accounts_once(&self) -> Result<usize> {
+        // 对象后端：同样三条修复在同一根 CAS 内；marker 省略（迁移已搬，
+        // 函数本身幂等）。
+        // shortcut: 对象模式不写 accounts_canonical marker，升级点=需要对象侧
+        // accounts_canonical() 对未迁移库也为真时，用具体 txn 的 set_marker。
+        if self.object.get().is_some() {
+            return self
+                .control_write("accounts-canonical", |txn| {
+                    Box::pin(async move {
+                        txn.account_members_delete_admins().await?;
+                        txn.accounts_delete_admin_derived().await?;
+                        let users = txn.legacy_users_missing_accounts().await?;
+                        let ts = now();
+                        let mut changed = 0usize;
+                        for (uid, username) in users {
+                            let Some(acct) = xl_s3::access::account_id_of(uid) else {
+                                continue;
+                            };
+                            changed += txn
+                                .account_insert_derived_if_absent(&acct, &username, uid, ts, ts)
+                                .await? as usize;
+                            changed += txn
+                                .account_member_insert_if_absent(&acct, uid, "owner", ts)
+                                .await? as usize;
+                        }
+                        Ok(changed)
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let ts = now();
         let mut changed = 0usize;
@@ -4665,6 +4764,19 @@ impl Db {
 
     /// 开一条作业（worker 每次执行一条）。
     pub async fn job_start(&self, kind: &str, bucket: &str, prefix: &str, now: i64) -> Result<i64> {
+        if self.object.get().is_some() {
+            let kind = kind.to_owned();
+            let bucket = bucket.to_owned();
+            let prefix = prefix.to_owned();
+            return self
+                .control_write("jobs", move |txn| {
+                    let kind = kind.clone();
+                    let bucket = bucket.clone();
+                    let prefix = prefix.clone();
+                    Box::pin(async move { txn.job_start(&kind, &bucket, &prefix, now).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let id = crate::control_store::SqliteControlTxn::new(&mut tx)
             .job_start(kind, bucket, prefix, now)
@@ -4687,6 +4799,20 @@ impl Db {
         error: Option<&str>,
         now: i64,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let state = state.to_owned();
+            let error = error.map(str::to_owned);
+            return self
+                .control_write("jobs", move |txn| {
+                    let state = state.clone();
+                    let error = error.clone();
+                    Box::pin(async move {
+                        txn.job_finish(id, &state, scanned, deleted, skipped, error.as_deref(), now)
+                            .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .job_finish(id, state, scanned, deleted, skipped, error, now)
@@ -4933,6 +5059,25 @@ impl Db {
         timeout_secs: i64,
         fence: FencingEpoch,
     ) -> Result<Option<ClaimedTask>> {
+        // 对象后端：根 CAS 提供串行化；闭包可重跑（纯行读写）。
+        if self.object.get().is_some() {
+            return self
+                .control_write("jobs", move |txn| {
+                    Box::pin(async move {
+                        let claim = txn
+                            .job_claim(now, timeout_secs, fence.term_i64(), fence.leader_i64())
+                            .await?;
+                        Ok(claim.map(|c| ClaimedTask {
+                            job_id: c.job_id,
+                            task_no: c.task_no,
+                            action: c.action,
+                            payload_json: c.payload_json,
+                            attempt: c.attempt,
+                        }))
+                    })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         // 单节点领取仍需 SQLite 写锁串行化；缝只借用调用方事务，不接管 BEGIN/COMMIT。
         sqlx::raw_sql("BEGIN IMMEDIATE").execute(&mut *conn).await?;
@@ -4967,6 +5112,16 @@ impl Db {
         deadline_at: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            return self
+                .control_write("jobs", move |txn| {
+                    Box::pin(async move {
+                        txn.task_set_deadline(job_id, task_no, deadline_at, fence.term_i64())
+                            .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .task_set_deadline(job_id, task_no, deadline_at, fence.term_i64())
@@ -4996,6 +5151,16 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<bool> {
+        if self.object.get().is_some() {
+            return self
+                .control_write("jobs", move |txn| {
+                    Box::pin(async move {
+                        txn.requeue_task(job_id, task_no, now, fence.term_i64())
+                            .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let hit = crate::control_store::SqliteControlTxn::new(&mut tx)
             .requeue_task(job_id, task_no, now, fence.term_i64())
@@ -5017,6 +5182,13 @@ impl Db {
         if capacity == 0 {
             return Ok(0);
         }
+        if self.object.get().is_some() {
+            return self
+                .control_write("jobs", move |txn| {
+                    Box::pin(async move { txn.preempt_lower_priority(capacity, now).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let n = crate::control_store::SqliteControlTxn::new(&mut tx)
             .preempt_lower_priority(capacity, now)
@@ -5031,6 +5203,13 @@ impl Db {
     /// 返回释放数。正在运行的高优先级任务不阻塞释放——空闲容量应回到低优先级作业，
     /// 领取顺序仍保证后续高优先级任务先被取走。
     pub async fn release_preempted(&self, now: i64) -> Result<usize> {
+        if self.object.get().is_some() {
+            return self
+                .control_write("jobs", move |txn| {
+                    Box::pin(async move { txn.release_preempted(now).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let n = crate::control_store::SqliteControlTxn::new(&mut tx)
             .release_preempted(now)
@@ -5099,6 +5278,29 @@ impl Db {
         max_attempts: i64,
         fence: FencingEpoch,
     ) -> Result<&'static str> {
+        if self.object.get().is_some() {
+            let code = code.to_owned();
+            let message = message.map(str::to_owned);
+            return self
+                .control_write("jobs", move |txn| {
+                    let code = code.clone();
+                    let message = message.clone();
+                    Box::pin(async move {
+                        txn.finish_task(
+                            job_id,
+                            task_no,
+                            ok,
+                            &code,
+                            message.as_deref(),
+                            now,
+                            max_attempts,
+                            fence.term_i64(),
+                        )
+                        .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let out = crate::control_store::SqliteControlTxn::new(&mut tx)
             .finish_task(
@@ -5158,6 +5360,23 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            return self
+                .control_write("jobs", move |txn| {
+                    Box::pin(async move {
+                        txn.take_over_task(
+                            job_id,
+                            task_no,
+                            started_before,
+                            now,
+                            fence.term_i64(),
+                            fence.leader_i64(),
+                        )
+                        .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .take_over_task(
@@ -5178,6 +5397,13 @@ impl Db {
     /// lifecycle/inventory 等单条作业只写 jobs 行；进程在 job_start 之后崩溃会永久停在
     /// running。`cutoff` 限定 updated_at（长作业靠心跳续命，避免把仍在跑的扫描误标 error）。
     pub async fn recover_orphan_jobs(&self, cutoff: i64, now: i64) -> Result<usize> {
+        if self.object.get().is_some() {
+            return self
+                .control_write("jobs", move |txn| {
+                    Box::pin(async move { txn.recover_orphan_jobs(cutoff, now).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let n = crate::control_store::SqliteControlTxn::new(&mut tx)
             .recover_orphan_jobs(cutoff, now)
@@ -5189,6 +5415,13 @@ impl Db {
 
     /// M2：长作业心跳（只续 running 行），让 orphan 回收按 liveness 而非创建时间判断。
     pub async fn job_heartbeat(&self, job_id: i64, now: i64) -> Result<()> {
+        if self.object.get().is_some() {
+            return self
+                .control_write("jobs", move |txn| {
+                    Box::pin(async move { txn.job_heartbeat(job_id, now).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .job_heartbeat(job_id, now)
@@ -5265,6 +5498,15 @@ impl Db {
 
     /// 作业级错误文案（报告写失败等；不改任务终态）。
     pub async fn job_set_error(&self, id: i64, msg: &str, now: i64) -> Result<()> {
+        if self.object.get().is_some() {
+            let msg = msg.to_owned();
+            return self
+                .control_write("jobs", move |txn| {
+                    let msg = msg.clone();
+                    Box::pin(async move { txn.job_set_error(id, &msg, now).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .job_set_error(id, msg, now)
@@ -5316,6 +5558,15 @@ impl Db {
 
     /// 状态操作：`pause`/`resume`/`cancel`。返回是否有行被改（false = 不存在或状态不允许）。
     pub async fn job_set_state(&self, id: i64, action: &str, now: i64) -> Result<bool> {
+        if self.object.get().is_some() {
+            let action = action.to_owned();
+            return self
+                .control_write("jobs", move |txn| {
+                    let action = action.clone();
+                    Box::pin(async move { txn.job_set_state(id, &action, now).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let hit = crate::control_store::SqliteControlTxn::new(&mut tx)
             .job_set_state(id, action, now)
@@ -5327,6 +5578,13 @@ impl Db {
 
     /// 失败任务重试：建子作业（只含 failed 任务，原 task_no 保留为顺序），返回新 job id。
     pub async fn job_retry_failed(&self, id: i64, now: i64) -> Result<Option<i64>> {
+        if self.object.get().is_some() {
+            return self
+                .control_write("jobs", move |txn| {
+                    Box::pin(async move { txn.job_retry_failed(id, now).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let new_id = crate::control_store::SqliteControlTxn::new(&mut tx)
             .job_retry_failed(id, now)
@@ -5370,6 +5628,18 @@ impl Db {
 
     /// 单机保留清理：一个事务内删除终态作业历史，返回删除的 jobs 行数。
     pub async fn purge_terminal_jobs_local(&self, ids: &[i64]) -> Result<u64> {
+        if self.object.get().is_some() {
+            let ids = ids.to_vec();
+            return self
+                .control_write("jobs", move |txn| {
+                    let ids = ids.clone();
+                    Box::pin(async move {
+                        let (deleted, _) = txn.purge_terminal_jobs(&ids).await?;
+                        Ok(deleted)
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let (deleted, _) = {
             let mut cw = crate::raft::apply::control_tx(&mut tx);
@@ -5660,6 +5930,13 @@ impl Db {
 
     /// Inventory 作业的 `progress` = 已扫描对象数（任务收尾时引擎会 +1，调用方存 n-1）。
     pub async fn job_set_progress(&self, job_id: i64, progress: i64, now: i64) -> Result<()> {
+        if self.object.get().is_some() {
+            return self
+                .control_write("jobs", move |txn| {
+                    Box::pin(async move { txn.job_set_progress(job_id, progress, now).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .job_set_progress(job_id, progress, now)
@@ -5756,6 +6033,13 @@ impl Db {
     pub async fn delete_audit_older_than(&self, cutoff: i64, limit: i64) -> Result<u64> {
         use xl_store::control_store::audit::AuditTxn;
 
+        if self.object.get().is_some() {
+            return self
+                .object_local_write("lifecycle", move |txn| {
+                    Box::pin(async move { txn.audit_delete_older_than(cutoff, limit).await })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         let n = crate::control_store::SqliteControlTxn::new(&mut conn)
             .audit_delete_older_than(cutoff, limit)

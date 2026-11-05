@@ -12,6 +12,7 @@ mod control_site_cascade;
 mod control_site_triggers;
 mod control_site_triggers_extras;
 mod crash;
+mod db_object;
 #[path = "../../../tests/support/golden.rs"]
 mod golden;
 mod hooks_cascade;

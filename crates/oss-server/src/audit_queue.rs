@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use sqlx::SqlitePool;
 use tokio::sync::mpsc;
 
 use xl_s3::access::AuditSink;
@@ -98,7 +97,7 @@ fn now_secs() -> i64 {
 }
 
 /// 批量写 worker（serve 路径且仅调用一次）。
-pub fn spawn_worker(pool: SqlitePool, mut rx: mpsc::Receiver<AuditEntry>) {
+pub fn spawn_worker(db: Arc<crate::db::Db>, mut rx: mpsc::Receiver<AuditEntry>) {
     tokio::spawn(async move {
         let mut batch = Vec::with_capacity(BATCH_MAX);
         loop {
@@ -118,7 +117,7 @@ pub fn spawn_worker(pool: SqlitePool, mut rx: mpsc::Receiver<AuditEntry>) {
                     Err(_) => break,
                 }
             }
-            flush(&pool, &mut batch).await;
+            flush(&db, &mut batch).await;
             if closed {
                 return;
             }
@@ -126,20 +125,23 @@ pub fn spawn_worker(pool: SqlitePool, mut rx: mpsc::Receiver<AuditEntry>) {
     });
 }
 
-async fn flush(pool: &SqlitePool, batch: &mut Vec<AuditEntry>) {
+async fn flush(db: &crate::db::Db, batch: &mut Vec<AuditEntry>) {
     if batch.is_empty() {
         return;
     }
-    if insert_batch(pool, batch).await.is_err() {
-        // 瞬时 busy/锁冲突重试一次；仍失败则放弃该批（审计不得反压请求）。
-        if let Err(e) = insert_batch(pool, batch).await {
-            tracing::warn!(error = %e, rows = batch.len(), "审计批量写入失败，丢弃该批");
-        }
+    let mut err = insert_batch(db, batch).await.err();
+    // 瞬时 busy/锁冲突重试一次；仍失败则放弃该批（审计不得反压请求）。
+    // 对象模式不重试：审计行已写入本地日志，重放会重复。
+    if err.is_some() && db.object_control().is_none() {
+        err = insert_batch(db, batch).await.err();
+    }
+    if let Some(e) = err {
+        tracing::warn!(error = %e, rows = batch.len(), "审计批量写入失败，丢弃该批");
     }
     batch.clear();
 }
 
-async fn insert_batch(pool: &SqlitePool, rows: &[AuditEntry]) -> Result<(), sqlx::Error> {
+async fn insert_batch(db: &crate::db::Db, rows: &[AuditEntry]) -> Result<(), sqlx::Error> {
     use xl_store::control_store::audit::{AuditTxn, NewAuditRecord};
 
     let records: Vec<NewAuditRecord> = rows
@@ -154,7 +156,17 @@ async fn insert_batch(pool: &SqlitePool, rows: &[AuditEntry]) -> Result<(), sqlx
             detail: r.detail.clone(),
         })
         .collect();
-    let mut tx = pool.begin().await?;
+    if db.object_control().is_some() {
+        db.object_local_write("audit", move |txn| {
+            Box::pin(async move {
+                txn.audit_insert_batch(&records).await?;
+                Ok(())
+            })
+        })
+        .await?;
+        return Ok(());
+    }
+    let mut tx = db.pool().begin().await?;
     crate::control_store::SqliteControlTxn::new(&mut tx)
         .audit_insert_batch(&records)
         .await
@@ -178,19 +190,11 @@ mod tests {
     /// worker 成批落库（沿用 events 测试的内存 SQLite 单连接池模式）。
     #[tokio::test]
     async fn worker_writes_batched_rows() {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::raw_sql(
-            "CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, \
-              uid INTEGER NOT NULL, op TEXT NOT NULL, bucket TEXT, object_key TEXT, \
-              decision TEXT NOT NULL, detail TEXT);",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let db = Arc::new(crate::db::Db::connect("sqlite::memory:").await.unwrap());
 
         let q = AuditQueue::new(QUEUE_CAPACITY);
         let rx = q.take_rx().expect("rx 只能取一次");
-        spawn_worker(pool.clone(), rx);
+        spawn_worker(db.clone(), rx);
         assert!(q.enqueue(7, "PutObject", Some("b"), Some("k"), "allow", Some("d")));
         assert!(q.enqueue(0, "GetObject", Some("b"), Some("k"), "deny", None));
 
@@ -198,7 +202,7 @@ mod tests {
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(20)).await;
             rows = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
-                .fetch_one(&pool)
+                .fetch_one(db.pool())
                 .await
                 .unwrap();
             if rows == 2 {
@@ -207,7 +211,7 @@ mod tests {
         }
         assert_eq!(rows, 2, "worker 应把两条审计行批量写入");
         let uid: i64 = sqlx::query_scalar("SELECT uid FROM audit_log WHERE decision = 'allow'")
-            .fetch_one(&pool)
+            .fetch_one(db.pool())
             .await
             .unwrap();
         assert_eq!(uid, 7);

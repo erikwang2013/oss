@@ -18,6 +18,8 @@ use serde::Deserialize;
 use xl_s3::access::{Action, AuthedUser};
 use xl_s3::events::EventSink as _;
 use xl_s3::sync_delete::SyncDeleteSink as _;
+use xl_store::control_store::OwnerRef;
+use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry};
 use xl_store::control_store::event_outbox::{EventOutboxStore, EventOutboxTxn};
 use xl_store::control_store::repl_outbox::ReplOutboxStore;
 use xl_store::control_store::sites::SiteStore;
@@ -2803,6 +2805,90 @@ async fn create_bucket(
             }
         },
     };
+    // 对象后端：行写入走 BucketTxn（根 CAS），物理桶仍是先建后补偿。
+    if state.db.control_backend() == crate::config::ControlBackend::Objects {
+        let owner = if is_admin {
+            OwnerRef::Admin
+        } else {
+            match state.db.get_user(uid).await {
+                Ok(Some((name, _, _))) => OwnerRef::User(name),
+                Ok(None) => return internal_error(),
+                Err(e) => {
+                    tracing::error!(error = %e, "查询桶主失败");
+                    return internal_error();
+                }
+            }
+        };
+        let entry = BucketEntry {
+            name: body.name.clone(),
+            owner,
+            creation_date: crate::db::now(),
+            versioning: if replication_mode == "sync" {
+                "Enabled"
+            } else {
+                "Off"
+            }
+            .into(),
+            object_lock: false,
+            default_encryption: None,
+            object_lock_default_mode: None,
+            object_lock_default_days: None,
+            replication_mode: replication_mode.into(),
+            deleting: false,
+        };
+        if let Err(e) = state.store.create_bucket(&body.name).await {
+            return store_error(e).into_response();
+        }
+        // 管理员桶归系统账户，不占用户配额（与 SQLite 门面 uid 0 同口径）。
+        let quota_owner = (!is_admin).then_some(uid);
+        let out = state
+            .db
+            .control_write("console", move |txn| {
+                let entry = entry.clone();
+                Box::pin(async move {
+                    // SQLite 语义：只有新建行判配额，重建收敛不占新配额。
+                    if !txn.bucket_exists(&entry.name).await?
+                        && txn.bucket_quota_reached(quota_owner).await?
+                    {
+                        return Ok((true, BucketCreateOutcome::Created));
+                    }
+                    Ok((false, txn.bucket_create(&entry).await?))
+                })
+            })
+            .await;
+        match out {
+            Ok((true, _)) => {
+                if let Err(re) = state.store.delete_bucket(&body.name).await {
+                    tracing::warn!(error = %re, bucket = %body.name, "配额拒绝后回滚物理桶失败");
+                }
+                return (StatusCode::FORBIDDEN, "账户桶配额已用尽").into_response();
+            }
+            Ok((false, BucketCreateOutcome::ModeConflict)) => {
+                if let Err(re) = state.store.delete_bucket(&body.name).await {
+                    tracing::warn!(error = %re, bucket = %body.name, "模式冲突后回滚物理桶失败");
+                }
+                return (
+                    StatusCode::CONFLICT,
+                    "bucket replication mode cannot be changed on recreate",
+                )
+                    .into_response();
+            }
+            Ok((false, _)) => {}
+            Err(e) => {
+                tracing::error!(error = %e, bucket = %body.name, "写入桶行失败");
+                if let Err(re) = state.store.delete_bucket(&body.name).await {
+                    tracing::warn!(error = %re, bucket = %body.name, "行写失败回滚物理桶失败");
+                }
+                return internal_error();
+            }
+        }
+        state.store.invalidate_gate(&body.name);
+        state
+            .store
+            .broadcast_bucket_row(&body.name, Some(set))
+            .await;
+        return StatusCode::NO_CONTENT.into_response();
+    }
     if let Err(e) = state.store.create_bucket(&body.name).await {
         return store_error(e).into_response();
     }

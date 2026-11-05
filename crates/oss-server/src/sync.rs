@@ -12,13 +12,13 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use xl_s3::sync_delete::SyncDeleteSink;
 use xl_store::control_store::sync_intents::{
-    NewSyncDeleteIntent, NewSyncWriteIntent, SyncIntentStore, SyncIntentTxn,
+    NewSyncDeleteIntent, NewSyncWriteIntent, SyncIntentTxn,
 };
 use xl_store::error::Error as StoreError;
 use xl_store::gate::{GateError, GateRequest, GateTicket, PutCommitGate};
 use xl_store::store::{DeleteMarkerSpec, DeleteOutcome, Store, VersioningMode};
 
-use crate::control_store::{SqliteControlStore, SqliteControlTxn};
+use crate::control_store::SqliteControlTxn;
 use crate::db::Db;
 use crate::repl_client::{ReplClient, ReplError};
 use crate::state::AppState;
@@ -172,6 +172,28 @@ impl SiteSyncGate {
         let now = crate::db::now();
         let tee_path = req.plaintext.to_string_lossy().into_owned();
         let commit_json = serde_json::json!({ "etag": req.etag, "size": req.size }).to_string();
+        let intent = NewSyncWriteIntent {
+            id: req.local_version_id.to_string(),
+            bucket: req.bucket.to_string(),
+            key: req.key.to_string(),
+            local_version_id: req.local_version_id.to_string(),
+            remote_version_id: req.local_version_id.to_string(),
+            tee_path,
+            commit_json,
+            state: INTENT_PENDING.to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        if self.db.object_control().is_some() {
+            // 对象模式：intent 在 LocalKv，写入即时生效（D4），不参与根 CAS 重试。
+            return self
+                .db
+                .object_local_write("sync", move |txn| {
+                    Box::pin(async move { txn.sync_write_intent_insert(&intent).await })
+                })
+                .await
+                .map_err(|e| GateError::Unavailable(format!("write intent: {e}")));
+        }
         let mut conn = self
             .db
             .pool()
@@ -183,24 +205,27 @@ impl SiteSyncGate {
             .await
             .map_err(|e| GateError::Unavailable(format!("intent pragma: {e}")))?;
         SqliteControlTxn::new(&mut conn)
-            .sync_write_intent_insert(&NewSyncWriteIntent {
-                id: req.local_version_id.to_string(),
-                bucket: req.bucket.to_string(),
-                key: req.key.to_string(),
-                local_version_id: req.local_version_id.to_string(),
-                remote_version_id: req.local_version_id.to_string(),
-                tee_path,
-                commit_json,
-                state: INTENT_PENDING.to_string(),
-                created_at: now,
-                updated_at: now,
-            })
+            .sync_write_intent_insert(&intent)
             .await
             .map_err(|e| GateError::Unavailable(format!("write intent: {e}")))?;
         Ok(())
     }
 
     async fn intent_done(&self, id: &str) {
+        if self.db.object_control().is_some() {
+            let key = id.to_owned();
+            let now = crate::db::now();
+            let out = self
+                .db
+                .object_local_write("sync", move |txn| {
+                    Box::pin(async move { txn.sync_write_intent_mark_done(&key, now).await })
+                })
+                .await;
+            if let Err(e) = out {
+                tracing::warn!(id, error = %e, "sync intent 状态更新失败");
+            }
+            return;
+        }
         let done = match self.db.pool().acquire().await {
             Ok(mut conn) => {
                 SqliteControlTxn::new(&mut conn)
@@ -234,13 +259,29 @@ impl SiteSyncGate {
 /// 清理一条写 intent：先删 tee，再删行（中途崩溃时行仍在，下轮恢复）。
 /// 返回 `true` 仅当 intent 行已删除；tee 删除失败仍算清理成功（行是恢复的依据）。
 async fn clean_intent(db: &Db, id: &str) -> bool {
-    let tee = SqliteControlStore::new(db.pool().clone())
+    let tee = db
+        .control_store()
         .sync_write_intent_tee(id)
         .await
         .ok()
         .flatten();
     if let Some(p) = tee {
         let _ = tokio::fs::remove_file(p).await;
+    }
+    if db.object_control().is_some() {
+        let key = id.to_owned();
+        return match db
+            .object_local_write("sync", move |txn| {
+                Box::pin(async move { txn.sync_write_intent_delete(&key).await })
+            })
+            .await
+        {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(id, error = %e, "sync intent 删除失败（下轮恢复重试）");
+                false
+            }
+        };
     }
     let deleted = match db.pool().acquire().await {
         Ok(mut conn) => {
@@ -266,10 +307,7 @@ async fn clean_intent(db: &Db, id: &str) -> bool {
 async fn clean_orphan_tees(state: &AppState) {
     let dir = state.store.tee_dir();
     let referenced: std::collections::HashSet<String> =
-        match SqliteControlStore::new(state.db.pool().clone())
-            .sync_write_intent_tees()
-            .await
-        {
+        match state.db.control_store().sync_write_intent_tees().await {
             Ok(v) => v.into_iter().collect(),
             Err(e) => {
                 tracing::warn!(error = %e, "tee 清理：读取 intent 失败（本轮跳过）");
@@ -310,7 +348,9 @@ pub async fn recover_write_intents(state: &AppState) {
     // sync.timeout_ms + 提交耗时；60s 裕量覆盖病态 fsync。否则 worker 可能删掉
     // 仍在途、但远端已提交的版本（客户端 200、远端无副本）。
     let cutoff = crate::db::now() - (state.cfg.sync.timeout_ms as i64 / 1000 + 60);
-    let rows = match SqliteControlStore::new(state.db.pool().clone())
+    let rows = match state
+        .db
+        .control_store()
         .sync_write_intents_stale(cutoff)
         .await
     {
@@ -717,6 +757,27 @@ impl SiteSyncDelete {
     ) -> Result<String, StoreError> {
         let id = uuid::Uuid::new_v4().to_string();
         let now = crate::db::now();
+        let intent = NewSyncDeleteIntent {
+            id: id.clone(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            op: op.to_string(),
+            local_version_id: local_version_id.to_string(),
+            remote_version_id: remote_version_id.to_string(),
+            marker_version_id: marker_version_id.to_string(),
+            state: INTENT_PENDING.to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        if self.db.object_control().is_some() {
+            self.db
+                .object_local_write("sync", move |txn| {
+                    Box::pin(async move { txn.sync_delete_intent_insert(&intent).await })
+                })
+                .await
+                .map_err(|e| StoreError::Unavailable(format!("delete intent: {e}")))?;
+            return Ok(id);
+        }
         let mut conn = self
             .db
             .pool()
@@ -728,24 +789,27 @@ impl SiteSyncDelete {
             .await
             .map_err(|e| StoreError::Unavailable(format!("intent pragma: {e}")))?;
         SqliteControlTxn::new(&mut conn)
-            .sync_delete_intent_insert(&NewSyncDeleteIntent {
-                id: id.clone(),
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-                op: op.to_string(),
-                local_version_id: local_version_id.to_string(),
-                remote_version_id: remote_version_id.to_string(),
-                marker_version_id: marker_version_id.to_string(),
-                state: INTENT_PENDING.to_string(),
-                created_at: now,
-                updated_at: now,
-            })
+            .sync_delete_intent_insert(&intent)
             .await
             .map_err(|e| StoreError::Unavailable(format!("delete intent: {e}")))?;
         Ok(id)
     }
 
     async fn intent_done(&self, id: &str) {
+        if self.db.object_control().is_some() {
+            let key = id.to_owned();
+            let now = crate::db::now();
+            let out = self
+                .db
+                .object_local_write("sync", move |txn| {
+                    Box::pin(async move { txn.sync_delete_intent_mark_done(&key, now).await })
+                })
+                .await;
+            if let Err(e) = out {
+                tracing::warn!(id, error = %e, "delete intent 状态更新失败（恢复按 pending 重放）");
+            }
+            return;
+        }
         let done = match self.db.pool().acquire().await {
             Ok(mut conn) => {
                 SqliteControlTxn::new(&mut conn)
@@ -762,6 +826,19 @@ impl SiteSyncDelete {
     }
 
     async fn intent_clean(&self, id: &str) {
+        if self.db.object_control().is_some() {
+            let key = id.to_owned();
+            let out = self
+                .db
+                .object_local_write("sync", move |txn| {
+                    Box::pin(async move { txn.sync_delete_intent_delete(&key).await })
+                })
+                .await;
+            if let Err(e) = out {
+                tracing::warn!(id, error = %e, "delete intent 删除失败（下轮恢复重试）");
+            }
+            return;
+        }
         let deleted = match self.db.pool().acquire().await {
             Ok(mut conn) => {
                 SqliteControlTxn::new(&mut conn)
@@ -1332,7 +1409,9 @@ impl SyncDeleteSink for SiteSyncDelete {
 /// `remote_done` 只补本地；本地失败保留行下一轮重试（不重启也恢复）。
 pub async fn recover_delete_intents(state: &AppState) {
     let cutoff = crate::db::now() - (state.cfg.sync.timeout_ms as i64 / 1000 + 60);
-    let rows = match SqliteControlStore::new(state.db.pool().clone())
+    let rows = match state
+        .db
+        .control_store()
         .sync_delete_intents_stale(cutoff, RECOVER_BATCH)
         .await
     {
