@@ -8,10 +8,9 @@ use super::iam::{
     user_row_by_username,
 };
 use super::table::TableId;
+use super::txn::RAFT_GUARD;
 use xl_store::control_state::root::Mode;
 use xl_store::control_store::ControlError;
-
-pub(crate) const RAFT_GUARD: &str = "raft: control write outside apply";
 
 /// True when the raft guard does not apply: standalone mode, or a replicated
 /// origin (Raft apply / snapshot install) is the writer.

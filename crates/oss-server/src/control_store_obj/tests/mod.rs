@@ -6,7 +6,14 @@ mod account_snapshot;
 mod account_write;
 mod basic;
 mod conflict;
+mod control_guards;
+mod control_guards_exceptions;
+mod control_site_cascade;
+mod control_site_triggers;
+mod control_site_triggers_extras;
 mod crash;
+#[path = "../../../tests/support/golden.rs"]
+mod golden;
 mod hooks_cascade;
 mod hooks_iam;
 mod iam;

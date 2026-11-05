@@ -23,6 +23,10 @@ use super::table::{TableId, known_table_ids};
 /// Bounded whole-transaction attempts on root CAS conflict (design §2.2 step 5).
 pub const MAX_COMMIT_ATTEMPTS: usize = 8;
 
+/// Denial raised by the raft guard (design §5.1). Must match the SQLite trigger
+/// message byte for byte: the golden matrix pins it.
+pub(crate) const RAFT_GUARD: &str = "raft: control write outside apply";
+
 /// Cache publication callback, invoked once after a successful root CAS.
 pub type CachePublish = Arc<dyn Fn(&CommitStamp) + Send + Sync>;
 
@@ -246,6 +250,7 @@ impl ObjectControlTxn {
     /// Stage a row. Values above 16 KiB are written as chunks immediately (before
     /// any node that references them), so a later node flush sees an existing blob.
     pub async fn put(&mut self, table: TableId, key: &[u8], value: &[u8]) -> Result<()> {
+        self.guard_local_write(table)?;
         if value.len() > MAX_BLOB_BYTES {
             return Err(Error::InvalidArgument(format!(
                 "control row is {} bytes, over the {MAX_BLOB_BYTES} byte cap",
@@ -263,6 +268,7 @@ impl ObjectControlTxn {
 
     /// Stage a delete; returns whether the row was visible before the delete.
     pub async fn delete(&mut self, table: TableId, key: &[u8]) -> Result<bool> {
+        self.guard_local_write(table)?;
         let existed = self.get(table, key).await?.is_some();
         self.stage(table, key.to_vec(), StagedRow::Delete);
         Ok(existed)
@@ -369,6 +375,18 @@ impl ObjectControlTxn {
             }
         }
         unreachable!("attempt loop always returns")
+    }
+
+    /// Replicated tables with no row exception reject any non-replicated writer,
+    /// including `SiteApply`; zero bytes are staged before the check.
+    fn guard_local_write(&self, table: TableId) -> Result<()> {
+        if self.meta.mode == Mode::Raft
+            && !self.origin.is_replicated()
+            && table.raft_guard_no_exception()
+        {
+            return Err(Error::InvalidArgument(RAFT_GUARD.into()));
+        }
+        Ok(())
     }
 
     fn tree(&self, table: TableId) -> &TableTree {

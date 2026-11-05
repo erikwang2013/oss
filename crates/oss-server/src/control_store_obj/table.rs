@@ -109,6 +109,23 @@ impl TableId {
         0
     }
 
+    /// Replicated tables whose raft guard has no row exception; the transaction
+    /// layer enforces them so no adapter can forget the check. The IAM tables
+    /// carry their own exception matrix in `iam_write`.
+    pub(crate) const fn raft_guard_no_exception(self) -> bool {
+        matches!(
+            self,
+            Self::Buckets
+                | Self::BucketPolicies
+                | Self::LifecycleRules
+                | Self::EventConfigs
+                | Self::ReplicationRules
+                | Self::AccessPoints
+                | Self::OlapConfigs
+                | Self::InventoryConfigs
+        )
+    }
+
     pub const fn from_u16(id: u16) -> Option<Self> {
         Some(match id {
             1 => Self::Users,
