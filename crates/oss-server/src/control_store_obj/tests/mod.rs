@@ -3,6 +3,13 @@
 mod basic;
 mod conflict;
 mod crash;
+mod parity_ap_olap_vpc;
+mod parity_bucket;
+mod parity_cascade;
+mod parity_inventory;
+mod parity_lifecycle;
+mod parity_tier;
+mod parity_util;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};

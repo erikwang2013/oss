@@ -78,6 +78,46 @@ impl ObjectControlStore {
         self.pin().await?.root.check_compatible(&known_table_ids())
     }
 
+    /// Point read directly from a freshly pinned root (cold read path, design D7).
+    pub(crate) async fn read_row(&self, table: TableId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let Some(tree) = self.pinned_tree(table).await? else {
+            return Ok(None);
+        };
+        match tree.get_leaf(&*self.root, key).await? {
+            None | Some(LeafValue::Tombstone) => Ok(None),
+            Some(LeafValue::Row(bytes)) => Ok(Some(bytes)),
+            Some(LeafValue::Blob(blob)) => Ok(Some(self.root.get_blob(&blob).await?)),
+        }
+    }
+
+    /// Ordered range read directly from a freshly pinned root.
+    pub(crate) async fn read_range(
+        &self,
+        table: TableId,
+        range: Range<&[u8]>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some(tree) = self.pinned_tree(table).await? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for (key, value) in tree.scan_leaf(&*self.root, range).await? {
+            match value {
+                LeafValue::Row(bytes) => out.push((key, bytes)),
+                LeafValue::Blob(blob) => out.push((key, self.root.get_blob(&blob).await?)),
+                LeafValue::Tombstone => {}
+            }
+        }
+        Ok(out)
+    }
+
+    async fn pinned_tree(&self, table: TableId) -> Result<Option<TableTree>> {
+        let pinned = self.pin().await?;
+        Ok(pinned
+            .root
+            .table(table.as_u16())
+            .map(|root| TableTree::from_root(root.hash, root.rows, root.bytes)))
+    }
+
     /// Start a transaction at the current generation. The origin is mandatory.
     pub async fn begin(self: &Arc<Self>, origin: WriteOrigin) -> Result<ObjectControlTxn> {
         let pinned = self.pin().await?;
