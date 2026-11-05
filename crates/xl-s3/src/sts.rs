@@ -160,12 +160,19 @@ impl StsRoute {
             .ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing RoleArn"))?;
         let role = parse_role_arn(&arn)
             .ok_or_else(|| s3s::s3_error!(InvalidRequest, "invalid RoleArn"))?;
-        let role_uid: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND status = 'active'")
-                .bind(&role)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
+        let role_uid = match crate::control::request_view() {
+            Some(view) => view.active_user_uid(&role).await.map_err(|e| {
+                tracing::error!(error = %e, role, "control view role lookup failed");
+                s3s::s3_error!(InternalError, "internal error")
+            })?,
+            None => {
+                sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND status = 'active'")
+                    .bind(&role)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(db_err)?
+            }
+        };
         let Some(role_uid) = role_uid else {
             return Err(s3s::s3_error!(AccessDenied, "role not found or disabled"));
         };
@@ -296,12 +303,19 @@ impl StsRoute {
         let verified = wi
             .verify(&token, &arn, requested)
             .map_err(web_identity_error)?;
-        let role_uid: Option<i64> =
-            sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND status = 'active'")
-                .bind(&verified.role)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(db_err)?;
+        let role_uid = match crate::control::request_view() {
+            Some(view) => view.active_user_uid(&verified.role).await.map_err(|e| {
+                tracing::error!(error = %e, role = %verified.role, "control view role lookup failed");
+                s3s::s3_error!(InternalError, "internal error")
+            })?,
+            None => {
+                sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND status = 'active'")
+                    .bind(&verified.role)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(db_err)?
+            }
+        };
         let Some(role_uid) = role_uid else {
             // 映射命中但本地角色不存在/停用：拒绝，绝不回退到其他用户。
             return Err(s3s::s3_error!(
@@ -355,6 +369,16 @@ impl StsRoute {
 
     /// 调用者（须长时键）：uid + is_admin。会话键不得作为调用者（父链只有一层；S2）。
     async fn caller_of(&self, ak: &str) -> S3Result<Option<(i64, bool)>> {
+        if let Some(view) = crate::control::request_view() {
+            return view
+                .sts_caller(ak, now_secs())
+                .await
+                .map(|u| u.map(|u| (u.uid, u.is_admin)))
+                .map_err(|e| {
+                    tracing::error!(error = %e, ak, "control view STS caller lookup failed");
+                    s3s::s3_error!(InternalError, "internal error")
+                });
+        }
         let row = sqlx::query(
             "SELECT ak.user_id AS uid, u.is_admin AS is_admin \
              FROM access_keys ak JOIN users u ON u.id = ak.user_id \

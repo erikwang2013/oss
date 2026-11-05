@@ -5,6 +5,9 @@
 //! supplied by the server (the object-root hot view) and must keep the documented
 //! fail-closed semantics.
 
+use std::future::Future;
+use std::sync::Arc;
+
 use xl_store::control_store::ControlError;
 
 use crate::access::{Action, AuthedUser};
@@ -135,4 +138,27 @@ pub trait ControlAcl: Send + Sync {
     ) -> Result<Option<(String, String)>, ControlError>;
     /// `sites` row count (sync bucket-creation gate).
     async fn site_peer_count(&self) -> Result<usize, ControlError>;
+}
+
+/// One request's immutable hot view: auth and ACL reads over the same root
+/// generation. Implemented by the server's captured `RequestView`.
+pub trait Control: ControlAuth + ControlAcl {}
+
+impl<T: ControlAuth + ControlAcl + ?Sized> Control for T {}
+
+tokio::task_local! {
+    static REQUEST_CONTROL: Arc<dyn Control>;
+}
+
+/// Scope one captured view around a request. Every hot read inside the scope
+/// (SigV4 auth, STS caller lookup, ACL checks, bucket config, service handlers)
+/// observes the same generation; a concurrent commit affects only the next
+/// request. Outside the scope the SQLite paths run unchanged.
+pub async fn with_request_view<F: Future>(view: Arc<dyn Control>, f: F) -> F::Output {
+    REQUEST_CONTROL.scope(view, f).await
+}
+
+/// The view captured for the current request (`None` = SQLite backend).
+pub fn request_view() -> Option<Arc<dyn Control>> {
+    REQUEST_CONTROL.try_with(Arc::clone).ok()
 }

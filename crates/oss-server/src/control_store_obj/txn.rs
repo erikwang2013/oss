@@ -27,8 +27,9 @@ pub const MAX_COMMIT_ATTEMPTS: usize = 8;
 /// message byte for byte: the golden matrix pins it.
 pub(crate) const RAFT_GUARD: &str = "raft: control write outside apply";
 
-/// Cache publication callback, invoked once after a successful root CAS.
-pub type CachePublish = Arc<dyn Fn(&CommitStamp) + Send + Sync>;
+/// Cache publication callback, awaited once after a successful root CAS so the
+/// facade does not return before read-your-write holds on this node (§3).
+pub type CachePublish = Arc<dyn Fn(CommitStamp) -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// Result of a commit.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +48,7 @@ pub struct ObjectControlStore {
     pub root: Arc<RootIo>,
     /// Node-local operational state (D4): outboxes, uploads, audit, intents.
     pub(super) local: Option<Arc<LocalStore>>,
-    publisher: Option<CachePublish>,
+    publisher: std::sync::OnceLock<CachePublish>,
 }
 
 impl ObjectControlStore {
@@ -55,17 +56,25 @@ impl ObjectControlStore {
         Self {
             root,
             local: None,
-            publisher: None,
+            publisher: std::sync::OnceLock::new(),
         }
     }
 
-    /// Install a cache-publication callback (called once per successful CAS).
+    /// Install a cache-publication callback (awaited once per successful CAS).
     pub fn with_publisher(
         mut self,
-        publish: impl Fn(&CommitStamp) + Send + Sync + 'static,
+        publish: impl Fn(CommitStamp) -> BoxFuture<'static, ()> + Send + Sync + 'static,
     ) -> Self {
-        self.publisher = Some(Arc::new(publish));
+        self.publisher = std::sync::OnceLock::from(Arc::new(publish) as CachePublish);
         self
+    }
+
+    /// Install the publication callback on a shared handle (startup wiring).
+    pub fn set_publisher(
+        &self,
+        publish: impl Fn(CommitStamp) -> BoxFuture<'static, ()> + Send + Sync + 'static,
+    ) {
+        let _ = self.publisher.set(Arc::new(publish) as CachePublish);
     }
 
     /// Bootstrap the empty root when the store has none; returns the pin.
@@ -135,7 +144,7 @@ impl ObjectControlStore {
         let mut txn = ObjectControlTxn {
             root: Arc::clone(&self.root),
             local: self.local.clone(),
-            publisher: self.publisher.clone(),
+            publisher: self.publisher.get().cloned(),
             origin,
             pinned,
             meta,
@@ -337,7 +346,7 @@ impl ObjectControlTxn {
                         dirty_tables: dirty,
                     };
                     if let Some(publish) = &self.publisher {
-                        publish(&stamp);
+                        publish(stamp.clone()).await;
                     }
                     return Ok(stamp);
                 }

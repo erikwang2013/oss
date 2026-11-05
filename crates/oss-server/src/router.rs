@@ -371,7 +371,24 @@ pub fn build_router_with_trust(
              移除其写流量，本进程无法约束旧节点"
         );
     }
+    // E1：对象后端每请求捕获一个热视图，S3 鉴权/ACL/桶配置在请求内同代。
+    // SQLite 默认不挂层：热路径逐字节不变。
+    let app = match state.control_view.clone() {
+        Some(view) => app.layer(middleware::from_fn_with_state(view, capture_control_view)),
+        None => app,
+    };
     Ok(app)
+}
+
+/// 把 `ViewCache::capture()` 放进 task-local，供 xl-s3 的鉴权/ACL/桶配置读取；
+/// 请求之外（worker/后台任务）仍走各后端原路径。
+async fn capture_control_view(
+    State(view): State<Arc<crate::control_view::ViewCache>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let request: Arc<dyn xl_s3::control::Control> = Arc::new(view.capture());
+    xl_s3::control::with_request_view(request, next.run(req)).await
 }
 
 /// maintenance：非只读方法一律 503（S3 错误 XML + Retry-After）。
@@ -1674,5 +1691,73 @@ mod tests {
         assert_eq!(label_escape("a\\b"), "a\\\\b");
         assert_eq!(label_escape("a\nb"), "a\\nb");
         assert_eq!(label_escape("\\\""), "\\\\\\\"");
+    }
+
+    /// E1：请求内的控制提交不改变本请求已捕获的视图（同一 `Arc`），
+    /// 发布后的新代只对下一个请求生效。
+    #[tokio::test]
+    async fn captured_control_view_is_stable_within_one_request() {
+        use super::{Router, get};
+        use crate::control_backend::ObjectControl;
+        use crate::control_store_obj::{TableId, UserRow, WriteOrigin};
+        use std::sync::Arc;
+        use xl_store::control_state::root::Mode;
+        use xl_store::store::{Store, StoreConfig};
+
+        async fn probe(
+            axum::extract::State(control): axum::extract::State<
+                Arc<crate::control_store_obj::ObjectControlStore>,
+            >,
+        ) -> &'static str {
+            let before = xl_s3::control::request_view().expect("对象后端请求必须捕获视图");
+            let row = UserRow {
+                uid: 1,
+                username: "u1".into(),
+                password_hash: "h".into(),
+                is_admin: false,
+                status: "active".into(),
+                created_at: 1,
+            };
+            let mut txn = control.begin(WriteOrigin::local("probe")).await.unwrap();
+            txn.put(
+                TableId::Users,
+                b"u1",
+                &rmp_serde::to_vec_named(&row).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(txn.commit().await.unwrap().committed);
+            let after = xl_s3::control::request_view().expect("视图作用域覆盖整个请求");
+            assert!(Arc::ptr_eq(&before, &after), "同一请求不得混代");
+            "same"
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = StoreConfig::new(dir.path());
+        cfg.fsync = false;
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let object = ObjectControl::open(Arc::clone(&store), Mode::Standalone, None)
+            .await
+            .unwrap();
+        let cache = Arc::clone(&object.view);
+        let generation = cache.capture().generation;
+        assert!(generation >= 1);
+
+        let app = Router::new()
+            .route("/probe", get(probe))
+            .with_state(Arc::clone(&object.control))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&cache),
+                super::capture_control_view,
+            ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let resp = reqwest::get(format!("http://{addr}/probe")).await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.text().await.unwrap(), "same");
+        // 提交已发布：下一请求（及后续捕获）见新代。
+        assert_eq!(cache.capture().generation, generation + 1);
     }
 }

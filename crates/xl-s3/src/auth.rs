@@ -122,8 +122,8 @@ impl SigV4Auth {
 }
 
 // ponytail: 每请求查一次 AK、无缓存 —— SQLite 读不阻塞、撤销即时生效；量大再加缓存。
-// shortcut: SigV4 热路径只持 SqlitePool，看不到 oss-server 的 ControlStore 适配器；
-// 每请求 AK→SK 查询保留 raw SQL，最终移除 SQLite 或引入后端无关 pool 时再迁移（D7）。
+// shortcut: 请求外（无捕获视图：后台任务/离线命令）仍走 raw SQL；对象后端的请求内
+// 路径已由 `control::request_view` 视图化，视图缺失时按占位库 fail-closed。
 #[async_trait::async_trait]
 impl S3Auth for SigV4Auth {
     async fn get_secret_key(&self, access_key: &str) -> S3Result<SecretKey> {
@@ -131,6 +131,33 @@ impl S3Auth for SigV4Auth {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+
+        // 对象控制面（E1）：请求已捕获一份 HotView，AK→SK 走视图点查；
+        // 默认 SQLite 后端无视图作用域，下面的既有查询逐字节不变。
+        if let Some(view) = crate::control::request_view() {
+            return match view.key_auth(access_key, now).await {
+                // 视图返回的是存储态 SK（封存/明文），不再本地重封（写归控制面事务）。
+                Ok(crate::control::KeyLookup::Valid(key)) => self
+                    .resolve_sk(access_key, key.secret_key, false)
+                    .await
+                    .map(SecretKey::from),
+                Ok(crate::control::KeyLookup::ExpiredSession) => Err(S3Error::with_message(
+                    S3ErrorCode::ExpiredToken,
+                    "session token has expired",
+                )),
+                Ok(crate::control::KeyLookup::Invalid) => Err(S3Error::with_message(
+                    S3ErrorCode::InvalidAccessKeyId,
+                    "unknown access key",
+                )),
+                Err(e) => {
+                    tracing::error!(error = %e, access_key, "control view key lookup failed");
+                    Err(S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        "internal error",
+                    ))
+                }
+            };
+        }
 
         // JOIN users：账号停用（users.status）同样让 AK 失效——认证面与授权面同口径，
         // 停用即全链路出局（授权层 Acl::user_of_key 有一份同样的 JOIN，防单点遗漏）。

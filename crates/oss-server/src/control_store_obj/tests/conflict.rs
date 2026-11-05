@@ -145,7 +145,10 @@ async fn publisher_fires_once_per_successful_commit_not_on_noop_or_failure() {
     let control = Arc::new(
         ObjectControlStore::new(Arc::new(RootIo::with_backend(backend_io(&backend))))
             .with_publisher(move |_| {
-                counted.fetch_add(1, Ordering::SeqCst);
+                let counted = Arc::clone(&counted);
+                Box::pin(async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                })
             }),
     );
     control.bootstrap(Mode::Standalone, 100).await.unwrap();

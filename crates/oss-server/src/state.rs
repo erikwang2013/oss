@@ -86,6 +86,8 @@ pub struct AppState {
     pub admin_username: Option<String>,
     /// M9 S7.4：vault 主键探针（同一主键的两站点可互相 unseal；无 vault = None）。
     pub vault_probe: Option<String>,
+    /// E1：对象后端的请求热视图缓存（SQLite 默认 = None，读路径行为不变）。
+    pub control_view: Option<Arc<crate::control_view::ViewCache>>,
 }
 
 fn mesh_of(store: &Store) -> Option<xl_s3::access::ControlMesh> {
@@ -1087,6 +1089,7 @@ impl AppState {
             },
             None => None,
         };
+        let control_view = db.object_control().map(|object| Arc::clone(&object.view));
         let cfg = Arc::new(cfg);
         let ingest = Arc::new(crate::aether::IngestSink {
             store: Arc::clone(&store),
@@ -1133,6 +1136,7 @@ impl AppState {
             raft,
             admin_username,
             vault_probe,
+            control_view,
         }
     }
 }

@@ -397,6 +397,16 @@ fn now() -> i64 {
         .unwrap_or(0)
 }
 
+/// 当前请求捕获的热视图（`None` = SQLite 后端，走下面既有 SQL）。
+fn request_view() -> Option<Arc<dyn crate::control::Control>> {
+    crate::control::request_view()
+}
+
+/// 视图错误 → sqlx 通道：调用方既有的 fail-closed 500 映射不变。
+fn view_err(e: xl_store::control_store::ControlError) -> sqlx::Error {
+    sqlx::Error::Protocol(e.to_string())
+}
+
 impl Acl {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
@@ -430,6 +440,9 @@ impl Acl {
 
     /// 桶版本控制状态（M4 切片 3；`buckets.versioning`）：无行/旧库缺列值 → "Off"（fail-closed 兼容）。
     pub async fn bucket_versioning(&self, bucket: &str) -> Result<String, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.bucket_versioning(bucket).await.map_err(view_err);
+        }
         let row = sqlx::query("SELECT versioning FROM buckets WHERE name = ?")
             .bind(bucket)
             .fetch_optional(&self.pool)
@@ -444,6 +457,12 @@ impl Acl {
         &self,
         bucket: &str,
     ) -> Result<Option<String>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v
+                .bucket_replication_mode_row(bucket)
+                .await
+                .map_err(view_err);
+        }
         let row = sqlx::query("SELECT replication_mode FROM buckets WHERE name = ?")
             .bind(bucket)
             .fetch_optional(&self.pool)
@@ -453,6 +472,9 @@ impl Acl {
 
     /// M9：桶复制模式（行不存在 = "async"，与缺行旧桶同口径）。
     pub async fn bucket_replication_mode(&self, bucket: &str) -> Result<String, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.bucket_replication_mode(bucket).await.map_err(view_err);
+        }
         Ok(self
             .bucket_replication_mode_row(bucket)
             .await?
@@ -461,6 +483,9 @@ impl Acl {
 
     /// M9 S3：sync 建桶前置——数据站点 peer 数必须恰为 1（witness 不写 `sites` 行）。
     pub async fn site_peer_count(&self) -> Result<usize, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.site_peer_count().await.map_err(view_err);
+        }
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sites")
             .fetch_one(&self.pool)
             .await?;
@@ -473,6 +498,9 @@ impl Acl {
         &self,
         bucket: &str,
     ) -> Result<Option<(bool, Option<String>, Option<i64>)>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.bucket_lock(bucket).await.map_err(view_err);
+        }
         let row = sqlx::query(
             "SELECT object_lock, object_lock_default_mode, object_lock_default_days \
              FROM buckets WHERE name = ?",
@@ -529,6 +557,9 @@ impl Acl {
         &self,
         bucket: &str,
     ) -> Result<Option<crate::policy::PolicyDoc>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.bucket_policy(bucket).await.map_err(view_err);
+        }
         let row = sqlx::query("SELECT policy_json FROM bucket_policies WHERE bucket = ?")
             .bind(bucket)
             .fetch_optional(&self.pool)
@@ -603,6 +634,9 @@ impl Acl {
 
     /// M6 切片 0：桶通知配置（None = 未配置；json 原文，解析在 notify 模块）。
     pub async fn bucket_notification(&self, bucket: &str) -> Result<Option<String>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.bucket_notification(bucket).await.map_err(view_err);
+        }
         let row = sqlx::query("SELECT config_json FROM event_configs WHERE bucket = ?")
             .bind(bucket)
             .fetch_optional(&self.pool)
@@ -643,6 +677,9 @@ impl Acl {
         &self,
         bucket: &str,
     ) -> Result<Option<String>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.bucket_default_encryption(bucket).await.map_err(view_err);
+        }
         let row = sqlx::query("SELECT default_encryption FROM buckets WHERE name = ?")
             .bind(bucket)
             .fetch_optional(&self.pool)
@@ -805,6 +842,9 @@ impl Acl {
     ///（认证面与授权面查的是同一行，任一处撤销即同时失效）；**账号停用（users.status）
     /// 同样使 AK 失效**——停用即全链路出局。
     pub async fn user_of_key(&self, access_key: &str) -> Result<Option<AuthedUser>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.user_of_key(access_key, now()).await.map_err(view_err);
+        }
         // M5 切片 5：与 SigV4Auth::get_secret_key 同口径（含会话父链条件——三处 SQL 逐字
         // 一致：auth.rs / 此处 / cluster_control AccessKey；P3-1 补父**用户**停用同样传播）。
         let row = sqlx::query(
@@ -872,6 +912,9 @@ impl Acl {
     /// AC-0：用户当前账户（成员行优先，无行回落 uid 派生账户）。
     /// 策略主体把账户根 ARN 映射到账户成员集合时使用；查询失败由调用方 fail-closed。
     pub async fn account_id_of_user(&self, uid: i64) -> Result<Option<String>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.account_id_of_user(uid).await.map_err(view_err);
+        }
         let row = sqlx::query("SELECT account_id FROM account_members WHERE uid = ?")
             .bind(uid)
             .fetch_optional(&self.pool)
@@ -895,6 +938,9 @@ impl Acl {
         &self,
         uid: i64,
     ) -> Result<(Option<String>, bool), sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.account_identity_of_user(uid).await.map_err(view_err);
+        }
         let row = sqlx::query(
             "SELECT am.account_id AS account_id, a.status AS status \
              FROM account_members am LEFT JOIN accounts a ON a.id = am.account_id \
@@ -933,6 +979,9 @@ impl Acl {
     /// 这是快速检查（文案/错误码兼容）；权威判定在 standalone 写事务内、Raft leader
     /// append 前，并发建桶不会越过 `accounts.bucket_quota`。
     pub async fn bucket_quota_exceeded(&self, uid: i64) -> Result<bool, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.bucket_quota_exceeded(uid).await.map_err(view_err);
+        }
         let row = sqlx::query(
             "SELECT a.id AS id, a.status AS status, a.bucket_quota AS quota \
              FROM account_members am JOIN accounts a ON a.id = am.account_id \
@@ -1038,6 +1087,9 @@ impl Acl {
         &self,
         access_key: &str,
     ) -> Result<Option<crate::policy::PolicyDoc>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.session_policy_of(access_key).await.map_err(view_err);
+        }
         // 空串 = 控制台/aether 合成身份（AuthedUser 口径——各自面不走策略）→ 无会话
         if access_key.is_empty() {
             return Ok(None);
@@ -1077,6 +1129,9 @@ impl Acl {
 
     /// 桶主？（`buckets.owner_id == uid`）
     pub async fn is_owner(&self, bucket: &str, uid: i64) -> Result<bool, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.is_owner(bucket, uid).await.map_err(view_err);
+        }
         let row = sqlx::query("SELECT 1 FROM buckets WHERE name = ? AND owner_id = ?")
             .bind(bucket)
             .bind(uid)
@@ -1100,6 +1155,9 @@ impl Acl {
         &self,
         bucket: &str,
     ) -> Result<Option<(String, String)>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.bucket_owner_display(bucket).await.map_err(view_err);
+        }
         let row = match sqlx::query(
             "SELECT b.owner_id AS owner_id, u.username AS username FROM buckets b \
              LEFT JOIN users u ON u.id = b.owner_id WHERE b.name = ?",
@@ -1143,6 +1201,9 @@ impl Acl {
         action: Action,
         bucket: &str,
     ) -> Result<bool, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.can(&user, action, bucket).await.map_err(view_err);
+        }
         if user.is_admin {
             return Ok(true);
         }
@@ -1188,6 +1249,9 @@ impl Acl {
     /// 可见桶集合（列举过滤）：自有桶 ∪ 在 `permissions` 任一能力位为 1 的桶。
     /// 与磁盘列表**求交**使用（磁盘是权威——历史桶可能没有 DB 行）。
     pub async fn visible(&self, uid: i64) -> Result<Vec<String>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.visible(uid).await.map_err(view_err);
+        }
         let rows = sqlx::query(
             "SELECT name AS b FROM buckets WHERE owner_id = ? \
              UNION \
@@ -1211,6 +1275,17 @@ impl Acl {
             }
         }
         Ok(names)
+    }
+
+    /// 桶主账户硬配额（E1）：请求视图存在时读视图；否则走本地 `account_usage` 缓存路径。
+    pub async fn account_quota_for_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<crate::account_quota::AccountQuota>, sqlx::Error> {
+        if let Some(v) = request_view() {
+            return v.account_quota_for_bucket(bucket).await.map_err(view_err);
+        }
+        crate::account_quota::account_for_bucket(&self.pool, bucket).await
     }
 
     /// 桶归属登记（历史形态，无 set；幂等——已存在不覆盖，测试钉）。

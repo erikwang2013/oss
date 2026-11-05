@@ -22,7 +22,10 @@ async fn empty_txn_does_not_commit_or_publish() {
     let hits = Arc::clone(&published);
     let control = Arc::new(
         ObjectControlStore::new(Arc::clone(&real.control.root)).with_publisher(move |_| {
-            hits.fetch_add(1, Ordering::SeqCst);
+            let hits = Arc::clone(&hits);
+            Box::pin(async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
         }),
     );
     let stamp = control
@@ -175,7 +178,10 @@ async fn identical_put_is_a_noop_without_cas_or_publication() {
     let hits = Arc::clone(&published);
     let control = Arc::new(
         ObjectControlStore::new(Arc::clone(&real.control.root)).with_publisher(move |_| {
-            hits.fetch_add(1, Ordering::SeqCst);
+            let hits = Arc::clone(&hits);
+            Box::pin(async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+            })
         }),
     );
     let mut txn = control.begin(local()).await.unwrap();

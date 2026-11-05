@@ -24,10 +24,13 @@ use xl_store::control_store::ControlError;
 use xl_store::store::{LocalControlRootGuard, Store};
 
 use crate::control_store_obj::{ObjectControlStore, RootIo, WriteOrigin};
+use crate::control_view::{CacheDelta, ViewCache};
 
 /// 控制根锁 + 对象控制面句柄。`_root_lock` 必须在进程生命周期内持有。
 pub struct ObjectControl {
     pub control: Arc<ObjectControlStore>,
+    /// E1：请求热视图缓存；提交经 publisher 增长，快照安装走 [`Self::rebuild_view`]。
+    pub view: Arc<ViewCache>,
     _root_lock: LocalControlRootGuard,
 }
 
@@ -124,10 +127,37 @@ impl ObjectControl {
                 .map_err(|e| format!("写入对象 site_config 身份失败：{e}"))?;
         }
 
+        // E1：视图在种子之后加载（包含身份行）；publisher 在加载后安装，二者之间
+        // 若有提交，下一次发布按 generation 缺口整体重建，不会把旧表标成新代。
+        let view = ViewCache::load(Arc::clone(&control))
+            .await
+            .map_err(|e| format!("控制热视图加载失败：{e}"))?;
+        {
+            // Weak：store 持有 publisher，若 publisher 再强持 view 会形成
+            // store→publisher→view→store 的引用环；view 本身由本结构持有。
+            let view = Arc::downgrade(&view);
+            control.set_publisher(move |stamp| {
+                let view = view.clone();
+                Box::pin(async move {
+                    if let Some(view) = view.upgrade()
+                        && let Err(e) = view.publish(CacheDelta::from_stamp(&stamp)).await
+                    {
+                        tracing::error!(error = %e, "控制提交后热视图发布失败");
+                    }
+                })
+            });
+        }
+
         Ok(Arc::new(Self {
             control,
+            view,
             _root_lock: root_lock,
         }))
+    }
+
+    /// 快照安装/批量替换后，从新根整体重建热视图（§4；下一个请求见新代）。
+    pub async fn rebuild_view(&self) -> Result<(), ControlError> {
+        self.view.rebuild().await
     }
 }
 
