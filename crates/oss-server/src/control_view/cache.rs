@@ -193,6 +193,8 @@ impl CacheDelta {
 pub struct ViewCache {
     store: Arc<ObjectControlStore>,
     current: RwLock<Arc<HotView>>,
+    /// One publisher at a time: a full rebuild and a merge must never interleave.
+    publish_lock: tokio::sync::Mutex<()>,
     max_bytes: usize,
 }
 
@@ -209,6 +211,7 @@ impl ViewCache {
         Ok(Arc::new(Self {
             store,
             current: RwLock::new(view),
+            publish_lock: tokio::sync::Mutex::new(()),
             max_bytes,
         }))
     }
@@ -226,16 +229,39 @@ impl ViewCache {
     /// publish was missed) rebuilds everything, so a stale map is never tagged
     /// with a newer generation.
     pub async fn publish(&self, delta: CacheDelta) -> Result<(), ControlError> {
-        if !delta.full && delta.tables.is_empty() {
+        if !delta.full && delta.tables.is_empty() && delta.generation == 0 {
             return Ok(());
         }
+        let _publishing = self.publish_lock.lock().await;
         let current = self
             .current
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if !delta.full && delta.generation <= current.generation {
-            return Ok(());
+            if delta.tables.is_empty() {
+                return Ok(());
+            }
+            // A data commit older than the published generation: a concurrent
+            // metadata-only publisher may have skipped its tables, so rebuild
+            // from the current root instead of trusting the delta.
+            let next = HotView::load_with_cap(&self.store, self.max_bytes).await?;
+            return self.store_view(next);
+        }
+        if !delta.full && delta.tables.is_empty() {
+            // Metadata-only commits (applied id, membership, markers) advance the
+            // root without touching a table. Adopt the generation when it is the
+            // immediate successor so the next data commit still takes the merge
+            // path; a real gap falls through to the full rebuild.
+            if current.generation.checked_add(1) == Some(delta.generation) {
+                let mut next = (*current).clone();
+                next.generation = delta.generation;
+                let mut guard = self.current.write().unwrap_or_else(|e| e.into_inner());
+                if next.generation > guard.generation {
+                    *guard = Arc::new(next);
+                }
+                return Ok(());
+            }
         }
         let pinned = self.store.pin().await.map_err(backend)?;
         let next = if !delta.full
@@ -250,6 +276,10 @@ impl ViewCache {
         } else {
             HotView::load_with_cap(&self.store, self.max_bytes).await?
         };
+        self.store_view(next)
+    }
+
+    fn store_view(&self, next: Arc<HotView>) -> Result<(), ControlError> {
         let mut guard = self.current.write().unwrap_or_else(|e| e.into_inner());
         if next.generation > guard.generation {
             *guard = next;

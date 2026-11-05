@@ -126,6 +126,40 @@ async fn publish_gap_and_snapshot_install_rebuild_all() {
 }
 
 #[tokio::test]
+async fn empty_commit_advances_generation_and_next_data_commit_merges() {
+    let fx = fixture().await;
+    let cache = ViewCache::load(Arc::clone(&fx.control)).await.unwrap();
+    let mut t = txn(&fx).await;
+    t.set_applied(Some(xl_store::control_state::root::AppliedLog {
+        term: 1,
+        index: 1,
+    }));
+    let empty = t.commit().await.unwrap();
+    assert!(
+        empty.committed && empty.dirty_tables.is_empty(),
+        "{empty:?}"
+    );
+    let before = cache.capture();
+    cache.publish(CacheDelta::from_stamp(&empty)).await.unwrap();
+    let after = cache.capture();
+    assert_eq!(after.generation, empty.generation);
+    assert!(Arc::ptr_eq(&before.view.users, &after.view.users));
+
+    let mut t = txn(&fx).await;
+    put(&mut t, TableId::Buckets, b"b1", &bucket("b1", Some(1))).await;
+    let data = t.commit().await.unwrap();
+    assert!(data.committed && !data.dirty_tables.is_empty(), "{data:?}");
+    cache.publish(CacheDelta::from_stamp(&data)).await.unwrap();
+    let merged = cache.capture();
+    assert_eq!(merged.generation, data.generation);
+    assert!(merged.view.buckets.contains_key("b1"));
+    assert!(
+        Arc::ptr_eq(&after.view.users, &merged.view.users),
+        "the data publish must merge domains, not full-reload"
+    );
+}
+
+#[tokio::test]
 async fn memory_cap_fails_closed() {
     let fx = fixture().await;
     let err = HotView::load_with_cap(&fx.control, 1).await.unwrap_err();
