@@ -31,6 +31,7 @@ pub mod lifecycle;
 pub mod lifecycle_store;
 pub mod local_store;
 pub mod local_tier;
+pub mod migrate;
 pub mod raft;
 pub mod repl_client;
 pub mod replication;

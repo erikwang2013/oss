@@ -83,9 +83,16 @@ impl FileLogStore {
                 ));
             }
         }
-        fs::create_dir_all(&dir)
+        Self::open_dir(&dir).await
+    }
+
+    /// Open the file log directly at its `<raft.db>.d` directory without checking
+    /// for a legacy SQLite file at the sibling path. Offline migration uses this
+    /// to verify a final directory while the source `raft.db` still exists.
+    pub(crate) async fn open_dir(dir: &Path) -> Result<Self, StorageError<u64>> {
+        fs::create_dir_all(dir)
             .map_err(|e| log_err(ErrorVerb::Write, format!("create {}: {e}", dir.display())))?;
-        let meta = match RaftMetaFile::load(&dir)
+        let meta = match RaftMetaFile::load(dir)
             .map_err(|e| storage_err(ErrorSubject::Store, ErrorVerb::Read, e))?
         {
             Some(meta) => meta,
@@ -103,18 +110,18 @@ impl FileLogStore {
                         format!(
                             "raft meta file {} is missing but log segments exist: refusing to \
                              guess (restore the backup or re-run the migration)",
-                            RaftMetaFile::path(&dir).display()
+                            RaftMetaFile::path(dir).display()
                         ),
                     ));
                 }
                 let meta = RaftMetaFile::default();
-                meta.store_err(&dir)?;
+                meta.store_err(dir)?;
                 meta
             }
         };
-        let inner = LogInner::load(&dir, meta)?;
+        let inner = LogInner::load(dir, meta)?;
         Ok(Self {
-            dir,
+            dir: dir.to_path_buf(),
             inner: Arc::new(Mutex::new(inner)),
         })
     }
@@ -128,6 +135,15 @@ impl FileLogStore {
             .fault(FaultPoint::BeforeMetaStore)
             .map_err(|e| log_err(ErrorVerb::Write, format!("injected meta fault: {e}")))?;
         meta.store_err(&self.dir)
+    }
+
+    /// Offline-import append (no openraft flush callback). Same contiguity and
+    /// hole checks as a live append.
+    pub async fn append_import(
+        &self,
+        entries: &[Entry<TypeConfig>],
+    ) -> Result<(), StorageError<u64>> {
+        self.append_locked(entries)
     }
 
     pub(super) fn append_locked(

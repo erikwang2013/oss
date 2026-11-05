@@ -19,18 +19,18 @@ use super::{ObjectControlStore, ObjectControlTxn};
 use crate::local_store::{LocalQueue, QueueStatus};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct StoredRepl {
-    bucket: String,
-    key: String,
-    version_id: String,
-    etag: String,
-    size: i64,
-    remote_id: String,
-    dest_bucket: String,
-    is_delete_marker: bool,
-    is_version_delete: bool,
-    target_kind: String,
-    created_at: i64,
+pub(crate) struct StoredRepl {
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) version_id: String,
+    pub(crate) etag: String,
+    pub(crate) size: i64,
+    pub(crate) remote_id: String,
+    pub(crate) dest_bucket: String,
+    pub(crate) is_delete_marker: bool,
+    pub(crate) is_version_delete: bool,
+    pub(crate) target_kind: String,
+    pub(crate) created_at: i64,
 }
 
 fn status_of(state: &str) -> Option<QueueStatus> {

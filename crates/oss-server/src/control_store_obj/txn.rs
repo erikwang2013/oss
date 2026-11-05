@@ -139,6 +139,16 @@ impl ObjectControlStore {
     /// Start a transaction at the current generation. The origin is mandatory.
     pub async fn begin(&self, origin: WriteOrigin) -> Result<ObjectControlTxn> {
         let pinned = self.pin().await?;
+        self.begin_at(pinned, origin).await
+    }
+
+    /// Start a transaction at a caller-supplied pin. Offline migration uses a
+    /// synthetic empty pin so every node is written before the single root CAS.
+    pub(crate) async fn begin_at(
+        &self,
+        pinned: PinnedRoot,
+        origin: WriteOrigin,
+    ) -> Result<ObjectControlTxn> {
         let meta = pinned.root.meta.clone();
         let applied_target = origin.log_id();
         let mut txn = ObjectControlTxn {

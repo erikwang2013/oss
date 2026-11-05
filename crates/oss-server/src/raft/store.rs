@@ -270,7 +270,7 @@ fn encode_segment(entries: &[Entry<TypeConfig>]) -> Result<Vec<u8>, StorageError
 }
 
 /// 解码并校验段：magic、声明长度、zlib、数组元素数与索引必须精确匹配 [start,end]。
-fn decode_segment(
+pub(crate) fn decode_segment(
     data: &[u8],
     start_idx: i64,
     end_idx: i64,
@@ -663,7 +663,7 @@ async fn write_snapshot_tx(
 
 /// 读快照数据：`raft_snapshot.data` 是分块清单时按 `snapshot_id` 拼接并校验块数/
 /// 总长；否则按旧版整行 BLOB 返回。缺块、乱序、截断一律 fail-closed。
-async fn read_snapshot_data(
+pub(crate) async fn read_snapshot_data(
     conn: &mut SqliteConnection,
     snapshot_id: &str,
     stored: Vec<u8>,

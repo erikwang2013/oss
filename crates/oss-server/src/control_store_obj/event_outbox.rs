@@ -20,11 +20,11 @@ use super::{ObjectControlStore, ObjectControlTxn};
 use crate::local_store::QueueStatus;
 
 #[derive(Debug, Serialize, Deserialize)]
-struct StoredEvent {
-    bucket: String,
-    target_id: String,
-    event_json: String,
-    created_at: i64,
+pub(crate) struct StoredEvent {
+    pub(crate) bucket: String,
+    pub(crate) target_id: String,
+    pub(crate) event_json: String,
+    pub(crate) created_at: i64,
 }
 
 #[async_trait::async_trait]

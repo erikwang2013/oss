@@ -19,31 +19,31 @@ use super::local_ops::{SYNC_DELETE_KV, SYNC_WRITE_KV, backend, decode, encode, k
 use super::{ObjectControlStore, ObjectControlTxn};
 
 #[derive(Debug, Serialize, Deserialize)]
-struct StoredWriteIntent {
-    id: String,
-    bucket: String,
-    key: String,
-    local_version_id: String,
-    remote_version_id: String,
-    tee_path: String,
-    commit_json: String,
-    state: String,
-    created_at: i64,
-    updated_at: i64,
+pub(crate) struct StoredWriteIntent {
+    pub(crate) id: String,
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) local_version_id: String,
+    pub(crate) remote_version_id: String,
+    pub(crate) tee_path: String,
+    pub(crate) commit_json: String,
+    pub(crate) state: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct StoredDeleteIntent {
-    id: String,
-    bucket: String,
-    key: String,
-    op: String,
-    local_version_id: Option<String>,
-    remote_version_id: Option<String>,
-    marker_version_id: Option<String>,
-    state: String,
-    created_at: i64,
-    updated_at: i64,
+pub(crate) struct StoredDeleteIntent {
+    pub(crate) id: String,
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) op: String,
+    pub(crate) local_version_id: Option<String>,
+    pub(crate) remote_version_id: Option<String>,
+    pub(crate) marker_version_id: Option<String>,
+    pub(crate) state: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
 }
 
 fn write_intents(store: &ObjectControlStore) -> Result<Vec<StoredWriteIntent>, ControlError> {

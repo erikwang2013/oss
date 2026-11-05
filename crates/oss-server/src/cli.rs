@@ -32,6 +32,9 @@ pub const USAGE: &str = "\
   rebalance [--dry-run|--apply]
                  扩容搬迁（默认 dry-run）：把存量对象迁到展开放置（placement=v2；未开则空跑）；
                  逐对象 copy→锁内翻转→清老片，幂等可重跑；报告 <时间戳>-rebalance[-dry].json
+  control-migrate --from <oss.db> --state-dir <dir> --raft-db <raft.db> (--dry-run|--apply) [--json]
+                 离线迁移 SQLite 控制面/节点本地态/Raft 文件（只读源；默认必须显式选模式；
+                 根对象最后提交，中断重跑安全）
   control-recertify --keys-file <path> [--apply] [--json]
                  集群 legacy 控制对象补证书（默认 dry-run）：逐键全槽扫描，唯一同内容组
                  ≥Q_s 才写提交证书；--apply 才落盘；任一键失败 exit 1。键列表必须覆盖
@@ -180,6 +183,14 @@ pub enum Command {
     },
     /// 3.16 离线 CMK 运维：引用扫描 / rewrap / 删除 / .cmk-trash 清理（逐节点执行）。
     Cmk(CmkCommand),
+    /// G1 离线控制面迁移：SQLite（控制库 + raft 库）→ 对象根 + 本地态 + Raft 文件。
+    ControlMigrate {
+        from: std::path::PathBuf,
+        state_dir: std::path::PathBuf,
+        raft_db: std::path::PathBuf,
+        dry_run: bool,
+        json: bool,
+    },
 }
 
 /// `cmk` 子命令。全部为离线命令（不经 AppState::load，避免二次打开 raft.db）。
@@ -270,6 +281,7 @@ pub fn needs_full_state(cmd: &Command) -> bool {
             | Command::ReplicaReconcile { .. }
             | Command::TierAudit { .. }
             | Command::Cmk(_)
+            | Command::ControlMigrate { .. }
     )
 }
 
@@ -369,6 +381,31 @@ pub fn parse_args(args: &[String]) -> Result<Command, &'static str> {
         ("rebalance", []) => Ok(Command::Rebalance { dry_run: true }),
         ("rebalance", [flag]) if flag == "--dry-run" => Ok(Command::Rebalance { dry_run: true }),
         ("rebalance", [flag]) if flag == "--apply" => Ok(Command::Rebalance { dry_run: false }),
+        ("control-migrate", rest) => {
+            let (v, flags) = parse_flags(
+                rest,
+                &["--from", "--state-dir", "--raft-db"],
+                &["--dry-run", "--apply", "--json"],
+            )?;
+            let dry_run = match (flags.contains("--dry-run"), flags.contains("--apply")) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => return Err(USAGE),
+            };
+            Ok(Command::ControlMigrate {
+                from: v.get("--from").map(std::path::PathBuf::from).ok_or(USAGE)?,
+                state_dir: v
+                    .get("--state-dir")
+                    .map(std::path::PathBuf::from)
+                    .ok_or(USAGE)?,
+                raft_db: v
+                    .get("--raft-db")
+                    .map(std::path::PathBuf::from)
+                    .ok_or(USAGE)?,
+                dry_run,
+                json: flags.contains("--json"),
+            })
+        }
         ("control-recertify", rest) => {
             let (v, flags) = parse_flags(rest, &["--keys-file"], &["--apply", "--json"])?;
             Ok(Command::ControlRecertify {
@@ -1250,7 +1287,8 @@ pub async fn run(
         | Command::SyncReconcile { .. }
         | Command::ReplicaReconcile { .. }
         | Command::TierAudit { .. }
-        | Command::Cmk(_) => {
+        | Command::Cmk(_)
+        | Command::ControlMigrate { .. } => {
             Err("内部错误：离线命令不得走 AppState::run（应走 run_offline）".into())
         }
     }
@@ -1329,6 +1367,13 @@ pub async fn run_offline(
         } => replica_reconcile_cmd(cfg_path, bucket, key, delete, apply, json).await,
         Command::TierAudit { json } => tier_audit_cmd(cfg_path, json).await,
         Command::Cmk(cmd) => cmk_cmd(cfg_path, cmd).await,
+        Command::ControlMigrate {
+            from,
+            state_dir,
+            raft_db,
+            dry_run,
+            json,
+        } => crate::migrate::run_cli(&from, &state_dir, &raft_db, dry_run, json).await,
         other => Err(format!("{other:?} 不是离线命令（内部接线错误）").into()),
     }
 }

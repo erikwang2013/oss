@@ -19,20 +19,20 @@ use super::local_ops::{backend, decode, encode, kv, limit_of};
 use super::{ObjectControlStore, ObjectControlTxn};
 use crate::local_store::{AuditLog, LocalKv};
 
-const AUDIT_NS: &str = "audit_log";
-const AUDIT_META_KV: &str = "audit_meta";
-const NEXT_ID_KEY: &str = "next_id";
+pub(crate) const AUDIT_NS: &str = "audit_log";
+pub(crate) const AUDIT_META_KV: &str = "audit_meta";
+pub(crate) const NEXT_ID_KEY: &str = "next_id";
 
-#[derive(Debug, Serialize, Deserialize)]
-struct StoredAudit {
-    id: i64,
-    ts: i64,
-    uid: i64,
-    op: String,
-    bucket: Option<String>,
-    object_key: Option<String>,
-    decision: String,
-    detail: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StoredAudit {
+    pub(crate) id: i64,
+    pub(crate) ts: i64,
+    pub(crate) uid: i64,
+    pub(crate) op: String,
+    pub(crate) bucket: Option<String>,
+    pub(crate) object_key: Option<String>,
+    pub(crate) decision: String,
+    pub(crate) detail: Option<String>,
 }
 
 fn audit_log(local: &crate::local_store::LocalStore) -> Result<AuditLog, ControlError> {

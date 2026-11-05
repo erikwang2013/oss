@@ -51,28 +51,28 @@ impl ObjectControlTxn {
     }
 }
 
-pub(super) const EVENT_QUEUE: &str = "event_outbox";
-pub(super) const REPL_QUEUE: &str = "repl_outbox";
-pub(super) const SYNC_WRITE_KV: &str = "sync_write_intents";
-pub(super) const SYNC_DELETE_KV: &str = "sync_delete_intents";
+pub(crate) const EVENT_QUEUE: &str = "event_outbox";
+pub(crate) const REPL_QUEUE: &str = "repl_outbox";
+pub(crate) const SYNC_WRITE_KV: &str = "sync_write_intents";
+pub(crate) const SYNC_DELETE_KV: &str = "sync_delete_intents";
 
 /// The SQL outbox tables carry no lease at claim time; expiry is decided by the
 /// caller's constants at reclaim (`events::EVENT_LEASE_SECS` = 60s,
 /// `replication::REPL_LEASE_SECS` = 300s). The local queue records a lease so
 /// its own bookkeeping stays consistent; reclaim still uses `claimed_at` plus
 /// the caller's `lease_secs`, matching the SQL `claimed_at < now - lease_secs`.
-pub(super) const EVENT_LEASE_SECS: i64 = 60;
-pub(super) const REPL_LEASE_SECS: i64 = 300;
+pub(crate) const EVENT_LEASE_SECS: i64 = 60;
+pub(crate) const REPL_LEASE_SECS: i64 = 300;
 
 pub(super) fn backend(e: io::Error) -> ControlError {
     ControlError::Backend(format!("local store: {e}"))
 }
 
-pub(super) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ControlError> {
+pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, ControlError> {
     rmp_serde::to_vec_named(value).map_err(|e| ControlError::Backend(format!("local encode: {e}")))
 }
 
-pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ControlError> {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ControlError> {
     rmp_serde::from_slice(bytes).map_err(|e| ControlError::Backend(format!("local decode: {e}")))
 }
 

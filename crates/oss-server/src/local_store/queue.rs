@@ -401,6 +401,10 @@ fn write_record_buffered(file: &mut File, record: &Record) -> Result<()> {
 
 #[path = "queue_ext.rs"]
 mod ext;
+#[path = "queue_import.rs"]
+mod import;
+
+pub use import::QueueImport;
 
 #[cfg(test)]
 #[path = "queue_tests.rs"]
