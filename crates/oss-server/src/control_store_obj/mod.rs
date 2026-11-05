@@ -47,6 +47,11 @@ mod vpc;
 mod tests;
 
 pub use ap_olap::{AccessPointStore, AccessPointTxn};
+// Row shapes are re-exported for the generation-tagged read view (C2); the
+// domain modules themselves stay private.
+pub(crate) use account::{AccountRow, LedgerRow, MemberRow};
+pub(crate) use bucket::BucketRow;
+pub(crate) use iam::{AccessKeyRow, PermissionStorageRow, UserRow};
 pub use inventory::BucketDomainCleanup;
 pub use origin::WriteOrigin;
 pub use root_io::{PinnedRoot, RootIo};

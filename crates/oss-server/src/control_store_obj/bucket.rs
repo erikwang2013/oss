@@ -229,7 +229,7 @@ pub(crate) async fn non_admin_uid<L: UserLookup + ?Sized>(
 
 // ---------- bucket rows ----------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BucketRow {
     pub name: String,
     pub owner_uid: Option<i64>,

@@ -16,6 +16,7 @@ pub mod control_backend;
 pub mod control_recertify;
 pub mod control_store;
 pub mod control_store_obj;
+pub mod control_view;
 pub mod db;
 pub mod events;
 pub mod inventory;
