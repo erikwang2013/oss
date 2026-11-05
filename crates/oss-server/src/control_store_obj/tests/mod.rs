@@ -3,6 +3,7 @@
 mod basic;
 mod conflict;
 mod crash;
+mod jobs;
 mod parity_ap_olap_vpc;
 mod parity_bucket;
 mod parity_cascade;
