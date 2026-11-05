@@ -22,6 +22,8 @@ mod jobs_write;
 mod lifecycle;
 mod origin;
 mod root_io;
+mod site;
+mod site_apply;
 mod table;
 mod tier;
 mod txn;

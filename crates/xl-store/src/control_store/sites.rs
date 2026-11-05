@@ -3,10 +3,13 @@
 //! 仅覆盖简单 CRUD；LWW 时钟、changelog 触发与 apply 路径仍在 `site.rs` 原始 SQL
 //! （`shortcut:` 记档），不经本 trait。
 
+use serde::{Deserialize, Serialize};
+
 use super::ControlError;
 
 /// 对端站点行（`sites` 全列；含出站凭据——接口层负责脱敏）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SitePeerRow {
     pub peer_id: String,
     pub remote_site_id: String,

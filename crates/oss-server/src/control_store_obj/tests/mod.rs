@@ -3,6 +3,8 @@
 mod basic;
 mod conflict;
 mod crash;
+mod hooks_cascade;
+mod hooks_iam;
 mod jobs;
 mod parity_ap_olap_vpc;
 mod parity_bucket;
@@ -11,6 +13,9 @@ mod parity_inventory;
 mod parity_lifecycle;
 mod parity_tier;
 mod parity_util;
+mod site;
+mod site_common;
+mod site_hooks;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
