@@ -19,6 +19,7 @@ type Snap = (
 );
 
 async fn seed_users(db: &Db, obj: &support::Obj) {
+    support::mirror_sqlite_baseline(db, obj).await;
     support::sqlite_iam(db, |t| Box::pin(async move { support::seed_iam(t).await }))
         .await
         .unwrap();
@@ -55,7 +56,6 @@ async fn seed_accounts(t: &mut dyn support::Account) -> Result<(), ControlError>
 }
 
 async fn seed(db: &Db, obj: &support::Obj) {
-    support::mirror_sqlite_baseline(db, obj).await;
     seed_users(db, obj).await;
     let (s, o) = both_account(db, obj, |t| Box::pin(async move { seed_accounts(t).await })).await;
     same_ok((s, o));
@@ -114,16 +114,21 @@ async fn strict_export_matches_sqlite_and_serializes_identically() {
         "strict snapshot bytes"
     );
 
-    let ids: Vec<&str> = o.0.iter().map(|a| a.id.as_str()).collect();
+    let accts: Vec<_> = o
+        .0
+        .iter()
+        .filter(|a| a.id != xl_s3::access::LEGACY_ACCOUNT)
+        .collect();
+    let ids: Vec<&str> = accts.iter().map(|a| a.id.as_str()).collect();
     assert_eq!(ids, ["000000000002", "300000000001", "300000000002"]);
-    assert_eq!(o.0[0].admin.as_deref(), Some("alice"));
+    assert_eq!(accts[0].admin.as_deref(), Some("alice"));
     assert_eq!(
-        (o.0[0].bucket_quota, o.0[0].soft_byte_quota),
+        (accts[0].bucket_quota, accts[0].soft_byte_quota),
         (Some(3), Some(10))
     );
-    assert_eq!((o.0[0].created_at, o.0[0].updated_at), (100, 103));
-    assert_eq!(o.0[1].admin, None);
-    assert_eq!(o.0[2].status, "disabled");
+    assert_eq!((accts[0].created_at, accts[0].updated_at), (100, 103));
+    assert_eq!(accts[1].admin, None);
+    assert_eq!(accts[2].status, "disabled");
     let members: Vec<(&str, &str, &str)> =
         o.1.iter()
             .map(|m| (m.account_id.as_str(), m.username.as_str(), m.role.as_str()))
@@ -391,8 +396,12 @@ async fn install_errors_match_sqlite() {
         pair,
         "account member \"admin\" is not a replicated non-admin user",
     );
-    // All failures rolled back.
-    assert_eq!(obj.control.account_counts().await.unwrap(), (0, 0));
+    // All failures rolled back; only the mirrored baseline remains.
+    let (sql_accounts, sql_members) = support::sqlite_store(&db).account_counts().await.unwrap();
+    assert_eq!(
+        obj.control.account_counts().await.unwrap(),
+        (sql_accounts, sql_members)
+    );
     support::dump_accounts(&db, &obj).await;
 
     let (s, o) = both_account(&db, &obj, |t| {

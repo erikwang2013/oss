@@ -41,6 +41,36 @@ pub(super) async fn sqlite(raft: bool) -> Db {
         .unwrap()
 }
 
+/// Null a bucket owner on both backends (the production user-delete façade
+/// does this before deleting the user, to satisfy the owner FK).
+pub(super) async fn clear_bucket_owner(db: &Db, obj: &Obj, name: &str) {
+    sqlx::query("UPDATE buckets SET owner_id = NULL WHERE name = ?")
+        .bind(name)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    use crate::control_store_obj::TableId;
+    let mut txn = obj
+        .control
+        .begin(crate::control_store_obj::WriteOrigin::local("seed"))
+        .await
+        .unwrap();
+    let bytes = txn
+        .get(TableId::Buckets, name.as_bytes())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut row: super::account_fixtures::TestBucket = rmp_serde::from_slice(&bytes).unwrap();
+    row.owner_uid = None;
+    row.owner_id = None;
+    row.owner_username = None;
+    let bytes = rmp_serde::to_vec_named(&row).unwrap();
+    txn.put(TableId::Buckets, name.as_bytes(), &bytes)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+}
+
 /// Copy the local baseline `Db::connect` creates (system account and canonical
 /// marker) into the object store, so parity fixtures start from equal state.
 pub(super) async fn mirror_sqlite_baseline(db: &Db, obj: &Obj) {

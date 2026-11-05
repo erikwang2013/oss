@@ -143,6 +143,8 @@ async fn user_delete_cascades_match_sqlite() {
     let obj = support::object_store(Mode::Standalone).await;
     seed(&db, &obj).await;
 
+    // Production delete_user nulls owned buckets first; do the same for carol.
+    support::clear_bucket_owner(&db, &obj, "b-carol").await;
     // carol is an account member; eve is a non-admin account's admin_uid.
     let (s, o) = both_iam(&db, &obj, |t| {
         Box::pin(async move {

@@ -1,6 +1,6 @@
 //! Shared seed helpers for the B3 account parity tests.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use xl_store::control_store::iam::UserEntry;
 
 use super::local;
@@ -16,7 +16,7 @@ pub(super) const DISABLED: &str = "200000000001";
 pub(super) const DELETE_ACCT: &str = "200000000002";
 pub(super) const EVE_ACCT: &str = "000000000006";
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub(super) struct TestBucket {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) owner_uid: Option<i64>,
