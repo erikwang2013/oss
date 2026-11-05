@@ -1,6 +1,7 @@
 //! B4 启动断言：对象根引导/锁/mode 校验，SQLite 默认路径零改动。
 
 use super::*;
+use xl_store::control_store::sites::SiteStore;
 use xl_store::store::StoreConfig;
 
 async fn open_store(root: &std::path::Path) -> Arc<Store> {
