@@ -119,12 +119,13 @@ impl ObjectControlStore {
     }
 
     /// Start a transaction at the current generation. The origin is mandatory.
-    pub async fn begin(self: &Arc<Self>, origin: WriteOrigin) -> Result<ObjectControlTxn> {
+    pub async fn begin(&self, origin: WriteOrigin) -> Result<ObjectControlTxn> {
         let pinned = self.pin().await?;
         let meta = pinned.root.meta.clone();
         let applied_target = origin.log_id();
         let mut txn = ObjectControlTxn {
-            store: Arc::clone(self),
+            root: Arc::clone(&self.root),
+            publisher: self.publisher.clone(),
             origin,
             pinned,
             meta,
@@ -162,7 +163,8 @@ impl ObjectControlStore {
 
 /// A transaction over one pinned root generation.
 pub struct ObjectControlTxn {
-    store: Arc<ObjectControlStore>,
+    root: Arc<RootIo>,
+    publisher: Option<CachePublish>,
     origin: WriteOrigin,
     pinned: PinnedRoot,
     meta: RootMeta,
@@ -244,7 +246,7 @@ impl ObjectControlTxn {
             )));
         }
         let row = if value.len() > INLINE_MAX {
-            StagedRow::PutBlob(self.store.root.put_blob(value).await?)
+            StagedRow::PutBlob(self.root.put_blob(value).await?)
         } else {
             StagedRow::Put(value.to_vec())
         };
@@ -261,10 +263,10 @@ impl ObjectControlTxn {
 
     /// Overlay-aware point read; blobs are reassembled and verified.
     pub async fn get(&self, table: TableId, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        match self.tree(table).get_leaf(&*self.store.root, key).await? {
+        match self.tree(table).get_leaf(&*self.root, key).await? {
             None | Some(LeafValue::Tombstone) => Ok(None),
             Some(LeafValue::Row(bytes)) => Ok(Some(bytes)),
-            Some(LeafValue::Blob(blob)) => Ok(Some(self.store.root.get_blob(&blob).await?)),
+            Some(LeafValue::Blob(blob)) => Ok(Some(self.root.get_blob(&blob).await?)),
         }
     }
 
@@ -275,10 +277,10 @@ impl ObjectControlTxn {
         range: Range<&[u8]>,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut out = Vec::new();
-        for (key, value) in self.tree(table).scan_leaf(&*self.store.root, range).await? {
+        for (key, value) in self.tree(table).scan_leaf(&*self.root, range).await? {
             match value {
                 LeafValue::Row(bytes) => out.push((key, bytes)),
-                LeafValue::Blob(blob) => out.push((key, self.store.root.get_blob(&blob).await?)),
+                LeafValue::Blob(blob) => out.push((key, self.root.get_blob(&blob).await?)),
                 LeafValue::Tombstone => {}
             }
         }
@@ -312,16 +314,8 @@ impl ObjectControlTxn {
         }
         let bytes = encode_root(&new_root)?;
         for attempt in 1..=MAX_COMMIT_ATTEMPTS {
-            let fence = self
-                .store
-                .root
-                .alloc_fence(self.pinned.version.saturating_add(1));
-            match self
-                .store
-                .root
-                .cas_root(self.pinned.version, fence, &bytes)
-                .await
-            {
+            let fence = self.root.alloc_fence(self.pinned.version.saturating_add(1));
+            match self.root.cas_root(self.pinned.version, fence, &bytes).await {
                 Ok(CasOutcome::Committed(generation)) => {
                     let stamp = CommitStamp {
                         generation,
@@ -329,7 +323,7 @@ impl ObjectControlTxn {
                         applied: new_root.meta.applied,
                         dirty_tables: dirty,
                     };
-                    if let Some(publish) = &self.store.publisher {
+                    if let Some(publish) = &self.publisher {
                         publish(&stamp);
                     }
                     return Ok(stamp);
@@ -344,7 +338,7 @@ impl ObjectControlTxn {
                     }
                 }
                 Err(Error::Conflict(_)) => {
-                    let Some(new_pinned) = self.store.root.load().await? else {
+                    let Some(new_pinned) = self.root.load().await? else {
                         return Err(Error::CorruptMeta(
                             "control root vanished during commit".into(),
                         ));
@@ -428,7 +422,7 @@ impl ObjectControlTxn {
             if tree.staged_len() == 0 {
                 continue;
             }
-            tree.flush(&*self.store.root).await?;
+            tree.flush(&*self.root).await?;
             let table = TableId::from_u16(*id).ok_or_else(|| {
                 Error::CorruptMeta(format!("transaction staged unknown table {id}"))
             })?;

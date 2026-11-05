@@ -7,11 +7,18 @@
 //! whole closure on a root CAS conflict so guards never replay on a stale root.
 //! No begin/rollback is exposed; dropping a transaction discards its overlay.
 
+mod account;
+mod account_snapshot;
+mod account_write;
 mod ap_olap;
 mod bucket;
 mod bucket_snapshot;
 mod bucket_write;
 mod change;
+mod iam;
+mod iam_snapshot;
+mod iam_txn;
+mod iam_write;
 mod inventory;
 mod inventory_txn;
 mod jobs;

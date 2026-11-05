@@ -1,10 +1,17 @@
 //! B1 tests: basic transaction/commit, crash matrix, conflict retry.
 
+mod account;
+mod account_fixtures;
+mod account_snapshot;
+mod account_write;
 mod basic;
 mod conflict;
 mod crash;
 mod hooks_cascade;
 mod hooks_iam;
+mod iam;
+mod iam_guard;
+mod iam_snapshot;
 mod jobs;
 mod parity_ap_olap_vpc;
 mod parity_bucket;
@@ -16,6 +23,7 @@ mod parity_util;
 mod site;
 mod site_common;
 mod site_hooks;
+mod support;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
