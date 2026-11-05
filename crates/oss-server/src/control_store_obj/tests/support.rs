@@ -41,6 +41,42 @@ pub(super) async fn sqlite(raft: bool) -> Db {
         .unwrap()
 }
 
+/// Copy the local baseline `Db::connect` creates (system account and canonical
+/// marker) into the object store, so parity fixtures start from equal state.
+pub(super) async fn mirror_sqlite_baseline(db: &Db, obj: &Obj) {
+    let system: Option<(String, String, i64, i64)> = sqlx::query_as(
+        "SELECT id, name, created_at, updated_at FROM accounts WHERE id = ?",
+    )
+    .bind(xl_s3::access::LEGACY_ACCOUNT)
+    .fetch_optional(db.pool())
+    .await
+    .unwrap();
+    if let Some((id, name, created_at, updated_at)) = system {
+        let mut txn = obj
+            .control
+            .begin(crate::control_store_obj::WriteOrigin::local("seed"))
+            .await
+            .unwrap();
+        txn.account_insert_if_absent(&id, &name, None, created_at, updated_at)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    }
+    if let Some(value) = db
+        .schema_meta(crate::db::META_ACCOUNTS_CANONICAL)
+        .await
+        .unwrap()
+    {
+        let mut txn = obj
+            .control
+            .begin(crate::control_store_obj::WriteOrigin::local("seed"))
+            .await
+            .unwrap();
+        txn.set_marker(crate::db::META_ACCOUNTS_CANONICAL, value);
+        txn.commit().await.unwrap();
+    }
+}
+
 /// Toggle the SQLite raft guard triggers for the next local write.
 pub(super) async fn set_apply_ctx(db: &Db, active: bool) {
     sqlx::query("UPDATE raft_apply_ctx SET active = ? WHERE id = 1")

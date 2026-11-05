@@ -7,6 +7,7 @@ use super::local;
 use super::support::{self, both_account, both_iam, same_ok};
 use crate::control_store_obj::TableId;
 use crate::db::Db;
+use xl_store::control_store::account::AccountTxn;
 
 pub(super) const A: &str = "000000000002"; // derived id of alice (uid 2)
 pub(super) const B: &str = "000000000003"; // derived id of bob (uid 3)
@@ -83,6 +84,7 @@ async fn seed_users(db: &Db, obj: &support::Obj) {
 
 pub(super) async fn seed(db: &Db, obj: &support::Obj) {
     seed_users(db, obj).await;
+    support::mirror_sqlite_baseline(db, obj).await;
     // alice and carol are members of A; bob is a member of B; dave belongs to a
     // disabled account; the admin member exists only to exercise the guards.
     for (name, owner) in [

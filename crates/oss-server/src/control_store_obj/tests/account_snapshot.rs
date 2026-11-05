@@ -55,6 +55,7 @@ async fn seed_accounts(t: &mut dyn support::Account) -> Result<(), ControlError>
 }
 
 async fn seed(db: &Db, obj: &support::Obj) {
+    support::mirror_sqlite_baseline(db, obj).await;
     seed_users(db, obj).await;
     let (s, o) = both_account(db, obj, |t| Box::pin(async move { seed_accounts(t).await })).await;
     same_ok((s, o));
@@ -194,16 +195,14 @@ async fn install_replaces_tables_and_sets_canonical_marker() {
     .await;
     same_ok((s, o));
     support::dump_accounts(&db, &obj).await;
+    // Db::connect canonicalizes at startup; a non-canonical install must not
+    // change whatever marker the baseline already had.
     assert_eq!(
         db.schema_meta(crate::db::META_ACCOUNTS_CANONICAL)
             .await
             .unwrap(),
-        None
-    );
-    assert_eq!(
         marker(&obj.control).await,
-        None,
-        "non-canonical install clears no marker"
+        "non-canonical install keeps the baseline marker"
     );
 
     // The ledger is not touched by the account install.
