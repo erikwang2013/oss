@@ -45,7 +45,10 @@ pub(super) async fn object_machine(feature_level: u8, max_bytes: u64) -> ObjectM
     let control = ObjectControlStore::new(Arc::new(RootIo::new(store))).with_local_store(local);
     let control = Arc::new(control);
     control.bootstrap(Mode::Raft, 100).await.unwrap();
-    let sm = ObjectStateMachine::open(control, max_bytes, None, feature_level)
+    let snapshots = Arc::new(
+        crate::raft::file_snapshot::FileSnapshotStore::open(&dir.path().join("raft.db")).unwrap(),
+    );
+    let sm = ObjectStateMachine::open(control, snapshots, max_bytes, None, feature_level)
         .await
         .unwrap();
     ObjectMachine { _dir: dir, sm }

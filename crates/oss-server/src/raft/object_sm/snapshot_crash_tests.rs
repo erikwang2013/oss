@@ -37,7 +37,10 @@ async fn crash_machine(
     let control = ObjectControlStore::new(Arc::new(root)).with_local_store(local);
     let control = Arc::new(control);
     control.bootstrap(Mode::Raft, 100).await.unwrap();
-    let sm = ObjectStateMachine::open(control, max, None, feature_level)
+    let snapshots = Arc::new(
+        crate::raft::file_snapshot::FileSnapshotStore::open(&dir.path().join("raft.db")).unwrap(),
+    );
+    let sm = ObjectStateMachine::open(control, snapshots, max, None, feature_level)
         .await
         .unwrap();
     (dir, sm, crash)
