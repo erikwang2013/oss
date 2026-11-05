@@ -338,9 +338,8 @@ impl WitnessToml {
         if r.bootstrap {
             return Err("witness 配置的 [raft].bootstrap 必须为 false".into());
         }
-        if r.state_db.is_none() {
-            return Err("witness 配置缺少 [raft].state_db".into());
-        }
+        // F2：witness 状态在 `<db_path>.d/witness/state`；state_db 仅保留为迁移输入，
+        // 因此可选且运行时不再打开。
         if r.db_path.is_none() {
             return Err("witness 配置缺少 [raft].db_path".into());
         }
@@ -2282,9 +2281,9 @@ state_db = "/x/state.db"
         let mut bad = w.clone();
         bad.raft.bootstrap = true;
         assert!(bad.validate().is_err());
-        let mut bad = w.clone();
-        bad.raft.state_db = None;
-        assert!(bad.validate().is_err());
+        let mut no_state = w.clone();
+        no_state.raft.state_db = None;
+        assert!(no_state.validate().is_ok(), "state_db 只是迁移输入，可缺省");
         let mut bad = w;
         bad.raft.role = RaftRole::Voter;
         assert!(bad.validate().is_err());

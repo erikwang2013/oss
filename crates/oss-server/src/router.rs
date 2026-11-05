@@ -1084,7 +1084,7 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         );
         out.push_str(&format!(
             "oss_raft_snapshot_bytes {}\n",
-            handle.state_machine().snapshot_bytes().await
+            handle.snapshot_bytes().await
         ));
     }
     (

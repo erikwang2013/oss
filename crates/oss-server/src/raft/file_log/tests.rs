@@ -121,6 +121,44 @@ async fn raft_file_log_bootstraps_empty_dir_and_roundtrips_trait_state() {
     );
 }
 
+/// openraft 0.9 `initialize()` appends the initial membership entry at `LogId::default()`
+/// (index 0). The file log must accept and re-open that 0-based log.
+#[tokio::test]
+async fn raft_file_log_accepts_initial_entry_at_index_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raft.db");
+    let mut store = FileLogStore::open(&path).await.unwrap();
+    let init = Entry {
+        log_id: LogId::default(),
+        payload: EntryPayload::Blank,
+    };
+    append(&mut store, vec![init, blank(1)]);
+    drop(store);
+
+    let mut store = FileLogStore::open(&path).await.unwrap();
+    assert_eq!(
+        indices(&store.try_get_log_entries(..).await.unwrap()),
+        vec![0, 1]
+    );
+    store.truncate(log_id(1)).await.unwrap();
+    assert_eq!(
+        store.get_log_state().await.unwrap().last_log_id,
+        Some(LogId::default())
+    );
+    drop(store);
+
+    let mut store = FileLogStore::open(&path).await.unwrap();
+    assert_eq!(
+        indices(&store.try_get_log_entries(..).await.unwrap()),
+        vec![0]
+    );
+    append(&mut store, vec![blank(1)]);
+    assert_eq!(
+        indices(&store.try_get_log_entries(..).await.unwrap()),
+        vec![0, 1]
+    );
+}
+
 #[tokio::test]
 async fn raft_file_log_entry_bytes_match_sqlite_data_fixture() {
     let dir = tempfile::tempdir().unwrap();

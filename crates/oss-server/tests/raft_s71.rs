@@ -378,7 +378,7 @@ async fn snapshot_build_upload_and_install_over_http() {
     drop(pool);
     a.handle.raft().trigger().snapshot().await.unwrap();
     // trigger 只投递命令；等快照真正落库。
-    let mut sm = a.handle.state_machine().clone();
+    let mut sm = a.handle.sqlite_state_machine().unwrap().clone();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
     let snapshot = loop {
         if let Some(s) = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
@@ -444,11 +444,22 @@ async fn snapshot_build_upload_and_install_over_http() {
         "B 未应用到快照 index {}",
         want.index
     );
-    let (b_applied, b_membership) = b.handle.state_machine().applied().await.unwrap();
+    let (b_applied, b_membership) = b
+        .handle
+        .sqlite_state_machine()
+        .unwrap()
+        .applied()
+        .await
+        .unwrap();
     assert_eq!(b_applied, snapshot.meta.last_log_id);
     assert_eq!(b_membership.voter_ids().collect::<Vec<_>>(), vec![1]);
     assert_eq!(
-        b.handle.state_machine().get("k7").await.unwrap(),
+        b.handle
+            .sqlite_state_machine()
+            .unwrap()
+            .get("k7")
+            .await
+            .unwrap(),
         Some(value)
     );
     a.shutdown().await;

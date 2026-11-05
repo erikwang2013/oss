@@ -202,7 +202,7 @@ impl LogInner {
         }
         match (hi, self.last_index()) {
             (None, None) | (Some(_), None) => {}
-            (None, Some(_)) => self.trim_suffix(1, dir)?,
+            (None, Some(_)) => self.trim_suffix(0, dir)?,
             (Some(hi), Some(end)) if end > hi => self.trim_suffix(hi + 1, dir)?,
             (Some(hi), Some(end)) if end < hi && lo != Some(hi) => {
                 return Err(log_corrupt(format!(
@@ -237,10 +237,12 @@ impl LogInner {
             }
         }
         if let Some(first) = self.first_index() {
-            let expected = lo.map(|l| l + 1).unwrap_or(1);
-            if first != expected {
+            // openraft 0.9 initializes at index 0; 1-based logs are accepted for older
+            // fixtures. After a purge the first index must be the purge bound + 1.
+            let expected = lo.map(|l| l + 1).unwrap_or(0);
+            if first != expected && !(lo.is_none() && first == 1) {
                 return Err(log_corrupt(format!(
-                    "raft log starts at {first}, expected {expected} after purge"
+                    "raft log starts at {first}, expected {expected} (last_purged {lo:?})"
                 )));
             }
         }

@@ -156,6 +156,13 @@ impl FileSnapshotStore {
         Ok(metas)
     }
 
+    /// Newest snapshot metadata (manifests only; no chunk reads).
+    pub async fn latest_meta(
+        &self,
+    ) -> Result<Option<SnapshotMeta<u64, BasicNode>>, StorageError<u64>> {
+        Ok(self.list().await?.pop())
+    }
+
     /// Newest snapshot by last applied log id (then snapshot id).
     pub async fn latest(&self) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
         let metas = self.list().await?;
@@ -220,6 +227,25 @@ impl FileSnapshotStore {
             meta: manifest.meta,
             snapshot: Box::new(Cursor::new(data)),
         }))
+    }
+
+    /// Newest snapshot payload size from chunk file lengths (no chunk reads).
+    /// Missing/corrupt state reports 0, matching the metrics gauge contract.
+    pub async fn latest_bytes(&self) -> u64 {
+        let Ok(metas) = self.list().await else {
+            return 0;
+        };
+        let Some(latest) = metas.last() else {
+            return 0;
+        };
+        let Ok(entries) = fs::read_dir(self.dir.join(&latest.snapshot_id)) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(CHUNK_PREFIX))
+            .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+            .sum()
     }
 
     pub async fn delete(&self, snapshot_id: &str) -> Result<(), StorageError<u64>> {

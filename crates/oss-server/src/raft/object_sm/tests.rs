@@ -10,6 +10,7 @@ use xl_store::control_state::root::Mode;
 use xl_store::control_store::iam::IamStore;
 use xl_store::store::{Store, StoreConfig};
 
+use super::super::file_snapshot::FileSnapshotStore;
 use super::super::runstate::ScheduleLeaseRow;
 use super::super::{ControlCommand, ControlResponse, TypeConfig, compat};
 use super::ObjectStateMachine;
@@ -25,7 +26,8 @@ async fn machine(feature_level: u8) -> (TempDir, ObjectStateMachine) {
     let control = ObjectControlStore::new(Arc::new(RootIo::new(store))).with_local_store(local);
     let control = Arc::new(control);
     control.bootstrap(Mode::Raft, 100).await.unwrap();
-    let sm = ObjectStateMachine::open(control, 1 << 20, None, feature_level)
+    let snapshots = Arc::new(FileSnapshotStore::open(&dir.path().join("raft.db")).unwrap());
+    let sm = ObjectStateMachine::open(control, snapshots, 1 << 20, None, feature_level)
         .await
         .unwrap();
     (dir, sm)

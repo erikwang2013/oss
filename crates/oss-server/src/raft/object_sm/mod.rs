@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Wired into RaftHandle/startup by F2.
-
 //! Object-backed control state machine (implementation plan F1).
 //!
 //! One root CAS per log entry (design §2.4): the command's row mutations,
@@ -8,13 +6,13 @@
 //! (`Invalid`/`Conflict`) is still an applied entry; only an internal error
 //! aborts the CAS (fail-stop). Replaying an already-applied entry is a no-op.
 //!
-//! Data mode only. F2 still supplies the metadata-only witness state machine
-//! (`witness_sm.rs`) and the file snapshot store; the snapshot kept here is
-//! in memory.
+//! Data mode only. F2 supplies the metadata-only witness state machine
+//! (`witness_sm.rs`) separately; snapshots persist through [`FileSnapshotStore`]
+//! under `<db_path>.d/snapshot/`.
 
 use std::io::Cursor;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
 
 use openraft::entry::RaftPayload;
 use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
@@ -24,11 +22,14 @@ use openraft::{
 };
 use xl_store::control_state::root::{AppliedLog, RootMeta};
 use xl_store::control_store::ControlError;
+use xl_store::control_store::account::AccountTxn;
+use xl_store::control_store::bucket::BucketTxn;
 use xl_store::control_store::iam::IamTxn;
 
 use super::apply;
 use super::compat;
 use super::data;
+use super::file_snapshot::FileSnapshotStore;
 use super::metrics::Metrics;
 use super::store::storage_err;
 use super::{ControlResponse, TypeConfig};
@@ -131,18 +132,15 @@ pub struct ObjectStateMachine {
     feature_level: u8,
     activation: Arc<AtomicU8>,
     snapshot_lock: Arc<tokio::sync::Mutex<()>>,
-    /// F2 replaces this with `FileSnapshotStore`; see the module docs.
-    last_snapshot: Arc<Mutex<SnapshotPair>>,
+    snapshots: Arc<FileSnapshotStore>,
     install_notify: Option<tokio::sync::watch::Sender<u64>>,
     counters: Arc<Metrics>,
 }
 
-/// Snapshot slot shared until F2 replaces it with `FileSnapshotStore`.
-type SnapshotPair = Option<(SnapshotMeta<u64, BasicNode>, Vec<u8>)>;
-
 impl ObjectStateMachine {
     pub async fn open(
         store: Arc<ObjectControlStore>,
+        snapshots: Arc<FileSnapshotStore>,
         max_snapshot_bytes: u64,
         install_notify: Option<tokio::sync::watch::Sender<u64>>,
         feature_level: u8,
@@ -157,7 +155,7 @@ impl ObjectStateMachine {
             feature_level,
             activation: Arc::new(AtomicU8::new(activation_of(&pinned.root.meta))),
             snapshot_lock: Arc::new(tokio::sync::Mutex::new(())),
-            last_snapshot: Arc::new(Mutex::new(None)),
+            snapshots,
             install_notify,
             counters: Arc::new(Metrics::default()),
         })
@@ -184,22 +182,33 @@ impl ObjectStateMachine {
         applied_of(&pinned.root.meta)
     }
 
-    fn snapshot_slot(&self) -> std::sync::MutexGuard<'_, SnapshotPair> {
-        self.last_snapshot
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    /// 建桶配额判定（leader append 前，只读根快照；与 SQLite 的
+    /// `bucket_create_quota_reached` 同语义）。
+    pub(crate) async fn bucket_create_quota_reached(
+        &self,
+        name: &str,
+        owner: Option<&str>,
+    ) -> Result<bool, StorageError<u64>> {
+        let mut txn = self
+            .store
+            .begin(WriteOrigin::local("bucket-quota"))
+            .await
+            .map_err(sm_err)?;
+        if txn.bucket_exists(name).await.map_err(sm_err)? {
+            return Ok(false);
+        }
+        let Some(owner) = owner else {
+            return Ok(false);
+        };
+        let Some(uid) = txn.user_uid(owner).await.map_err(sm_err)? else {
+            return Ok(false);
+        };
+        txn.bucket_quota_reached(Some(uid)).await.map_err(sm_err)
     }
 
-    /// Keep the newest snapshot only (mirrors SQLite's compare-and-write).
-    fn remember_snapshot(&self, meta: &SnapshotMeta<u64, BasicNode>, bytes: &[u8]) {
-        let mut slot = self.snapshot_slot();
-        if slot
-            .as_ref()
-            .is_some_and(|(old, _)| old.last_log_id >= meta.last_log_id)
-        {
-            return;
-        }
-        *slot = Some((meta.clone(), bytes.to_vec()));
+    /// 最新快照数据字节数（manifest-only；无快照/读失败 = 0）。
+    pub async fn snapshot_bytes(&self) -> u64 {
+        self.snapshots.latest_bytes().await
     }
 }
 
@@ -337,11 +346,7 @@ impl RaftStateMachine<TypeConfig> for ObjectStateMachine {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<u64>> {
-        let slot = self.snapshot_slot();
-        Ok(slot.as_ref().map(|(meta, bytes)| Snapshot {
-            meta: meta.clone(),
-            snapshot: Box::new(Cursor::new(bytes.clone())),
-        }))
+        self.snapshots.latest().await
     }
 }
 

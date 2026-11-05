@@ -27,8 +27,10 @@ pub mod routes;
 pub mod runstate;
 pub mod status;
 pub mod store;
+pub mod witness_sm;
 
 mod settings;
+mod sm;
 
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -47,6 +49,7 @@ pub use command::{
 };
 pub use settings::RaftSettings;
 
+use sm::RaftSm;
 use store::SqliteStateMachine;
 
 /// 控制写（console/S3 配置写）是否已可走 Raft。S6 出口已翻转（单节点）。
@@ -284,7 +287,7 @@ impl LeadershipSource for AlwaysLeader {
 pub struct RaftHandle {
     raft: Raft<TypeConfig>,
     settings: RaftSettings,
-    state_machine: SqliteStateMachine,
+    state_machine: RaftSm,
     /// 与状态机共享的观测计数（apply 错误由状态机累加）。
     counters: Arc<metrics::Metrics>,
     /// peer TLS 物料（None = 明文；Some = Raft RPC/转发/成员请求全走 https）。
@@ -313,8 +316,14 @@ impl RaftHandle {
         &self.settings
     }
 
-    pub fn state_machine(&self) -> &SqliteStateMachine {
-        &self.state_machine
+    /// SQLite 后端的底层状态机（对象模式返回 None；测试/运维诊断用）。
+    pub fn sqlite_state_machine(&self) -> Option<&SqliteStateMachine> {
+        self.state_machine.sqlite()
+    }
+
+    /// 已落库快照数据字节数（`/metrics` gauge）。
+    pub async fn snapshot_bytes(&self) -> u64 {
+        self.state_machine.snapshot_bytes().await
     }
 
     pub fn counters(&self) -> &Arc<metrics::Metrics> {
@@ -503,13 +512,11 @@ impl RaftHandle {
         if !self.wait_applied(last, left).await {
             return Err(WriteError::Timeout(timeout));
         }
-        let reached = crate::db::Db::bucket_create_quota_reached(
-            self.state_machine.pool(),
-            name,
-            owner.as_deref(),
-        )
-        .await
-        .map_err(|e| WriteError::Raft(format!("bucket quota check: {e}")))?;
+        let reached = self
+            .state_machine
+            .bucket_create_quota_reached(name, owner.as_deref())
+            .await
+            .map_err(|e| WriteError::Raft(format!("bucket quota check: {e}")))?;
         if reached {
             return Err(WriteError::QuotaExceeded);
         }
@@ -857,20 +864,7 @@ pub async fn spawn_with_control_tls(
 
     let counters = Arc::clone(state_machine.counters());
     let peers = Arc::new(compat::PeerVersions::default());
-    let network = match &tls {
-        Some(t) => network::HttpNetworkFactory::new_tls(
-            settings.cluster_token.clone(),
-            Arc::clone(t),
-            t.reqwest_client()?,
-            Arc::clone(&peers),
-            compat::advertised_feature(settings.feature_level),
-        ),
-        None => network::HttpNetworkFactory::new(
-            settings.cluster_token.clone(),
-            Arc::clone(&peers),
-            compat::advertised_feature(settings.feature_level),
-        ),
-    };
+    let network = build_network(&settings, &peers, &tls)?;
     let raft = Raft::new(
         settings.node_id,
         config,
@@ -879,32 +873,160 @@ pub async fn spawn_with_control_tls(
         state_machine.clone(),
     )
     .await?;
-    // leader 变更计数：watch 只保留最新值（合并的中间跳变不逐一计数）。
-    let mut watch = raft.metrics();
-    let mut last_leader = watch.borrow_and_update().current_leader;
-    let watch_counters = Arc::clone(&counters);
-    tokio::spawn(async move {
-        while watch.changed().await.is_ok() {
-            let leader = watch.borrow_and_update().current_leader;
-            if leader != last_leader {
-                watch_counters
-                    .leader_changes_total
-                    .fetch_add(1, Ordering::Relaxed);
-                last_leader = leader;
-            }
-        }
-    });
+    watch_leader_changes(&raft, &counters);
 
     let handle = RaftHandle {
         raft,
         settings,
-        state_machine,
+        state_machine: RaftSm::Sqlite(state_machine),
         counters,
         tls,
         peers,
         bucket_create_lock: tokio::sync::Mutex::new(()),
     };
     handle.bootstrap_if_needed(has_logs).await?;
+    Ok(handle)
+}
+
+fn build_network(
+    settings: &RaftSettings,
+    peers: &Arc<compat::PeerVersions>,
+    tls: &Option<Arc<crate::tls::Tls>>,
+) -> RaftResult<network::HttpNetworkFactory> {
+    let feature = compat::advertised_feature(settings.feature_level);
+    Ok(match tls {
+        Some(t) => network::HttpNetworkFactory::new_tls(
+            settings.cluster_token.clone(),
+            Arc::clone(t),
+            t.reqwest_client()?,
+            Arc::clone(peers),
+            feature,
+        ),
+        None => network::HttpNetworkFactory::new(
+            settings.cluster_token.clone(),
+            Arc::clone(peers),
+            feature,
+        ),
+    })
+}
+
+/// leader 变更计数：watch 只保留最新值（合并的中间跳变不逐一计数）。
+fn watch_leader_changes(raft: &Raft<TypeConfig>, counters: &Arc<metrics::Metrics>) {
+    let mut watch = raft.metrics();
+    let mut last_leader = watch.borrow_and_update().current_leader;
+    let counters = Arc::clone(counters);
+    tokio::spawn(async move {
+        while watch.changed().await.is_ok() {
+            let leader = watch.borrow_and_update().current_leader;
+            if leader != last_leader {
+                counters
+                    .leader_changes_total
+                    .fetch_add(1, Ordering::Relaxed);
+                last_leader = leader;
+            }
+        }
+    });
+}
+
+/// F2：对象后端 voter 启动入口。日志/元数据/快照全部走 `<db_path>.d/` 文件，
+/// 控制状态机是对象根上的 [`object_sm::ObjectStateMachine`]；不打开任何 SQLite。
+pub async fn spawn_object(
+    settings: RaftSettings,
+    control: Arc<crate::control_store_obj::ObjectControlStore>,
+    install_notify: Option<tokio::sync::watch::Sender<u64>>,
+    tls: Option<Arc<crate::tls::Tls>>,
+) -> RaftResult<RaftHandle> {
+    let config = Arc::new(settings.openraft_config()?);
+    identity::verify_and_seed_object(&control, &settings)
+        .await
+        .map_err(std::io::Error::other)?;
+    let log_store = file_log::FileLogStore::open(&settings.db_path).await?;
+    let has_logs = log_store.has_logs().await?;
+    let snapshots = Arc::new(file_snapshot::FileSnapshotStore::open(&settings.db_path)?);
+    let state_machine = object_sm::ObjectStateMachine::open(
+        control,
+        snapshots,
+        settings.snapshot_max_bytes,
+        install_notify,
+        settings.feature_level,
+    )
+    .await?;
+    // R8：根 feature level 高于本机配置 → 拒绝启动（与 SQLite 同一守卫）。
+    compat::guard_startup(state_machine.activation_level(), settings.feature_level)
+        .map_err(std::io::Error::other)?;
+    let counters = Arc::clone(state_machine.counters());
+    let peers = Arc::new(compat::PeerVersions::default());
+    let network = build_network(&settings, &peers, &tls)?;
+    let raft = Raft::new(
+        settings.node_id,
+        config,
+        network,
+        log_store,
+        state_machine.clone(),
+    )
+    .await?;
+    watch_leader_changes(&raft, &counters);
+    let handle = RaftHandle {
+        raft,
+        settings,
+        state_machine: RaftSm::Object(state_machine),
+        counters,
+        tls,
+        peers,
+        bucket_create_lock: tokio::sync::Mutex::new(()),
+    };
+    handle.bootstrap_if_needed(has_logs).await?;
+    Ok(handle)
+}
+
+/// F2：witness 启动入口。日志走 `<db_path>.d/` 文件，状态机只持久化身份 +
+/// applied/membership（`<db_path>.d/witness/state`），不打开 SQLite。
+pub async fn spawn_witness(
+    settings: RaftSettings,
+    tls: Option<Arc<crate::tls::Tls>>,
+) -> RaftResult<RaftHandle> {
+    let config = Arc::new(settings.openraft_config()?);
+    let log_store = file_log::FileLogStore::open(&settings.db_path).await?;
+    let has_logs = log_store.has_logs().await?;
+    let state_machine = witness_sm::WitnessStateMachine::open(&settings.db_path, &settings)
+        .await
+        .map_err(std::io::Error::other)?;
+    state_machine
+        .verify_not_lost(has_logs)
+        .map_err(std::io::Error::other)?;
+    let counters = Arc::clone(state_machine.counters());
+    let peers = Arc::new(compat::PeerVersions::default());
+    let network = build_network(&settings, &peers, &tls)?;
+    let raft = Raft::new(
+        settings.node_id,
+        config,
+        network,
+        log_store,
+        state_machine.clone(),
+    )
+    .await?;
+    watch_leader_changes(&raft, &counters);
+    let handle = RaftHandle {
+        raft,
+        settings,
+        state_machine: RaftSm::Witness(state_machine.clone()),
+        counters,
+        tls,
+        peers,
+        bucket_create_lock: tokio::sync::Mutex::new(()),
+    };
+    handle.bootstrap_if_needed(has_logs).await?;
+    // metrics 的成员由 core 启动任务异步载入；持久化状态机才是权威来源。
+    let initialized = state_machine
+        .applied()
+        .map_err(|e| std::io::Error::other(e.to_string()))?
+        .1
+        .voter_ids()
+        .next()
+        .is_some();
+    state_machine
+        .record_initialized(initialized)
+        .map_err(std::io::Error::other)?;
     Ok(handle)
 }
 
@@ -1173,10 +1295,20 @@ mod tests {
                 .await
         );
         assert_eq!(
-            handle.state_machine().get("k").await.unwrap(),
+            handle
+                .sqlite_state_machine()
+                .unwrap()
+                .get("k")
+                .await
+                .unwrap(),
             Some("v1".to_string())
         );
-        let (_, membership) = handle.state_machine().applied().await.unwrap();
+        let (_, membership) = handle
+            .sqlite_state_machine()
+            .unwrap()
+            .applied()
+            .await
+            .unwrap();
         assert_eq!(membership.voter_ids().collect::<Vec<_>>(), vec![1]);
 
         handle.shutdown().await;
@@ -1185,11 +1317,21 @@ mod tests {
         // 重启：不重新 initialize，完整 LogId + StoredMembership 与 SM 数据保留。
         let handle = spawn(settings).await.unwrap();
         assert_eq!(wait_leader(&handle).await, 1);
-        let (reopened_applied, membership) = handle.state_machine().applied().await.unwrap();
+        let (reopened_applied, membership) = handle
+            .sqlite_state_machine()
+            .unwrap()
+            .applied()
+            .await
+            .unwrap();
         assert!(reopened_applied.unwrap().index >= applied.index);
         assert_eq!(membership.voter_ids().collect::<Vec<_>>(), vec![1]);
         assert_eq!(
-            handle.state_machine().get("k").await.unwrap(),
+            handle
+                .sqlite_state_machine()
+                .unwrap()
+                .get("k")
+                .await
+                .unwrap(),
             Some("v1".to_string())
         );
 
@@ -1197,7 +1339,15 @@ mod tests {
             .write(ControlCommand::Delete { key: "k".into() })
             .await
             .unwrap();
-        assert_eq!(handle.state_machine().get("k").await.unwrap(), None);
+        assert_eq!(
+            handle
+                .sqlite_state_machine()
+                .unwrap()
+                .get("k")
+                .await
+                .unwrap(),
+            None
+        );
         handle.shutdown().await;
     }
 
@@ -1223,7 +1373,7 @@ mod tests {
         handle.raft().trigger().snapshot().await.unwrap();
         wait_snapshot(&handle, applied.index).await;
 
-        let mut sm = handle.state_machine().clone();
+        let mut sm = handle.sqlite_state_machine().unwrap().clone();
         let snapshot = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
             .await
             .unwrap()

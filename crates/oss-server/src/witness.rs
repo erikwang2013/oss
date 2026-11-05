@@ -1,7 +1,8 @@
 //! S7.1：witness 运行时（`oss-server witness --config <w.toml>`）。
 //!
-//! witness 只有控制面：控制库 + Raft 句柄 + `/api/v1/site/raft/*` HTTP。无 `AppState`、
-//! 无 JWT、无 `[site]`/数据目录/S3 面；控制库不种 `site_config`。
+//! witness 只有控制面：文件 Raft 日志 + 元数据状态机 + `/api/v1/site/raft/*` HTTP。
+//! 无 `AppState`、无 JWT、无 `[site]`/数据目录/S3 面；F2 起不再打开 SQLite（`state_db`
+//! 只作为旧库迁移输入保留）。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,14 +12,13 @@ use axum::routing::get;
 use ecat_transport::Server as _;
 
 use crate::config::WitnessToml;
-use crate::db::Db;
-use crate::raft::{self, RaftHandle, RaftSettings, identity};
+use crate::raft::{self, RaftHandle, RaftSettings};
 
 /// 启动 witness，监听 `advertise_endpoint` 的 host:port，ctrl_c 优雅退出。
 pub async fn run(config_path: &Path) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     let cfg = WitnessToml::load(config_path)?;
     let token = cfg.raft.cluster_token.clone();
-    let (_db, handle, tls) = start(&cfg).await?;
+    let (handle, tls) = start(&cfg).await?;
     let addr = bind_addr(&cfg.raft.advertise_endpoint).await?;
     tracing::info!(%addr, node_id = handle.node_id(), "witness 启动");
     // witness 与主服务共用 ecat 监听器（同一条 TLS/mTLS 配置）。
@@ -38,41 +38,27 @@ pub async fn run(config_path: &Path) -> Result<i32, Box<dyn std::error::Error + 
     Ok(0)
 }
 
-/// 打开控制库 → 身份校验 → 启动 Raft（bootstrap=false，等待 join）→ 记录 initialized。
+/// 文件日志 + 元数据状态机 → 启动 Raft（bootstrap=false，等待 join）。
 async fn start(
     cfg: &WitnessToml,
-) -> Result<
-    (Arc<Db>, Arc<RaftHandle>, Arc<crate::tls::Tls>),
-    Box<dyn std::error::Error + Send + Sync>,
-> {
-    let state_db = cfg
-        .raft
-        .state_db
-        .as_ref()
-        .ok_or("witness 配置缺少 [raft].state_db")?;
+) -> Result<(Arc<RaftHandle>, Arc<crate::tls::Tls>), Box<dyn std::error::Error + Send + Sync>> {
+    if cfg.raft.state_db.is_some() {
+        tracing::warn!("witness [raft].state_db 仅作为旧库迁移输入保留；本进程不打开 SQLite");
+    }
     let settings =
         RaftSettings::from_toml(&cfg.raft).map_err(|e| format!("[raft] 配置非法: {e}"))?;
-    for p in [state_db.as_path(), settings.db_path.as_path()] {
-        if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("创建 witness 目录 {} 失败: {e}", dir.display()))?;
-        }
+    if let Some(dir) = settings
+        .db_path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("创建 witness 目录 {} 失败: {e}", dir.display()))?;
     }
-    let url = format!("sqlite://{}?mode=rwc", state_db.display());
-    let db = Arc::new(Db::connect_witness(&url).await?);
-    identity::verify_and_seed(&db, &settings).await?;
     let tls = crate::tls::Tls::load(&cfg.tls)?;
-    let handle = Arc::new(
-        raft::spawn_with_control_tls(
-            settings,
-            Some(db.pool().clone()),
-            None,
-            tls.peer_tls().then(|| Arc::clone(&tls)),
-        )
-        .await?,
-    );
-    identity::record_initialized(&db, handle.membership_nonempty()).await?;
-    Ok((db, handle, tls))
+    let handle =
+        Arc::new(raft::spawn_witness(settings, tls.peer_tls().then(|| Arc::clone(&tls))).await?);
+    Ok((handle, tls))
 }
 
 fn build_app(handle: Arc<RaftHandle>, token: String) -> Router {
@@ -123,36 +109,19 @@ state_db = "{}"
         )
         .unwrap();
         let cfg = WitnessToml::load(&cfg_path).unwrap();
-        let (db, handle, _tls) = start(&cfg).await.unwrap();
+        let (handle, _tls) = start(&cfg).await.unwrap();
         assert!(!handle.membership_nonempty());
 
-        // 身份持久化 + witness 控制库无站点行。
-        assert_eq!(
-            db.schema_meta(identity::META_NODE_ID)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("3")
-        );
-        assert_eq!(
-            db.schema_meta(identity::META_ROLE)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("witness")
-        );
-        assert_eq!(
-            db.schema_meta(identity::META_INITIALIZED)
-                .await
-                .unwrap()
-                .as_deref(),
-            Some("0")
-        );
-        let sites: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM site_config")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(sites, 0);
+        // F2：状态在 `<db_path>.d/witness/state`；旧 state_db 不再打开。
+        assert!(!dir.path().join("state.db").exists(), "state_db 不得被打开");
+        let state_path = dir.path().join("raft.db.d").join("witness").join("state");
+        let state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        assert_eq!(state["identity"]["raft_node_id"], "3");
+        assert_eq!(state["identity"]["raft_role"], "witness");
+        assert_eq!(state["identity"]["raft_initialized"], "0");
+        assert!(state["identity"].get("raft_site_id").is_none());
+        assert!(state["applied"].is_null());
 
         let app = build_app(Arc::clone(&handle), cfg.raft.cluster_token.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

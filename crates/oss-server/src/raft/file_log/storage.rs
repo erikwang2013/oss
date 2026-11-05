@@ -23,10 +23,10 @@ use super::segments::{FRAME_HEADER_LEN, segment_files, write_segment_frames};
 use super::{FaultPoint, FrameLoc, LOG_DIR, LogInner, raft_dir};
 
 /// Translate the log_id of `index` (or the purge bound when the index is at/below it).
+///
+/// Index 0 is a real entry: openraft 0.9 initializes the cluster with a membership entry at
+/// `LogId::default()`.
 fn log_id_at_or_below(inner: &LogInner, index: u64) -> Option<LogId<u64>> {
-    if index == 0 {
-        return None;
-    }
     if let Some((_, frame)) = inner.by_index.get(&index) {
         return Some(LogId::new(
             CommittedLeaderId::new(frame.term, frame.node),
@@ -130,6 +130,11 @@ impl FileLogStore {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Startup identity guard: whether the log still holds entries (purged-to-empty is false).
+    pub async fn has_logs(&self) -> Result<bool, StorageError<u64>> {
+        Ok(self.lock().last_index().is_some())
+    }
+
     fn store_meta(&self, inner: &LogInner, meta: &RaftMetaFile) -> Result<(), StorageError<u64>> {
         inner
             .fault(FaultPoint::BeforeMetaStore)
@@ -176,7 +181,9 @@ impl FileLogStore {
             if first <= cur_last {
                 // Conflicting suffix: commit the truncation bound first, then overwrite on disk.
                 let mut meta = inner.meta.clone();
-                meta.last_index = log_id_at_or_below(&inner, first.saturating_sub(1));
+                meta.last_index = first
+                    .checked_sub(1)
+                    .and_then(|prev| log_id_at_or_below(&inner, prev));
                 meta.log_format = CURRENT_LOG_FORMAT;
                 self.store_meta(&inner, &meta)?;
                 inner.meta = meta;
@@ -190,10 +197,11 @@ impl FileLogStore {
                     ),
                 ));
             }
-        } else if first != 1 {
+        } else if first > 1 {
+            // openraft initializes at index 0; a 1-based log is kept for older fixtures.
             return Err(log_err(
                 ErrorVerb::Write,
-                format!("raft log hole: empty log append starts at {first}, expected 1"),
+                format!("raft log hole: empty log append starts at {first}, expected 0 or 1"),
             ));
         }
         let mut payloads = Vec::with_capacity(entries.len());

@@ -213,7 +213,10 @@ pub(super) async fn install(
     scrub_local_uploads(&sm.store, |owner| {
         owner.is_some_and(|uid| !admins.contains(&uid))
     })?;
-    sm.remember_snapshot(meta, &bytes);
+    // Root switch is the install commit; the snapshot file only feeds future
+    // replication. A crash in between leaves the new root with an older snapshot
+    // (normal lag), never the reverse.
+    sm.snapshots.write(meta, &bytes).await?;
     Ok(())
 }
 
@@ -270,7 +273,7 @@ pub(super) async fn build(
         last_membership: membership,
         snapshot_id,
     };
-    sm.remember_snapshot(&meta, &bytes);
+    sm.snapshots.write(&meta, &bytes).await?;
     Ok(Snapshot {
         meta,
         snapshot: Box::new(Cursor::new(bytes)),

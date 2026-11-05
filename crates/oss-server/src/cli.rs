@@ -1410,6 +1410,23 @@ fn sqlite_url(path: &std::path::Path) -> String {
     format!("sqlite://{}?mode=rw", path.display())
 }
 
+/// 对象后端没有 SQLite 控制库；离线 export/cutover/force-recover 仍只读 SQLite，
+/// 误跑会改写一个与运行态无关的库。对象导出一致性在 F3/G1 接线前 fail-closed。
+fn require_sqlite_backend(
+    cfg: &crate::config::AppConfig,
+    op: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if cfg.server.control_backend == crate::config::ControlBackend::Objects {
+        return Err(format!(
+            "control_backend=objects 不支持 {op}：离线 cutover/export/force-recover 仍只读 \
+             SQLite 控制库（对象后端的导出/安装由 F3/G1 接线）。请在 SQLite 后端执行，\
+             或等待迁移器完成"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn env_has_vault() -> bool {
     ["OSS_MASTER_KEY_FILE", "OSS_KMS_DIR"].iter().any(|k| {
         std::env::var(k)
@@ -1425,7 +1442,10 @@ async fn export_cmd(
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     let (db, source_site, node_id, role, admin, has_vault) = if witness {
         let w = crate::config::WitnessToml::load(cfg_path)?;
-        let state_db = w.raft.state_db.as_ref().ok_or("witness 缺少 state_db")?;
+        let state_db = w.raft.state_db.as_ref().ok_or(
+            "witness 是元数据-only 状态机（无控制数据）；raft-export --witness 只支持旧库\
+             迁移输入 [raft].state_db；请从 voter 导出",
+        )?;
         let db = crate::db::Db::connect_offline(&sqlite_url(state_db)).await?;
         (
             db,
@@ -1437,6 +1457,7 @@ async fn export_cmd(
         )
     } else {
         let cfg = crate::config::AppConfig::load(cfg_path)?;
+        require_sqlite_backend(&cfg, "raft-export")?;
         let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
         let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
         let site = db
@@ -1487,6 +1508,7 @@ async fn cutover_cmd(
     let mut targets = Vec::new();
     for p in &paths {
         let cfg = crate::config::AppConfig::load(p)?;
+        require_sqlite_backend(&cfg, "raft-cutover")?;
         let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
         let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
         let facts = crate::raft::cutover::TargetFacts {
@@ -1565,6 +1587,7 @@ async fn force_recover_cmd(
     // 数据站点配置优先；否则按 witness 配置（仅 [raft]）打开 state_db。
     let (db, settings, raft_db) = match crate::config::AppConfig::load(cfg_path) {
         Ok(cfg) => {
+            require_sqlite_backend(&cfg, "raft-force-recover")?;
             let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
             let settings = crate::raft::RaftSettings::from_toml(raft)?;
             let raft_db = settings.db_path.clone();
@@ -1573,7 +1596,9 @@ async fn force_recover_cmd(
         }
         Err(_) => {
             let w = crate::config::WitnessToml::load(cfg_path)?;
-            let state_db = w.raft.state_db.as_ref().ok_or("witness 缺少 state_db")?;
+            let state_db = w.raft.state_db.as_ref().ok_or(
+                "witness force-recover 需要旧 state_db 作为迁移输入（新状态机为元数据-only 文件）",
+            )?;
             let settings = crate::raft::RaftSettings::from_toml(&w.raft)?;
             let raft_db = settings.db_path.clone();
             for p in [state_db.as_path(), raft_db.as_path()] {

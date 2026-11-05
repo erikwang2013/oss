@@ -273,12 +273,11 @@ impl AppState {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut cfg = AppConfig::load(cfg_path)?;
         let object_backend = cfg.server.control_backend == ControlBackend::Objects;
-        // B4：对象状态机/文件日志（F1/F2）未接 Raft；集群/stretch 的控制面仍是
-        // SQLite 后端（M3/M9 S4）。在碰任何根或库之前拒绝，避免引导出半形态集群。
-        if object_backend && (cfg.raft.is_some() || cfg.cluster.is_some() || cfg.stretch.is_some())
-        {
+        // B4/F2：对象后端支持单机与 [raft]（文件日志 + 对象状态机）；集群/stretch 的
+        // 控制面仍是 SQLite 后端（M3/M9 S4）。在碰任何根或库之前拒绝，避免半形态集群。
+        if object_backend && (cfg.cluster.is_some() || cfg.stretch.is_some()) {
             return Err(
-                "control_backend=objects 暂不支持 [raft]/[cluster]/[stretch]（F2 前拒绝启动）"
+                "control_backend=objects 暂不支持 [cluster]/[stretch]（控制面仍为 SQLite 后端）"
                     .into(),
             );
         }
@@ -543,7 +542,7 @@ impl AppState {
         if object_backend {
             let object = crate::control_backend::ObjectControl::open(
                 Arc::clone(&store),
-                crate::control_backend::expected_mode(false),
+                crate::control_backend::expected_mode(cfg.raft.is_some()),
                 cfg.site.as_ref().and_then(|s| s.id.as_deref()),
             )
             .await?;
@@ -741,6 +740,22 @@ impl AppState {
             (None, None)
         };
         let raft = match raft_settings {
+            Some(settings) if object_backend => {
+                let control = db
+                    .object_control()
+                    .ok_or("对象控制根未装配，无法启动 [raft]")?
+                    .control
+                    .clone();
+                Some(Arc::new(
+                    crate::raft::spawn_object(
+                        settings,
+                        control,
+                        install_tx,
+                        tls.peer_tls().then(|| Arc::clone(&tls)),
+                    )
+                    .await?,
+                ))
+            }
             Some(settings) => Some(Arc::new(
                 crate::raft::spawn_with_control_tls(
                     settings,
@@ -753,8 +768,21 @@ impl AppState {
             None => None,
         };
         // S7.1：初始化标志以 live 成员为准（首启 bootstrap 后写 1；witness/等 join 写 0）。
-        // 对象后端没有 schema_meta；初始化事实由对象根与身份行承载（F 收口）。
-        if !object_backend {
+        // 对象后端把它写在对象根 markers；standalone 对象根不写 Raft 身份。
+        if object_backend {
+            if raft.is_some() {
+                let control = db
+                    .object_control()
+                    .ok_or("对象控制根未装配")?
+                    .control
+                    .clone();
+                crate::raft::identity::record_initialized_object(
+                    &control,
+                    bootstrapped || raft.as_ref().is_some_and(|h| h.membership_nonempty()),
+                )
+                .await?;
+            }
+        } else {
             crate::raft::identity::record_initialized(
                 &db,
                 bootstrapped || raft.as_ref().is_some_and(|h| h.membership_nonempty()),
