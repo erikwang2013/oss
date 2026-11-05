@@ -321,7 +321,10 @@ async fn seed_is_idempotent_and_trim_is_a_noop() {
         .unwrap()
         .unwrap();
     assert_eq!(obj_id.id, s_id);
-    assert_eq!((&obj_id.name, &obj_id.region, obj_id.priority), (&sql_id.name, &sql_id.region, sql_id.priority));
+    assert_eq!(
+        (&obj_id.name, &obj_id.region, obj_id.priority),
+        (&sql_id.name, &sql_id.region, sql_id.priority)
+    );
     assert_eq!(obj_id.token, "tok");
     assert_eq!(obj_id.id, s_id);
 }

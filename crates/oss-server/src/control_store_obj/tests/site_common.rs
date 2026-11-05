@@ -138,7 +138,10 @@ pub(super) fn assert_rows(sql: &[(String, String, String, String)], obj: &[SiteC
     let mut at = 0;
     for (i, row) in obj.iter().enumerate() {
         let found = sql[at..].iter().position(|(entity, id, op, payload)| {
-            row.entity == *entity && row.entity_id == *id && row.op == *op && row.payload == *payload
+            row.entity == *entity
+                && row.entity_id == *id
+                && row.op == *op
+                && row.payload == *payload
         });
         match found {
             Some(offset) => at += offset + 1,
@@ -166,7 +169,10 @@ pub(super) async fn block(db: &crate::db::Db, real: &Real, entity: &str, id: &st
     run_hook(real, |txn| {
         let entity = entity.clone();
         let id = id.clone();
-        Box::pin(async move { txn.site_put_clock(&entity, &id, ts, 7, "remote-z", 99).await })
+        Box::pin(async move {
+            txn.site_put_clock(&entity, &id, ts, 7, "remote-z", 99)
+                .await
+        })
     })
     .await
     .unwrap();

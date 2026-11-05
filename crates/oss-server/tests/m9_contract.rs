@@ -70,6 +70,7 @@ cluster_token = "t"
         sts: Default::default(),
         ap: Default::default(),
         quota: Default::default(),
+        server: Default::default(),
     }
 }
 

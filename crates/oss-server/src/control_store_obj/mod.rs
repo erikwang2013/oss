@@ -33,6 +33,7 @@ mod local_ops;
 mod origin;
 mod repl_outbox;
 mod root_io;
+mod seam;
 mod site;
 mod site_apply;
 mod sync_intents;

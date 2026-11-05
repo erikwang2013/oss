@@ -235,14 +235,12 @@ async fn policy_trigger_cells_match() {
     assert_rows(&sql_rows(&db).await, &obj_rows(&real).await);
 
     // Recreate the policy so the later gate-update test has a row to touch.
-    sqlx::query(
-        "INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES (?, ?, 7)",
-    )
-    .bind(bucket)
-    .bind(&changed.policy_json)
-    .execute(db.pool())
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO bucket_policies (bucket, policy_json, updated_at) VALUES (?, ?, 7)")
+        .bind(bucket)
+        .bind(&changed.policy_json)
+        .execute(db.pool())
+        .await
+        .unwrap();
     run_hook(&real, |txn| {
         let changed = changed.clone();
         Box::pin(async move { txn.site_hook_policy(None, Some(&changed), 2_001).await })
@@ -328,5 +326,4 @@ async fn policy_trigger_cells_match() {
     );
     assert_eq!(sql_rows(&db).await.len(), before);
     assert_eq!(obj_rows(&real).await.len(), obj_before);
-
 }

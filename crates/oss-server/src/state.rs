@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, ControlBackend};
 use crate::db::Db;
 use jwt_rust::config::JwtConfig;
 use jwt_rust::integrations::JwtAuth;
@@ -270,6 +270,16 @@ impl AppState {
         cfg_path: &std::path::Path,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut cfg = AppConfig::load(cfg_path)?;
+        let object_backend = cfg.server.control_backend == ControlBackend::Objects;
+        // B4：对象状态机/文件日志（F1/F2）未接 Raft；集群/stretch 的控制面仍是
+        // SQLite 后端（M3/M9 S4）。在碰任何根或库之前拒绝，避免引导出半形态集群。
+        if object_backend && (cfg.raft.is_some() || cfg.cluster.is_some() || cfg.stretch.is_some())
+        {
+            return Err(
+                "control_backend=objects 暂不支持 [raft]/[cluster]/[stretch]（F2 前拒绝启动）"
+                    .into(),
+            );
+        }
         // TLS 物料先于所有传输层加载（文件缺失/私钥非法 → 启动失败，不降级明文）。
         let tls = crate::tls::Tls::load(&cfg.tls)?;
         // 密钥兜底解析（docker/无人值守）：空值 → OSS_SECRETS_FILE 复用/生成落盘（见 config.rs）
@@ -300,15 +310,17 @@ impl AppState {
             .map_err(|e| format!("创建暂存目录 {} 失败: {e}", cfg.staging_dir.display()))?;
 
         // witness 由 `witness` 子命令承载（config 已拒绝 serve + role=witness）。
-        let db = Arc::new(
+        let db = Arc::new(if object_backend {
+            // B4：对象后端不打开/创建 oss.db，也不跑 SQLite 迁移。
+            Db::connect_object().await?
+        } else {
             Db::connect_site(
                 &cfg.database_url,
                 cfg.raft.is_some(),
                 cfg.site.as_ref().and_then(|s| s.id.as_deref()),
             )
-            .await?,
-        );
-        // M9 S7.1：身份必须在任何控制面写之前种子/校验（首次启动也写 schema_meta）。
+            .await?
+        });
         let raft_settings = match cfg.raft.as_ref() {
             Some(t) => Some(
                 crate::raft::RaftSettings::from_toml(t)
@@ -316,43 +328,48 @@ impl AppState {
             ),
             None => None,
         };
-        if let Some(settings) = &raft_settings {
-            crate::raft::identity::verify_and_seed(&db, settings).await?;
-        }
-        // M7（R2）：`[site]` 覆盖必须早于任何控制面写（桶对账/管理员引导）；测试路径
-        // 经 `AppState::new` 同样会再应用一次（幂等）。
-        if let Some(site) = cfg.site.as_ref() {
-            db.apply_site_config(
-                site.name.as_deref(),
-                Some(site.region.as_str()),
-                Some(site.priority),
-                site.token.as_deref(),
-            )
-            .await?;
-        }
-        // M9：无条件模式守卫（connect_* 已执行一次；这里按计划顺序在 site 配置后复验）。
-        db.prepare_raft_mode(cfg.raft.is_some()).await?;
-        // S6d：模式与库内触发器/站点状态一致才放行。
-        db.assert_mode_guards().await?;
-        // M8-2 P1-A：本地运行态（含 level-3 快照拷贝）不是日志事实；feature-4 启动前
-        // 必须四表为空/无悬空引用，或已有 level-4 命令/快照/cutover 留下的激活标记。
-        // 守卫在 Raft 启动前，拒绝时不会进入 apply。
-        if let Some(settings) = &raft_settings {
-            crate::raft::compat::guard_runstate_activation(db.pool(), settings.feature_level)
-                .await
-                .map_err(|e| format!("[raft] 运行态激活守卫：{e}"))?;
-            // v1.23.0 的 feature-4 inventory 行是节点本地行，且有独立的 level-5 marker。
-            crate::raft::compat::guard_inventory_activation(db.pool(), settings.feature_level)
-                .await
-                .map_err(|e| format!("[raft] inventory 激活守卫：{e}"))?;
-        }
-        // AP Slice A：静态端点 registry 的账户存在性/状态（DB 就绪后）。
-        // Raft 新节点在快照安装前本地账户表可能为空 → 只 hard-fail standalone；
-        // 请求级账户绑定在两种模式下都 fail-closed。
-        if cfg.raft.is_none() {
-            validate_ap_endpoints(&db, &cfg.ap)
-                .await
-                .map_err(|e| format!("[ap] 配置校验失败：{e}"))?;
+        // SQLite 专属启动序列（身份种子、模式守卫、AP 账户校验）。对象后端的
+        // 对应事实在对象根里，由 `ObjectControl::open` 断言；E/F 收口其余门面。
+        if !object_backend {
+            // M9 S7.1：身份必须在任何控制面写之前种子/校验（首次启动也写 schema_meta）。
+            if let Some(settings) = &raft_settings {
+                crate::raft::identity::verify_and_seed(&db, settings).await?;
+            }
+            // M7（R2）：`[site]` 覆盖必须早于任何控制面写（桶对账/管理员引导）；测试路径
+            // 经 `AppState::new` 同样会再应用一次（幂等）。
+            if let Some(site) = cfg.site.as_ref() {
+                db.apply_site_config(
+                    site.name.as_deref(),
+                    Some(site.region.as_str()),
+                    Some(site.priority),
+                    site.token.as_deref(),
+                )
+                .await?;
+            }
+            // M9：无条件模式守卫（connect_* 已执行一次；这里按计划顺序在 site 配置后复验）。
+            db.prepare_raft_mode(cfg.raft.is_some()).await?;
+            // S6d：模式与库内触发器/站点状态一致才放行。
+            db.assert_mode_guards().await?;
+            // M8-2 P1-A：本地运行态（含 level-3 快照拷贝）不是日志事实；feature-4 启动前
+            // 必须四表为空/无悬空引用，或已有 level-4 命令/快照/cutover 留下的激活标记。
+            // 守卫在 Raft 启动前，拒绝时不会进入 apply。
+            if let Some(settings) = &raft_settings {
+                crate::raft::compat::guard_runstate_activation(db.pool(), settings.feature_level)
+                    .await
+                    .map_err(|e| format!("[raft] 运行态激活守卫：{e}"))?;
+                // v1.23.0 的 feature-4 inventory 行是节点本地行，且有独立的 level-5 marker。
+                crate::raft::compat::guard_inventory_activation(db.pool(), settings.feature_level)
+                    .await
+                    .map_err(|e| format!("[raft] inventory 激活守卫：{e}"))?;
+            }
+            // AP Slice A：静态端点 registry 的账户存在性/状态（DB 就绪后）。
+            // Raft 新节点在快照安装前本地账户表可能为空 → 只 hard-fail standalone；
+            // 请求级账户绑定在两种模式下都 fail-closed。
+            if cfg.raft.is_none() {
+                validate_ap_endpoints(&db, &cfg.ap)
+                    .await
+                    .map_err(|e| format!("[ap] 配置校验失败：{e}"))?;
+            }
         }
         let mut store_cfg = StoreConfig::new(&drives[0]);
         // M9 S1：sync 写提交门（必须在 Store::open 前注入——open 克隆配置）。
@@ -518,7 +535,18 @@ impl AppState {
             }));
             stretch_first_init = stretch_startup_check(&db, &store_cfg.drives).await?;
         }
-        let store = Store::open(store_cfg).await?;
+        let store = Arc::new(Store::open(store_cfg).await?);
+        // B4：对象后端的控制根必须在任何控制面读（new_with 的 site/AP/OLAP 预加载）
+        // 之前装配完成；启动锁守卫随 `ObjectControl` 存活到进程结束。
+        if object_backend {
+            let object = crate::control_backend::ObjectControl::open(
+                Arc::clone(&store),
+                crate::control_backend::expected_mode(false),
+                cfg.site.as_ref().and_then(|s| s.id.as_deref()),
+            )
+            .await?;
+            db.attach_object_control(object)?;
+        }
         // DP-0 启动握手（best-effort，不阻断启动）：不可达节点交给运行期 quorum/降级；
         // 可达且混版 → warn，数据面在首个请求前即 fail-closed（503 peer_incompatible）。
         // 运维可见状态见 /health/cluster 与 /api/v1/cluster/status 的 data_plane_compatible。
@@ -534,7 +562,7 @@ impl AppState {
                 ),
             }
         }
-        if stretch_first_init {
+        if stretch_first_init && !object_backend {
             db.schema_meta_set_if_absent("stretch_initialized", "1")
                 .await
                 .map_err(|e| format!("写入 stretch_initialized 失败: {e}"))?;
@@ -562,7 +590,7 @@ impl AppState {
 
         // M7（P3）：两轮启动对账期间抑制站点触发器——维护写（set_id 收敛/补行）不得
         // 产生 changelog；结束后复位 0。进程若中途退出，下次 connect 的 site_bootstrap 复位。
-        if !raft_enabled {
+        if !raft_enabled && !object_backend {
             if let Err(e) = db.set_apply_ctx(true).await {
                 tracing::warn!(error = %e, "启动对账抑制开关失败（继续）");
             }
@@ -630,35 +658,39 @@ impl AppState {
         // 口令来源：OSS_ADMIN_PASSWORD 非空优先；空/缺时用密钥文件解析值（配了
         // OSS_SECRETS_FILE 才可能有——docker 栈即此路径，口令随文件落盘）。
         // 空凭据一律拒绝建号：空口令账号会被空口令登录命中。
-        match (
-            std::env::var("OSS_ADMIN_USER")
-                .ok()
-                .filter(|u| !u.is_empty()),
-            std::env::var("OSS_ADMIN_PASSWORD")
-                .ok()
-                .filter(|p| !p.is_empty())
-                .or_else(|| secrets.admin_password.clone()),
-        ) {
-            (Some(user), Some(pass)) => {
-                // 已存在的同名账号一律不覆盖（含口令不同的情况）
-                if !db.user_exists(&user).await? {
-                    db.create_user(&user, &pass, true).await?;
-                    tracing::info!(
-                        user = %user,
-                        secrets_file = ?secrets.secrets_file,
-                        "创建管理员账号（口令取自环境变量或密钥文件）"
+        // M1：SQLite 后端的首管引导 / groups 回填 / 初始化标记（对象后端由 E 收口
+        // 账户与会话门面；B4 阶段不写占位库，避免“看起来成功”的空账号）。
+        if !object_backend {
+            match (
+                std::env::var("OSS_ADMIN_USER")
+                    .ok()
+                    .filter(|u| !u.is_empty()),
+                std::env::var("OSS_ADMIN_PASSWORD")
+                    .ok()
+                    .filter(|p| !p.is_empty())
+                    .or_else(|| secrets.admin_password.clone()),
+            ) {
+                (Some(user), Some(pass)) => {
+                    // 已存在的同名账号一律不覆盖（含口令不同的情况）
+                    if !db.user_exists(&user).await? {
+                        db.create_user(&user, &pass, true).await?;
+                        tracing::info!(
+                            user = %user,
+                            secrets_file = ?secrets.secrets_file,
+                            "创建管理员账号（口令取自环境变量或密钥文件）"
+                        );
+                    }
+                    // M9 N8：identity/配对使用首个管理员名；已写入不覆盖。
+                    db.schema_meta_set_if_absent("admin_username", &user)
+                        .await?;
+                }
+                (Some(_), None) => {
+                    tracing::warn!(
+                        "OSS_ADMIN_USER 已设但无可用口令（环境与密钥文件都没有），跳过管理员引导"
                     );
                 }
-                // M9 N8：identity/配对使用首个管理员名；已写入不覆盖。
-                db.schema_meta_set_if_absent("admin_username", &user)
-                    .await?;
+                _ => {}
             }
-            (Some(_), None) => {
-                tracing::warn!(
-                    "OSS_ADMIN_USER 已设但无可用口令（环境与密钥文件都没有），跳过管理员引导"
-                );
-            }
-            _ => {}
         }
 
         // 每个上传分组对应的桶，启动时确保存在（内核 + 控制面各一份记录）。
@@ -668,7 +700,7 @@ impl AppState {
         // M7（L2）：groups 桶的记账写也属于启动维护，必须抑制站点触发器（否则时钟领先时
         // INSERT OR IGNORE 仍会触发 BEFORE 门控 ABORT，进程起不来）。
         // M9 H3/H5：Raft 模式下 groups 桶行/目录由日志 apply 产生，跳过本地回填。
-        if !raft_enabled {
+        if !raft_enabled && !object_backend {
             if let Err(e) = db.set_apply_ctx(true).await {
                 tracing::warn!(error = %e, "groups 回填抑制开关失败（继续）");
             }
@@ -719,11 +751,14 @@ impl AppState {
             None => None,
         };
         // S7.1：初始化标志以 live 成员为准（首启 bootstrap 后写 1；witness/等 join 写 0）。
-        crate::raft::identity::record_initialized(
-            &db,
-            bootstrapped || raft.as_ref().is_some_and(|h| h.membership_nonempty()),
-        )
-        .await?;
+        // 对象后端没有 schema_meta；初始化事实由对象根与身份行承载（F 收口）。
+        if !object_backend {
+            crate::raft::identity::record_initialized(
+                &db,
+                bootstrapped || raft.as_ref().is_some_and(|h| h.membership_nonempty()),
+            )
+            .await?;
+        }
 
         // M9 I-1：Raft 启动对账须在控制状态载入后、serve 前——apply 与 mkdir 之间崩溃
         // 或删桶副作用失败留下的 row/dir 不一致在此修复；只读行、不追加日志。
@@ -813,7 +848,7 @@ impl AppState {
         Self::new_with(
             cfg,
             db,
-            store,
+            Arc::new(store),
             ap_cache,
             olap_cache,
             bucket_cleanup,
@@ -829,7 +864,7 @@ impl AppState {
     async fn new_with(
         cfg: AppConfig,
         db: Arc<Db>,
-        store: Store,
+        store: Arc<Store>,
         ap_cache: Arc<xl_s3::ap::ApCache>,
         olap_cache: Arc<xl_s3::olap::OlapCache>,
         bucket_cleanup: Arc<dyn xl_s3::bucket_cleanup::BucketCleanupSink>,
@@ -957,7 +992,6 @@ impl AppState {
             db.pool().clone(),
             notifier,
         ));
-        let store = Arc::new(store);
         // M9 S6：门面与副作用执行器共享同一批 Arc；Raft 句柄来自 load。
         // 先于共享存储构造——S6c 起它们的控制写要经同一门面。
         let control = Arc::new(match &raft {

@@ -28,6 +28,11 @@ pub struct Db {
     pool: SqlitePool,
     /// M9 S6a：Raft 模式抑制 `verify_user` 的旧 hash 本地升级（H1；各站点盐不同会分叉）。
     raft_mode: std::sync::atomic::AtomicBool,
+    /// B4：`[server].control_backend = "objects"` 时由启动装配注入。未注入 =
+    /// SQLite 后端（默认路径零改动）。对象模式下 `pool` 只是一份无 schema 的
+    /// 内存占位：尚未双路由的 SQLite 门面会报 "no such table" 而 fail-closed，
+    /// 绝不静默写盘（E/F 逐个收口）。
+    object: std::sync::OnceLock<std::sync::Arc<crate::control_backend::ObjectControl>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -308,12 +313,25 @@ impl Db {
         Self::connect_with(url, false, true, None).await
     }
 
+    /// B4 对象后端启动占位：**不打开/创建 `oss.db`，也不跑任何迁移**。`pool` 是
+    /// 无 schema 的内存库，仅保证未迁移子系统能构造且误写时以 "no such table"
+    /// fail-closed；控制面读写走启动装配注入的 `ObjectControl`。
+    pub async fn connect_object() -> Result<Self> {
+        let pool = SqlitePool::connect("sqlite::memory:").await?;
+        Ok(Self {
+            pool,
+            raft_mode: std::sync::atomic::AtomicBool::new(false),
+            object: std::sync::OnceLock::new(),
+        })
+    }
+
     /// 离线运维连接：只开 WAL 池，不重放 schema、不切模式（避免二次开 raft.db / 降级守卫）。
     pub async fn connect_offline(url: &str) -> Result<Self> {
         let pool = SqlitePool::connect_with(wal_options(url)?).await?;
         Ok(Self {
             pool,
             raft_mode: std::sync::atomic::AtomicBool::new(false),
+            object: std::sync::OnceLock::new(),
         })
     }
 
@@ -329,6 +347,7 @@ impl Db {
         let db = Self {
             pool,
             raft_mode: std::sync::atomic::AtomicBool::new(false),
+            object: std::sync::OnceLock::new(),
         };
         db.ensure_columns().await?;
         // 生命周期表主键重建（旧 PK (bucket,prefix) → (bucket,rule_id)）：必须在 0003 建
@@ -1241,11 +1260,24 @@ impl Db {
         priority: Option<i64>,
         token: Option<&str>,
     ) -> Result<()> {
-        let mut conn = self.pool.acquire().await?;
-        SqliteControlTxn::new(&mut conn)
-            .site_config_apply(name, region, priority, token)
-            .await
-            .map_err(crate::control_store::to_sqlx)
+        let name = name.map(str::to_string);
+        let region = region.map(str::to_string);
+        let token = token.map(str::to_string);
+        self.control_write("startup", move |txn| {
+            let name = name.clone();
+            let region = region.clone();
+            let token = token.clone();
+            Box::pin(async move {
+                txn.site_config_apply(
+                    name.as_deref(),
+                    region.as_deref(),
+                    priority,
+                    token.as_deref(),
+                )
+                .await
+            })
+        })
+        .await
     }
 
     pub async fn list_sites(&self) -> Result<Vec<SitePeer>> {
@@ -1360,11 +1392,82 @@ impl Db {
         &self.pool
     }
 
-    /// 控制面读句柄：共享本 `Db` 的 pool（只克隆池句柄，不新建连接池）。
+    /// B4：启动装配注入对象控制面（S7：每个 `Db` 只能挂一次）。
+    pub fn attach_object_control(
+        &self,
+        object: std::sync::Arc<crate::control_backend::ObjectControl>,
+    ) -> Result<()> {
+        self.object.set(object).map_err(|_| {
+            sqlx::Error::Protocol("对象控制面后端被重复注入（每个 Db 只能挂一次）".into())
+        })
+    }
+
+    /// 已选后端（SQLite 默认；对象后端由启动路径注入）。
+    pub fn control_backend(&self) -> crate::config::ControlBackend {
+        if self.object.get().is_some() {
+            crate::config::ControlBackend::Objects
+        } else {
+            crate::config::ControlBackend::Sqlite
+        }
+    }
+
+    /// 对象后端句柄（未选对象后端 = None；测试/诊断用）。
+    pub fn object_control(&self) -> Option<&std::sync::Arc<crate::control_backend::ObjectControl>> {
+        self.object.get()
+    }
+
+    /// 控制面读句柄：对象后端直接返回已装配句柄；否则共享本 `Db` 的 pool
+    /// （只克隆池句柄，不新建连接池）。
     pub fn control_store(&self) -> std::sync::Arc<dyn xl_store::control_store::ControlStore> {
+        if let Some(object) = self.object.get() {
+            return object.control.clone();
+        }
         std::sync::Arc::new(crate::control_store::SqliteControlStore::new(
             self.pool.clone(),
         ))
+    }
+
+    /// B4 写侧派发：在一个事务里对选中后端运行闭包。
+    ///
+    /// - SQLite（默认）：`BEGIN` → `SqliteControlTxn` → 成功 `COMMIT` / 失败
+    ///   `ROLLBACK`；既有语义逐字节不变。
+    /// - 对象：`ObjectControlStore::transaction`（根 CAS 冲突时**整段闭包重跑**），
+    ///   origin 为 `Local`。D3 的 local_store 写入立即生效，绝不能放进这个闭包。
+    pub async fn control_write<T, F>(&self, actor: &str, mut f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'a> FnMut(
+            &'a mut dyn ControlTxn,
+        ) -> futures::future::BoxFuture<
+            'a,
+            std::result::Result<T, xl_store::control_store::ControlError>,
+        >,
+    {
+        if let Some(object) = self.object.get() {
+            return object
+                .control
+                .transaction(crate::control_store_obj::WriteOrigin::local(actor), |txn| {
+                    let fut = f(txn);
+                    Box::pin(async move { fut.await.map_err(crate::control_backend::store_error) })
+                })
+                .await
+                .map_err(|e| sqlx::Error::Protocol(format!("对象控制面事务失败：{e}")));
+        }
+        let mut tx = self.pool.begin().await?;
+        let out = {
+            let mut txn = SqliteControlTxn::new(&mut tx);
+            f(&mut txn).await
+        };
+        match out {
+            Ok(value) => {
+                tx.commit().await?;
+                Ok(value)
+            }
+            Err(e) => {
+                tx.rollback().await?;
+                Err(crate::control_store::to_sqlx(e))
+            }
+        }
     }
 
     /// 自然键属主 → 本节点数字 id（console JSON 边界用）：`Admin` → 首个管理员；

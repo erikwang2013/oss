@@ -6,9 +6,44 @@ use serde::{Deserialize, Serialize};
 
 use crate::tls_config::{TlsToml, normalize_peer_addr, parse_endpoint};
 
+/// `[server].control_backend`（B4）：控制面存储后端。`sqlite` 是 H1 前的默认；
+/// `objects` 仍处于迁移期（E/F 完成前不是完整服务形态）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlBackend {
+    #[default]
+    Sqlite,
+    Objects,
+}
+
+impl ControlBackend {
+    /// 解析显式值（env 覆盖用）；未知值必须拒绝，绝不静默回落到默认。
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            "sqlite" => Ok(Self::Sqlite),
+            "objects" => Ok(Self::Objects),
+            other => Err(format!(
+                "[server].control_backend 非法值 {other:?}（只认 sqlite|objects）"
+            )),
+        }
+    }
+}
+
+/// `[server]`：服务进程级开关。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerToml {
+    /// 控制面后端；默认 sqlite（未写该节 = 旧行为）。
+    #[serde(default)]
+    pub control_backend: ControlBackend,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub listen: String,
+    /// `[server]` 进程级开关（缺省 = 全默认）。
+    #[serde(default)]
+    pub server: ServerToml,
     /// 单盘形态的数据目录（`data_dirs` 未配置时使用）。M2b-2 起多盘用 `data_dirs`。
     pub data_dir: PathBuf,
     /// 多盘形态的数据盘数组（M2b-2）；配置了它则忽略 `data_dir`。
@@ -750,6 +785,11 @@ impl AppConfig {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("读取配置文件 {} 失败: {e}", path.display()))?;
         let mut cfg: Self = toml::from_str(&text)?;
+        // B4：env 覆盖 `[server].control_backend`（未知值启动失败，不静默回落）。
+        if let Ok(value) = std::env::var("OSS_CONTROL_BACKEND") {
+            cfg.server.control_backend =
+                ControlBackend::parse(&value).map_err(|e| format!("配置校验失败：{e}"))?;
+        }
         cfg.quota.strict |= std::env::var("OSS_ACCOUNT_QUOTA_STRICT")
             .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"));
         cfg.tls_validate()
@@ -1407,6 +1447,7 @@ mod tests {
             sts: Default::default(),
             ap: Default::default(),
             quota: Default::default(),
+            server: Default::default(),
         }
     }
 
@@ -2086,6 +2127,7 @@ mod tests {
             sts: Default::default(),
             ap: Default::default(),
             quota: Default::default(),
+            server: Default::default(),
         };
         // 合法
         assert!(
@@ -2434,5 +2476,41 @@ mesh_secret = "x"
         let mut c = base_cfg();
         c.sync.timeout_ms = 0;
         assert!(c.raft_validate().is_err());
+    }
+
+    /// B4：`[server].control_backend` 缺省 sqlite；显式 objects 可解析；未知值拒绝。
+    #[test]
+    fn backend_select_control_backend_selector() {
+        let base = "listen = \"127.0.0.1:0\"\n\
+                    data_dir = \"d\"\n\
+                    staging_dir = \"s\"\n\
+                    database_url = \"sqlite::memory:\"\n\
+                    jwt_secret = \"0123456789abcdef0123456789abcdef\"\n";
+        let c: AppConfig = toml::from_str(base).unwrap();
+        assert_eq!(
+            c.server.control_backend,
+            ControlBackend::Sqlite,
+            "缺省必须 sqlite"
+        );
+
+        let objects = format!("{base}\n[server]\ncontrol_backend = \"objects\"\n");
+        let c: AppConfig = toml::from_str(&objects).unwrap();
+        assert_eq!(c.server.control_backend, ControlBackend::Objects);
+
+        let unknown = format!("{base}\n[server]\ncontrol_backend = \"postgres\"\n");
+        assert!(
+            toml::from_str::<AppConfig>(&unknown).is_err(),
+            "未知后端必须拒绝"
+        );
+
+        assert_eq!(
+            ControlBackend::parse("objects").unwrap(),
+            ControlBackend::Objects
+        );
+        assert_eq!(
+            ControlBackend::parse(" sqlite ").unwrap(),
+            ControlBackend::Sqlite
+        );
+        assert!(ControlBackend::parse("postgres").is_err());
     }
 }

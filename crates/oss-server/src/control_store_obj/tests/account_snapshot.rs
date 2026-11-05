@@ -114,11 +114,10 @@ async fn strict_export_matches_sqlite_and_serializes_identically() {
         "strict snapshot bytes"
     );
 
-    let accts: Vec<_> = o
-        .0
-        .iter()
-        .filter(|a| a.id != xl_s3::access::LEGACY_ACCOUNT)
-        .collect();
+    let accts: Vec<_> =
+        o.0.iter()
+            .filter(|a| a.id != xl_s3::access::LEGACY_ACCOUNT)
+            .collect();
     let ids: Vec<&str> = accts.iter().map(|a| a.id.as_str()).collect();
     assert_eq!(ids, ["000000000002", "300000000001", "300000000002"]);
     assert_eq!(accts[0].admin.as_deref(), Some("alice"));
