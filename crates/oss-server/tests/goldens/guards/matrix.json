@@ -1,0 +1,319 @@
+{
+  "cases": [
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "users"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "users"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "users"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "access_keys"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "access_keys"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "access_keys"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "permissions"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "permissions"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "permissions"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "buckets"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "buckets"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "buckets"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "bucket_policies"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "bucket_policies"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "bucket_policies"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "lifecycle_rules"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "lifecycle_rules"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "lifecycle_rules"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "event_configs"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "event_configs"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "event_configs"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "replication_rules"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "replication_rules"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "replication_rules"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "access_points"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "access_points"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "access_points"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "olap_configs"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "olap_configs"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "olap_configs"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "insert",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "inventory_configs"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "update",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "inventory_configs"
+    },
+    {
+      "inside_apply": "allowed",
+      "op": "delete",
+      "outside_apply": {
+        "error": "error returned from database: (code: 1811) raft: control write outside apply",
+        "sqlite_message": "raft: control write outside apply"
+      },
+      "table": "inventory_configs"
+    }
+  ],
+  "denied_error": "raft: control write outside apply",
+  "exceptions": {
+    "actions": [
+      "insert admin user",
+      "update admin user",
+      "delete admin user",
+      "insert session key",
+      "update session key",
+      "delete session key",
+      "insert admin key",
+      "update admin key",
+      "delete admin key",
+      "insert admin permission",
+      "update admin permission",
+      "delete admin permission"
+    ],
+    "all_allowed": true
+  }
+}

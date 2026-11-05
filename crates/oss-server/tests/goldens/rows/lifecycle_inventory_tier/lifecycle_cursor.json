@@ -1,0 +1,9 @@
+{
+  "bucket": "bucket\"q\\b\u0001",
+  "rule_id": "rule-1",
+  "stage": "expire",
+  "cursor": "o1",
+  "updated_at": 144,
+  "fence_term": 3,
+  "fence_leader": 2
+}

@@ -1,0 +1,12 @@
+{
+  "actions": [
+    "insert user",
+    "insert bucket",
+    "insert policy",
+    "insert permission",
+    "insert access key"
+  ],
+  "after_reset_changelog_rows": 1,
+  "suppressed_changelog_rows": 0,
+  "suppressed_clock_rows": 0
+}

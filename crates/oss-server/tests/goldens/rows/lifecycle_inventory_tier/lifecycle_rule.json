@@ -1,0 +1,13 @@
+{
+  "bucket": "bucket\"q\\b\u0001",
+  "prefix": "logs/",
+  "rule_id": "rule-1",
+  "expire_days": 30,
+  "expiration_days": 30,
+  "transition_days": 7,
+  "transition_class": "STANDARD_IA",
+  "transition_tier": "tier-a",
+  "enabled": true,
+  "updated_at": 50,
+  "config_json": "{\"Rules\":[{\"ID\":\"rule-1\"}]}"
+}

@@ -1,0 +1,25 @@
+{
+  "case": "bucket_del",
+  "changelog": {
+    "created_at": 0,
+    "entity": "bucket",
+    "entity_id": "bucket\"q\\b\u0001",
+    "op": "delete",
+    "origin_site_id": "site-golden",
+    "priority": 7,
+    "seq": 1,
+    "ts": 0
+  },
+  "clock": {
+    "entity": "bucket",
+    "entity_id": "bucket\"q\\b\u0001",
+    "origin_site_id": "site-golden",
+    "priority": 7,
+    "seq": 1,
+    "ts": 0
+  },
+  "entity": "bucket",
+  "entity_id": "bucket\"q\\b\u0001",
+  "op": "delete",
+  "payload": "{\"name\":\"bucket\\\"q\\\\b\\u0001\"}"
+}

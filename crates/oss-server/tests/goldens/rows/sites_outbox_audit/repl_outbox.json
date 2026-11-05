@@ -1,0 +1,14 @@
+{
+  "seq": 41,
+  "bucket": "bucket\"q\\b\u0001",
+  "key": "logs/a b",
+  "version_id": "v1",
+  "etag": "etag\"q\\b\u0001",
+  "remote_id": "remote-b",
+  "dest_bucket": "dest-b",
+  "is_delete_marker": true,
+  "is_version_delete": true,
+  "target_kind": "site",
+  "attempts": 2,
+  "claimed_at": 1700000200
+}

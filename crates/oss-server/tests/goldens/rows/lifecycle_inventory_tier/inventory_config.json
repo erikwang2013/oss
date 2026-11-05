@@ -1,0 +1,10 @@
+{
+  "bucket": "bucket\"q\\b\u0001",
+  "id": "inv-1",
+  "owner": {
+    "kind": "user",
+    "username": "alice\"q\\b\u0001"
+  },
+  "config_json": "{\"format\":\"CSV\",\"schedule\":\"daily\"}",
+  "updated_at": 110
+}

@@ -1,0 +1,9 @@
+{
+  "bucket": "bucket\"q\\b\u0001",
+  "config_id": "inv-1",
+  "cursor": "c1",
+  "config_updated_at": 110,
+  "updated_at": 141,
+  "fence_term": 3,
+  "fence_leader": 2
+}

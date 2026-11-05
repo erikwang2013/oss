@@ -1,0 +1,5 @@
+{
+  "bucket": "bucket\"q\\b\u0001",
+  "config_json": "{\"targets\":[{\"id\":\"t1\",\"arn\":\"arn:aws:sns:us-east-1:1:t\"}]}",
+  "updated_at": 60
+}

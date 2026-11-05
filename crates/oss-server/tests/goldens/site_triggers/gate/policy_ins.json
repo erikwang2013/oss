@@ -1,0 +1,14 @@
+{
+  "case": "policy_ins",
+  "entity": "bucket_policy",
+  "op": "insert",
+  "probe": {
+    "origin_site_id": "remote-z",
+    "priority": 9,
+    "ts": "now+3600 (normalized)"
+  },
+  "rejected": {
+    "error": "error returned from database: (code: 1811) site replication conflict",
+    "sqlite_message": "site replication conflict"
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "bucket": "bucket\"q\\b\u0001",
+  "rules_json": "[{\"id\":\"r1\",\"dest\":\"dst\",\"prefix\":\"logs/\",\"status\":\"enabled\"}]",
+  "updated_at": 70
+}

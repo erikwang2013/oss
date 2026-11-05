@@ -1,0 +1,8 @@
+{
+  "vpce_id": "vpce-0123456789abcdef0",
+  "vpc_id": "vpc-0123456789abcdef0",
+  "account_id": "123456789012",
+  "state": "available",
+  "created_at": 130,
+  "updated_at": 131
+}

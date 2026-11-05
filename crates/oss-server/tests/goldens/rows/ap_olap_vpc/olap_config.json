@@ -1,0 +1,10 @@
+{
+  "access_point": "ap\"q\\b\u0001",
+  "kind": "http",
+  "endpoint": "http://127.0.0.1:9/transform",
+  "module_b64": "AAFnb2xkZW4tbW9kdWxl/w==",
+  "module_sha256": "0580615ff4cbe673abcb4b892590e5bc907eb66c9170856fed0f7b283380d768",
+  "timeout_ms": 1500,
+  "max_response_bytes": 4096,
+  "updated_at": 100
+}

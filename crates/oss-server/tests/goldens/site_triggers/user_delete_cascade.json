@@ -1,0 +1,95 @@
+{
+  "changelog": [
+    {
+      "created_at": 0,
+      "entity": "access_key",
+      "entity_id": "AKCASCADE-GOLDEN",
+      "op": "delete",
+      "origin_site_id": "site-golden",
+      "payload": "{\"access_key\":\"AKCASCADE-GOLDEN\",\"username\":\"alice\\\"q\\\\b\\u0001\"}",
+      "priority": 7,
+      "seq": 1,
+      "ts": 0
+    },
+    {
+      "created_at": 0,
+      "entity": "permission",
+      "entity_id": "alice\"q\\b\u0001\u001fcascade-b",
+      "op": "delete",
+      "origin_site_id": "site-golden",
+      "payload": "{\"username\":\"alice\\\"q\\\\b\\u0001\",\"bucket\":\"cascade-b\",\"can_read\":1,\"can_write\":1,\"can_delete\":1}",
+      "priority": 7,
+      "seq": 2,
+      "ts": 0
+    },
+    {
+      "created_at": 0,
+      "entity": "bucket",
+      "entity_id": "cascade-b",
+      "op": "upsert",
+      "origin_site_id": "site-golden",
+      "payload": "{\"name\":\"cascade-b\",\"owner_username\":null,\"creation_date\":1,\"versioning\":\"Off\",\"object_lock\":0}",
+      "priority": 7,
+      "seq": 3,
+      "ts": 0
+    },
+    {
+      "created_at": 0,
+      "entity": "user",
+      "entity_id": "alice\"q\\b\u0001",
+      "op": "delete",
+      "origin_site_id": "site-golden",
+      "payload": "{\"username\":\"alice\\\"q\\\\b\\u0001\"}",
+      "priority": 7,
+      "seq": 4,
+      "ts": 0
+    }
+  ],
+  "clock": [
+    {
+      "entity": "access_key",
+      "entity_id": "AKCASCADE-GOLDEN",
+      "origin_site_id": "site-golden",
+      "priority": 7,
+      "seq": 1,
+      "ts": 0
+    },
+    {
+      "entity": "bucket",
+      "entity_id": "cascade-b",
+      "origin_site_id": "site-golden",
+      "priority": 7,
+      "seq": 3,
+      "ts": 0
+    },
+    {
+      "entity": "permission",
+      "entity_id": "alice\"q\\b\u0001\u001fcascade-b",
+      "origin_site_id": "site-golden",
+      "priority": 7,
+      "seq": 2,
+      "ts": 0
+    },
+    {
+      "entity": "user",
+      "entity_id": "alice\"q\\b\u0001",
+      "origin_site_id": "site-golden",
+      "priority": 7,
+      "seq": 4,
+      "ts": 0
+    }
+  ],
+  "final": {
+    "access_key_rows": 0,
+    "bucket_owner_id": null,
+    "permission_rows": 0,
+    "upload_owner_id": null,
+    "user_rows": 0
+  },
+  "order": [
+    "access_key.delete",
+    "permission.delete",
+    "bucket.upsert",
+    "user.delete"
+  ]
+}

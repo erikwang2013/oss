@@ -1,0 +1,10 @@
+{
+  "name": "ap\"q\\b\u0001",
+  "bucket": "bucket\"q\\b\u0001",
+  "owner": {
+    "kind": "admin"
+  },
+  "policy_json": "{\"k\":\"q\\\"\\\\\\u0001\"}",
+  "created_at": 80,
+  "updated_at": 90
+}

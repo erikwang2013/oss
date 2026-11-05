@@ -1,0 +1,140 @@
+{
+  "jobs": [
+    {
+      "id": 1,
+      "kind": "lifecycle",
+      "bucket": "bucket\"q\\b\u0001",
+      "prefix": "logs/",
+      "state": "running",
+      "scanned": 5,
+      "deleted": 1,
+      "skipped": 2,
+      "error": "err\"q\\b\u0001",
+      "created_at": 120,
+      "updated_at": 121,
+      "spec_json": "{\"op\":\"lifecycle\",\"dry_run\":false}",
+      "progress": 3,
+      "total": 5,
+      "succeeded": 2,
+      "failed": 1,
+      "report_bucket": "reports",
+      "report_prefix": "r/",
+      "priority": 2,
+      "requested_by": 9,
+      "parent_job_id": null,
+      "started_at": 120,
+      "finished_at": null
+    },
+    {
+      "id": 2,
+      "kind": "inventory",
+      "bucket": "bucket\"q\\b\u0001",
+      "prefix": "",
+      "state": "done",
+      "scanned": 0,
+      "deleted": 0,
+      "skipped": 0,
+      "error": null,
+      "created_at": 122,
+      "updated_at": 123,
+      "spec_json": null,
+      "progress": 0,
+      "total": 0,
+      "succeeded": 0,
+      "failed": 0,
+      "report_bucket": null,
+      "report_prefix": null,
+      "priority": 0,
+      "requested_by": null,
+      "parent_job_id": 1,
+      "started_at": null,
+      "finished_at": 123
+    }
+  ],
+  "job_tasks": [
+    {
+      "job_id": 1,
+      "task_no": 1,
+      "action": "delete",
+      "payload_json": "{\"key\":\"logs/a b\"}",
+      "state": "queued",
+      "attempt": 1,
+      "next_at": 130,
+      "dedupe_key": "d1",
+      "deadline_at": 999,
+      "result_code": null,
+      "result_string": null,
+      "started_at": null,
+      "finished_at": null,
+      "fence_term": 3,
+      "fence_leader": 2
+    }
+  ],
+  "inventory_runs": [
+    {
+      "id": 1,
+      "bucket": "bucket\"q\\b\u0001",
+      "config_id": "inv-1",
+      "run_key": "2026-11-05T00:00:00Z",
+      "started_at": 140,
+      "state": "done",
+      "job_id": 1,
+      "manifest_key": "m.json",
+      "error": null,
+      "created_at": 140,
+      "fence_term": 3,
+      "fence_leader": 2
+    }
+  ],
+  "inventory_cursors": [
+    {
+      "bucket": "bucket\"q\\b\u0001",
+      "config_id": "inv-1",
+      "cursor": "c1",
+      "config_updated_at": 110,
+      "updated_at": 141,
+      "fence_term": 3,
+      "fence_leader": 2
+    }
+  ],
+  "inventory_incremental": [
+    {
+      "bucket": "bucket\"q\\b\u0001",
+      "config_id": "inv-1",
+      "enabled": true,
+      "updated_at": 142
+    }
+  ],
+  "tier_restores": [
+    {
+      "bucket": "bucket\"q\\b\u0001",
+      "key": "k",
+      "version_id": "v1",
+      "expires_at": 143,
+      "job_id": 1,
+      "state": "done",
+      "created_at": 143,
+      "fence_term": 3,
+      "fence_leader": 2
+    }
+  ],
+  "lifecycle_cursors": [
+    {
+      "bucket": "bucket\"q\\b\u0001",
+      "rule_id": "rule-1",
+      "stage": "expire",
+      "cursor": "o1",
+      "updated_at": 144,
+      "fence_term": 3,
+      "fence_leader": 2
+    }
+  ],
+  "schedule_lease": {
+    "term": 3,
+    "node": 2,
+    "expires_at": 200,
+    "acquired_at": 150
+  },
+  "next_job_id": 3,
+  "next_run_id": 2
+}

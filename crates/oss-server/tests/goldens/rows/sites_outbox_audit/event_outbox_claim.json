@@ -1,0 +1,7 @@
+{
+  "id": 42,
+  "target_id": "target-1",
+  "event_json": "{\"targets\":[{\"id\":\"t1\",\"arn\":\"arn:aws:sns:us-east-1:1:t\"}]}",
+  "attempts": 1,
+  "claimed_at": 1700000300
+}

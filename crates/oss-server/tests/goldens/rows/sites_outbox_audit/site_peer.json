@@ -1,0 +1,16 @@
+{
+  "peer_id": "peer-b",
+  "remote_site_id": "remote-b",
+  "name": "peer\"q\\b\u0001",
+  "endpoint": "https://peer.example:9443",
+  "region": "us-east-1",
+  "priority": 3,
+  "s3_access_key": "AKIAGOLDEN00000001",
+  "s3_secret_key": "SKGOLDEN00000000001",
+  "peer_site_token": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "created_at": 1700000000,
+  "last_seen": 1700000100,
+  "last_error": "err\"q\\b\u0001",
+  "raft_node_id": 3,
+  "reconcile_required": true
+}

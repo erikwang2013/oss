@@ -1,0 +1,11 @@
+{
+  "access_key": "AK\"q\\b\u0001",
+  "secret_key": "SK\"q\\b\u0001",
+  "username": "alice\"q\\b\u0001",
+  "status": "active",
+  "expires_at": 20,
+  "created_at": 10,
+  "parent_ak": null,
+  "session_policy": null,
+  "kind": "long-term"
+}

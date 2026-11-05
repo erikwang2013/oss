@@ -1,0 +1,10 @@
+{
+  "id": "intent-del\"q\\b\u0001",
+  "bucket": "bucket\"q\\b\u0001",
+  "key": "logs/a b",
+  "op": "delete_version",
+  "local_version_id": "v1",
+  "remote_version_id": null,
+  "marker_version_id": "v0",
+  "state": "pending"
+}

@@ -1,0 +1,52 @@
+{
+  "access_keys": [
+    {
+      "access_key": "AK\"q\\b\u0001",
+      "kind": "long-term",
+      "user_id": 11
+    },
+    {
+      "access_key": "AK-ADMIN-KEEP",
+      "kind": "long-term",
+      "user_id": 1
+    }
+  ],
+  "bucket": {
+    "name": "bucket\"q\\b\u0001",
+    "owner": "alice\"q\\b\u0001",
+    "set_id": 7
+  },
+  "permissions": [
+    {
+      "bucket": "bucket\"q\\b\u0001",
+      "can_delete": 1,
+      "can_read": 1,
+      "can_write": 0,
+      "user_id": 11
+    }
+  ],
+  "snapshot": "OSSCTL1 level 1",
+  "target_only_buckets": 0,
+  "uploads": [
+    {
+      "owner_id": 1,
+      "saved_path": "u/admin"
+    },
+    {
+      "owner_id": null,
+      "saved_path": "u/old"
+    }
+  ],
+  "users": [
+    {
+      "id": 1,
+      "is_admin": 1,
+      "username": "golden-admin"
+    },
+    {
+      "id": 11,
+      "is_admin": 0,
+      "username": "alice\"q\\b\u0001"
+    }
+  ]
+}

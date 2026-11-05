@@ -1,0 +1,8 @@
+{
+  "id": 43,
+  "bucket": "bucket\"q\\b\u0001",
+  "event_json": "{\"targets\":[{\"id\":\"t1\",\"arn\":\"arn:aws:sns:us-east-1:1:t\"}]}",
+  "attempts": 9,
+  "last_error": "err\"q\\b\u0001",
+  "created_at": 1700000400
+}

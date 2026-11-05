@@ -1,0 +1,58 @@
+{
+  "b1_remaining": {
+    "access_points": 0,
+    "bucket_policies": 0,
+    "event_configs": 0,
+    "inventory_configs": 0,
+    "inventory_cursors": 0,
+    "inventory_incremental": 0,
+    "inventory_runs": 0,
+    "lifecycle_cursors": 0,
+    "lifecycle_rules": 0,
+    "olap_configs": 0,
+    "permissions": 0,
+    "replication_rules": 0,
+    "tier_restores": 0
+  },
+  "b2_remaining": {
+    "access_points": 1,
+    "bucket_policies": 1,
+    "event_configs": 1,
+    "inventory_configs": 1,
+    "inventory_cursors": 1,
+    "inventory_incremental": 1,
+    "inventory_runs": 1,
+    "lifecycle_cursors": 1,
+    "lifecycle_rules": 1,
+    "olap_configs": 1,
+    "permissions": 1,
+    "replication_rules": 1,
+    "tier_restores": 1
+  },
+  "buckets_remaining": [
+    "b2"
+  ],
+  "deleted_bucket": "b1",
+  "order": [
+    "olap_configs",
+    "access_points",
+    "inventory_runs",
+    "inventory_configs",
+    "inventory_cursors",
+    "inventory_incremental",
+    "tier_restores",
+    "lifecycle_rules",
+    "lifecycle_cursors",
+    "permissions",
+    "bucket_policies",
+    "event_configs",
+    "replication_rules",
+    "buckets"
+  ],
+  "response": "Ok",
+  "site_changelog": [
+    "permission.delete",
+    "bucket_policy.delete",
+    "bucket.delete"
+  ]
+}

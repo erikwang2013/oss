@@ -1,0 +1,6 @@
+{
+  "username": "alice\"q\\b\u0001",
+  "password_hash": "hash\"q\\b\u0001",
+  "status": "active",
+  "created_at": 10
+}

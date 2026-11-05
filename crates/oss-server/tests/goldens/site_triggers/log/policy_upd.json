@@ -1,0 +1,25 @@
+{
+  "case": "policy_upd",
+  "changelog": {
+    "created_at": 0,
+    "entity": "bucket_policy",
+    "entity_id": "bucket\"q\\b\u0001",
+    "op": "upsert",
+    "origin_site_id": "site-golden",
+    "priority": 7,
+    "seq": 1,
+    "ts": 0
+  },
+  "clock": {
+    "entity": "bucket_policy",
+    "entity_id": "bucket\"q\\b\u0001",
+    "origin_site_id": "site-golden",
+    "priority": 7,
+    "seq": 1,
+    "ts": 0
+  },
+  "entity": "bucket_policy",
+  "entity_id": "bucket\"q\\b\u0001",
+  "op": "upsert",
+  "payload": "{\"bucket\":\"bucket\\\"q\\\\b\\u0001\",\"policy_json\":\"{\\\"k\\\":\\\"q\\\\\\\"\\\\\\\\\\\\u0001\\\"}\",\"updated_at\":334}"
+}

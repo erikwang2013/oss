@@ -1,0 +1,15 @@
+{
+  "name": "bucket\"q\\b\u0001",
+  "owner": {
+    "kind": "user",
+    "username": "alice\"q\\b\u0001"
+  },
+  "creation_date": 30,
+  "versioning": "Enabled",
+  "object_lock": true,
+  "default_encryption": "AES256",
+  "object_lock_default_mode": "GOVERNANCE",
+  "object_lock_default_days": 7,
+  "replication_mode": "async",
+  "deleting": false
+}

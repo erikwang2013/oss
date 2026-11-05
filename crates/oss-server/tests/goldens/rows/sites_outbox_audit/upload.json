@@ -1,0 +1,10 @@
+{
+  "saved_path": "a/b/c",
+  "bucket": "bucket\"q\\b\u0001",
+  "key": "logs/a b",
+  "group_name": "file",
+  "size": 123,
+  "etag": "etag\"q\\b\u0001",
+  "original_name": "name\"q\\b\u0001",
+  "created_at": 1700000600
+}

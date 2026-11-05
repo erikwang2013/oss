@@ -1,0 +1,17 @@
+{
+  "job_id": 1,
+  "task_no": 1,
+  "action": "delete",
+  "payload_json": "{\"key\":\"logs/a b\"}",
+  "state": "queued",
+  "attempt": 1,
+  "next_at": 130,
+  "dedupe_key": "d1",
+  "deadline_at": 999,
+  "result_code": null,
+  "result_string": null,
+  "started_at": null,
+  "finished_at": null,
+  "fence_term": 3,
+  "fence_leader": 2
+}

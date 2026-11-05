@@ -1,0 +1,7 @@
+{
+  "username": "alice\"q\\b\u0001",
+  "bucket": "bucket\"q\\b\u0001",
+  "can_read": true,
+  "can_write": false,
+  "can_delete": true
+}

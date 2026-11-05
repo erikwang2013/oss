@@ -1,0 +1,25 @@
+{
+  "case": "ak_upd",
+  "changelog": {
+    "created_at": 0,
+    "entity": "access_key",
+    "entity_id": "AK\"q\\b\u0001",
+    "op": "upsert",
+    "origin_site_id": "site-golden",
+    "priority": 7,
+    "seq": 1,
+    "ts": 0
+  },
+  "clock": {
+    "entity": "access_key",
+    "entity_id": "AK\"q\\b\u0001",
+    "origin_site_id": "site-golden",
+    "priority": 7,
+    "seq": 1,
+    "ts": 0
+  },
+  "entity": "access_key",
+  "entity_id": "AK\"q\\b\u0001",
+  "op": "upsert",
+  "payload": "{\"access_key\":\"AK\\\"q\\\\b\\u0001\",\"secret_key\":\"SK\\\"q\\\\b\\u0001\",\"username\":\"alice\\\"q\\\\b\\u0001\",\"status\":\"disabled\",\"expires_at\":444,\"created_at\":555}"
+}

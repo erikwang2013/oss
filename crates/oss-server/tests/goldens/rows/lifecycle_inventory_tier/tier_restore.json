@@ -1,0 +1,11 @@
+{
+  "bucket": "bucket\"q\\b\u0001",
+  "key": "k",
+  "version_id": "v1",
+  "expires_at": 143,
+  "job_id": 1,
+  "state": "done",
+  "created_at": 143,
+  "fence_term": 3,
+  "fence_leader": 2
+}

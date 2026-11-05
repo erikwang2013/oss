@@ -1,0 +1,18 @@
+{
+  "actions": [
+    "insert admin user",
+    "update admin user",
+    "delete admin user",
+    "insert session access key",
+    "update session access key",
+    "delete session access key",
+    "insert admin-owned access key",
+    "update admin-owned access key",
+    "delete admin-owned access key",
+    "insert admin-target permission",
+    "update admin-target permission",
+    "delete admin-target permission"
+  ],
+  "changelog_rows": 0,
+  "clock_rows": 0
+}

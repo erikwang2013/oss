@@ -1,0 +1,25 @@
+{
+  "case": "perm_ins",
+  "changelog": {
+    "created_at": 0,
+    "entity": "permission",
+    "entity_id": "alice\"q\\b\u0001\u001fbucket\"q\\b\u0001",
+    "op": "upsert",
+    "origin_site_id": "site-golden",
+    "priority": 7,
+    "seq": 1,
+    "ts": 0
+  },
+  "clock": {
+    "entity": "permission",
+    "entity_id": "alice\"q\\b\u0001\u001fbucket\"q\\b\u0001",
+    "origin_site_id": "site-golden",
+    "priority": 7,
+    "seq": 1,
+    "ts": 0
+  },
+  "entity": "permission",
+  "entity_id": "alice\"q\\b\u0001\u001fbucket\"q\\b\u0001",
+  "op": "upsert",
+  "payload": "{\"username\":\"alice\\\"q\\\\b\\u0001\",\"bucket\":\"bucket\\\"q\\\\b\\u0001\",\"can_read\":1,\"can_write\":0,\"can_delete\":1}"
+}
