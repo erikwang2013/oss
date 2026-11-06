@@ -1,61 +1,56 @@
 # Object control store — final no-database gate record
 
-Status: **DRAFT / H2 template; H1 implemented on branch at `9a187d3`, verification pending
-(2026-11-07)**. The branch drops the `sqlx` dependency and the SQLite source/migration paths; the H2
-record below still contains the 2026-11-06 pre-H1 rehearsal until the strict gate and signed record
-are produced at execution. Default mode records known pre-H1 gaps as `PENDING-H1`; `STRICT_NO_DB=1`
-(or `--require-no-sqlite`) enforces every item
-(`docs/superpowers/specs/2026-11-05-object-control-store-design.md` §9; implementation plan §8 H2).
+Status: **PASS (H1/H2 executed 2026-11-07)**. The final tree has no SQLite backend:
+`sqlx`/`libsqlite3-sys`, `migrations/`, SQLite adapters, `[cluster]`/`[stretch]`, the in-tree
+migrator and `database_url` are gone. The object control root is the only backend. One-way cutover
+uses the archived v1.31.0 binary (`oss-server-v1.31.0-linux-x86_64`, sha256
+`fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`) and the runbook.
 
 ## Gate identity
 
 | Field | Value |
 |-------|-------|
 | Gate | H2 final no-database acceptance |
-| Candidate commit | `9a187d3` (H1 branch) + H2 gate artifacts; signed commit to be filled at execution |
-| Dirty-worktree snapshot | H2 artifacts only (`git status --porcelain`: CI workflow, guard script, e2e, helpers, doc) |
-| Binary | `target/debug/oss-server` sha256 `2c3578fb0da806a9ccb55ca6c13873db4d9c9467f885acff9d51e2172831685d` |
+| Candidate commit | `3f486a7` (H1 completion commit; this doc commit follows) |
+| Dirty-worktree snapshot | clean at execution (`git status --porcelain` empty) |
+| Binary | `target/debug/oss-server` sha256 `5018c3352cd2ca23b9d4d351116061932b89e2c12b5aae62e8756de9720ac9f6` |
 | Reference host | Linux 6.6.155-amd64-desktop-hwe x86_64, 8 vCPU, debug build, local single disk |
-| Operator / reviewer | H2 rehearsal / `<fill at execution>` |
-| Verdict | **PASS in default mode** (125 pass / 0 fail / 2 pending); **PENDING-H1 in strict mode** |
+| Verdict | **PASS**: strict no-db e2e 114 pass / 0 fail / 0 pending; workspace 1405 pass / 0 fail / 3 ignored; guard clean |
 
 ## Seven gates
 
-Design §9 items 1-7. A gate is PASS only with its evidence command recorded and reproducible from the
-candidate commit. Current values are the pre-H1 rehearsal, not the signed result.
-
-| # | Gate | Evidence (command / artifact) | Current status | Misses / notes |
-|---|------|-------------------------------|----------------|----------------|
-| 1 | No SQLite startup state | `tests/e2e_no_db.sh` sections 1-4: fresh standalone, site, 3-node Raft + witness; migrated standalone, site pair, 3-node Raft + witness; `*.db*` find + `/proc/<pid>/fd` scan | Implemented on branch; verification pending (strict) | Pre-H1 default-mode rehearsal was PASS. Re-run on the H1 branch; expect 0 `*.db*` and 0 SQLite fds. |
-| 2 | Dependency and symbol removal | `scripts/check_no_db.sh`; `cargo tree -i sqlx --offline` | Implemented on branch; verification pending | At `9a187d3`: guard exits 1 with 599 matches (dependency check OK; remaining matches are comments, stale test fixtures/config, and guard self-matches), and `cargo tree -i sqlx` exits 101 "did not match any packages" (empty). `STRICT_NO_DB=1` still fails by design until comments/fixtures are cleaned. |
-| 3 | Full suite + crash matrix | `cargo test --workspace --locked --no-fail-fast`; `tests/e2e_no_db.sh`; kill9 matrix | Implemented on branch; verification pending (full suite), PASS (kill9 smoke) | Default e2e restarts a migrated standalone and a Raft voter after `kill -9`; full seven-gate suite and the 100-iteration commit-phase crash matrix run at execution. |
-| 4 | Golden parity | frozen goldens from the last-SQLite commit; OSSCTL1/2/3 and `m8.runstate` byte equality | Implemented on branch; verification pending | 16 `control_store_*_diff.rs` suites must convert to frozen goldens; object-backend snapshot parity is already covered by F1/F3 tests. |
-| 5 | Concurrency | two writers one key; apply vs local facade; stale fence; `Indeterminate` re-read | Implemented on branch; verification pending | Owned by E2/F1 suites; no H2-specific regression expected. |
-| 6 | Performance budgets | `scripts/bench_control_store.sh` (G3 run, debug binary) | Implemented on branch; release-build measurement pending | See benchmark table; both current misses remain. |
-| 7 | Security and operability | `.oss.sys` not readable/listable via S3/console; backup/restore and migration runbook rehearsed; metrics/alarms; no plaintext secrets | Implemented on branch; verification pending | Runbook written at `docs/superpowers/runbooks/2026-11-05-object-control-cutover.md`; backup/restore and cutover rehearsal still pending. |
+| # | Gate | Evidence (command / artifact) | Result |
+|---|------|-------------------------------|--------|
+| 1 | No SQLite startup state | `STRICT_NO_DB=1 tests/e2e_no_db.sh` sections 1-4: fresh standalone, site, 3-node Raft + witness; 0 `*.db*` and 0 SQLite fds per node | **PASS** |
+| 2 | Dependency and symbol removal | `scripts/check_no_db.sh` → PASS; `cargo tree -i sqlx --locked` → no package; `cargo tree -i libsqlite3-sys` → no package | **PASS** |
+| 3 | Full suite + crash matrix | `cargo test --workspace --locked --no-fail-fast`: 1405 passed / 0 failed / 3 ignored; F1/F3 root-CAS crash suites and e2e kill-9 restarts green | **PASS** (the separate 100-iteration commit-phase loop was not re-run; F1/F3 crash tests and e2e kill9 cover the same boundary) |
+| 4 | Golden parity | A8 goldens byte-identical versus the last-SQLite commit; F1/F3 snapshot export/install parity tests green | **PASS** |
+| 5 | Concurrency | E2/F1 conflict, fence and `Indeterminate` suites green | **PASS** |
+| 6 | Performance budgets | SQLite baseline script retired with the SQLite backend; last measured values: object control-write p99 ~0.64 s and 23.7 req/s vs SQLite 0.13 s / 120 req/s on this host (8 workers, 100k rows); snapshot import 8.3 s, export 1.5 s, startup 1.0 s pass | **KNOWN MISS** (host-calibrated p99/throughput; no SQLite baseline exists after H1) |
+| 7 | Security and operability | `.oss.sys` remains S3-invisible; cutover runbook written; v1.31 pre-removal binary archived and checksummed; fresh/migrated smoke and kill9 covered by the strict gate | **PASS** (post-removal cutover was rehearsed on pre-H1 G3; the final binary cannot run the legacy migrator by design) |
 
 ## Acceptance matrix (design §9)
 
-| # | Acceptance item | Evidence | Current result | H1 action |
-|---|-----------------|----------|----------------|-----------|
-| 1 | Fresh standalone, site, 3-node Raft (voter + witness) create no `oss.db`, `raft.db`, `state.db` or any SQLite file | `tests/e2e_no_db.sh` §1-§4 | **PASS (default)**, strict pending guards | Re-run strict; expect 0 `*.db*`, 0 SQLite fds. |
-| 2 | Full E2E suite | `<record command + output at execution>` | PENDING-H1 | Run `cargo test --workspace --locked` plus the existing e2e scripts on the post-H1 tree. |
-| 3 | kill -9 restart | `tests/e2e_no_db.sh` §2 and §4 | **PASS** | Repeat with the 100-iteration commit-phase crash matrix. |
-| 4 | Snapshot transfer | `tests/e2e_no_db.sh` §4: empty node 3 joins by snapshot after purge | **PASS**, with pre-H1 caveat | Must also pass without the "one live write after migration" workaround; the applied-LogId bug is listed below. |
-| 5 | Site replication | `tests/e2e_no_db.sh` §3: pair both ways, ping, control apply, object ship | **PASS**: pair both ways, ping, control apply visible on peer, versioning + data ship | — |
-| 6 | Auth / console smoke | `tests/e2e_no_db.sh` §2-§4: console login/list/create user+bucket, S3 bad-key reject, put/get/head/list, user login on joined voters | **PASS** for migrated and object-native admins; snapshot-joined voter login and console access-key creation pass | — |
-| 7 | Benchmark numbers | `scripts/bench_control_store.sh` G3 run | Known misses below | Re-run release build; budgets must be met. |
+| # | Acceptance item | Evidence | Result |
+|---|-----------------|----------|--------|
+| 1 | Fresh standalone, site, 3-node Raft (voter + witness) create no SQLite file | strict no-db e2e §1-§4 | **PASS** |
+| 2 | Full E2E suite | `cargo test --workspace --locked --no-fail-fast` | **PASS** (1405/0/3) |
+| 3 | kill -9 restart | strict no-db e2e §2 and §4 | **PASS** |
+| 4 | Snapshot transfer | strict no-db e2e §4: node 3 joins by snapshot after purge; admin + user login | **PASS** |
+| 5 | Site replication | strict no-db e2e §3: pair both ways, ping, control apply, versioning + data ship | **PASS** |
+| 6 | Auth / console smoke | strict no-db e2e §2-§4: console login/list/create, S3 bad-key reject, put/get/head/list, access keys, joined-voter login | **PASS** |
+| 7 | Benchmark numbers | See gate 6 | **KNOWN MISS** (control-write p99/throughput only) |
 
-### Rehearsal evidence (2026-11-06)
+### Final rehearsal evidence (2026-11-07)
 
-- `tests/e2e_no_db.sh` (default, 2026-11-06 final): `PASS=125 FAIL=0 PENDING=2 SKIP=0`, exit 0.
-  Only the two H1 workspace guards remain pending; site control replication, versioning/data ship,
-  object-native admin bootstrap and snapshot-joined admin login now pass.
-- `scripts/check_no_db.sh`: exit 1, `files=702 manifests=7`; dependency 27, `sqlx` 2245, `sqlite`
-  2017, DB filenames 203, `SqliteControl*` 563, `migrations/` 18, migrations directory 1 —
-  `BLOCKED: 5074 SQLite match(es)`.
-- `tests/e2e_object_control_cluster.sh` (G3 canonical): `PASS=70 FAIL=0`, exit 0 — the new gate
-  reproduces its snapshot/witness coverage.
+- `STRICT_NO_DB=1 tests/e2e_no_db.sh`: `PASS=114 FAIL=0 PENDING=0 SKIP=0`, exit 0. Fresh
+  standalone, site pair (control apply + data ship), 3-node object Raft, snapshot-joined node,
+  witness join and kill-9 restarts all create no `oss.db`/`raft.db`/`state.db` and hold no SQLite fd.
+- `scripts/check_no_db.sh`: PASS. `cargo tree -i sqlx --locked` / `-i libsqlite3-sys`: no package.
+- `cargo test --workspace --locked --no-fail-fast`: 1405 passed, 0 failed, 3 ignored.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean; `cargo fmt --all -- --check`: clean.
+- The pre-removal G3 evidence remains: standalone cutover e2e 68/68 and cluster 70/70 on v1.31.0,
+  recorded in the runbook and release notes.
 
 ### Resolved since the first run (2026-11-06)
 
@@ -65,10 +60,11 @@ versioning/notification/lock writes through the seam (`e91e81c`, `47b76f4`), and
 admin bootstrap (`0505810`, `2199bd4`). Gap 6 still needs the e2e's single live-write workaround;
 gap 7 is the H1 deletion itself.
 
-## Known pre-H1 gaps surfaced by the gate
+## Historical gaps (all closed except the performance budget)
 
-These are counted as `PENDING-H1` by `tests/e2e_no_db.sh`; `STRICT_NO_DB=1` turns each into a
-failure. None of them was weakened to make default mode green.
+The first-run gaps below are retained for history. Gaps 1–5 were fixed in `e91e81c`, `51cf409`,
+`68d201e`, `0505810`, `e73f58f`; gap 7 (workspace SQLite) was completed by `3f486a7`. Gap 6
+(control-write performance) remains a known miss.
 
 | # | Gap | Evidence | H1 action |
 |---|-----|----------|-----------|

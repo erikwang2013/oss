@@ -155,7 +155,17 @@ prepare_release() {
 	fi
 	verify_manifests "$OLD_VERSION"
 	verify_anchors "$OLD_VERSION" "$OLD_DATE"
-	verify_changelog "$OLD_VERSION" "$OLD_DATE"
+	# Allow the changelog to pre-date the mechanical bump: if the newest entry is
+	# already the target version (added in the release-narrative commit), verify
+	# that entry instead of requiring the old one to still be first.
+	newest=$(perl -0777 -ne 'if (/<details class="changelog-entry"[^>]*>\s*<summary><strong>v([0-9]+\.[0-9]+\.[0-9]+)<\/strong>/) { print $1 }' site/changelog.html)
+	if [[ $newest == "$VERSION" ]]; then
+		verify_changelog "$VERSION" "$DATE"
+	elif [[ $newest == "$OLD_VERSION" ]]; then
+		verify_changelog "$OLD_VERSION" "$OLD_DATE"
+	else
+		die "changelog: newest entry is v${newest:-<none>}, expected v$OLD_VERSION or v$VERSION"
+	fi
 
 	for f in crates/*/Cargo.toml; do
 		OLD="$OLD_VERSION" NEW="$VERSION" \
