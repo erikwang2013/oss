@@ -15,6 +15,7 @@ use crate::control_store_obj::{ObjectControlStore, RootIo, WriteOrigin};
 use crate::local_store::LocalStore;
 use crate::site::{ApplyStats, Entry};
 
+mod pair;
 mod ship;
 
 struct Noop;
@@ -36,7 +37,7 @@ pub(super) struct Fx {
     pub local: LocalStore,
 }
 
-pub(super) async fn fixture(endpoint: &str) -> Fx {
+pub(super) async fn empty_fixture(site_id: &str, priority: i64) -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = StoreConfig::new(dir.path());
     cfg.fsync = false;
@@ -48,6 +49,23 @@ pub(super) async fn fixture(endpoint: &str) -> Fx {
     );
     control.bootstrap(Mode::Standalone, 1).await.unwrap();
 
+    let mut txn = control.begin(WriteOrigin::local("seed")).await.unwrap();
+    txn.site_config_seed(site_id, "tok", 1).await.unwrap();
+    txn.site_config_apply(None, None, Some(priority), None)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+
+    Fx {
+        _dir: dir,
+        store,
+        control,
+        local,
+    }
+}
+
+pub(super) async fn fixture(endpoint: &str) -> Fx {
+    let fx = empty_fixture("site-a", 0).await;
     let peer = SitePeerRow {
         peer_id: "peer-b".into(),
         remote_site_id: "remote-b".into(),
@@ -64,20 +82,10 @@ pub(super) async fn fixture(endpoint: &str) -> Fx {
         raft_node_id: None,
         reconcile_required: false,
     };
-    let mut txn = control.begin(WriteOrigin::local("seed")).await.unwrap();
-    txn.site_config_seed("site-a", "tok", 1).await.unwrap();
-    txn.site_config_apply(None, None, Some(0), None)
-        .await
-        .unwrap();
+    let mut txn = fx.control.begin(WriteOrigin::local("seed")).await.unwrap();
     txn.site_insert(&peer, 0).await.unwrap();
     txn.commit().await.unwrap();
-
-    Fx {
-        _dir: dir,
-        store,
-        control,
-        local,
-    }
+    fx
 }
 
 fn entry(seq: i64, entity: &str, id: &str, op: &str, payload: serde_json::Value, ts: i64) -> Entry {

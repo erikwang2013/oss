@@ -725,6 +725,17 @@ pub async fn insert_peer_with_snapshot(
     state: &AppState,
     peer: &crate::db::SitePeer,
 ) -> Result<(), String> {
+    if let Some(object) = state.db.object_control() {
+        return object::insert_peer_with_snapshot(&object.control, state.control.is_raft(), peer)
+            .await;
+    }
+    insert_peer_with_snapshot_sqlite(state, peer).await
+}
+
+async fn insert_peer_with_snapshot_sqlite(
+    state: &AppState,
+    peer: &crate::db::SitePeer,
+) -> Result<(), String> {
     let pool = state.db.pool().clone();
     let mut tx = pool.begin().await.map_err(|e| bad(e.to_string()))?;
     // L9：单 peer 约束与插入原子化（并发 POST /sites 不得建出两个 peer）。

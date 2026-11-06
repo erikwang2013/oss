@@ -1319,6 +1319,14 @@ impl Db {
     pub async fn upsert_pair_peer(&self, p: &SitePeer) -> Result<()> {
         // 注意：UPDATE 不触碰 `reconcile_required`——该门只能由 repair 成功清除
         // （S7.4 review I2：重复/重试配对不得把 B′ 未修复状态打开）。
+        if self.object_control().is_some() {
+            let row = site_peer_row(p);
+            return self
+                .object_local_write("site-pair", move |txn| {
+                    Box::pin(async move { txn.site_pair_upsert(&row).await })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         SqliteControlTxn::new(&mut conn)
             .site_pair_upsert(&site_peer_row(p))
@@ -1328,6 +1336,14 @@ impl Db {
 
     /// S7.4 B′：替换站点后、repair 完成前拒绝向该对端服务 sync。
     pub async fn set_site_reconcile_required(&self, peer_id: &str, required: bool) -> Result<()> {
+        if self.object_control().is_some() {
+            let peer = peer_id.to_owned();
+            return self
+                .object_local_write("site-reconcile", move |txn| {
+                    Box::pin(async move { txn.site_set_reconcile_required(&peer, required).await })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         SqliteControlTxn::new(&mut conn)
             .site_set_reconcile_required(peer_id, required)
@@ -1336,6 +1352,14 @@ impl Db {
     }
 
     pub async fn insert_site(&self, p: &SitePeer) -> Result<()> {
+        if self.object_control().is_some() {
+            let row = site_peer_row(p);
+            return self
+                .object_local_write("site-pair", move |txn| {
+                    Box::pin(async move { txn.site_insert(&row, now()).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         SqliteControlTxn::new(&mut tx)
             .site_insert(&site_peer_row(p), now())
@@ -1353,6 +1377,38 @@ impl Db {
         &self,
         peer_id: &str,
     ) -> Result<Option<Vec<(String, String, String)>>> {
+        if self.object_control().is_some() {
+            let peer = peer_id.to_owned();
+            let out = self
+                .object_local_write("site-unpair", move |txn| {
+                    Box::pin(async move {
+                        let Some(remote) = txn.site_remote_id(&peer).await? else {
+                            return Ok(None);
+                        };
+                        let affected = txn.repl_drop_site(&peer).await?;
+                        txn.site_cursor_delete(&peer).await?;
+                        txn.site_delete(&peer).await?;
+                        Ok(Some((remote, affected)))
+                    })
+                })
+                .await?;
+            let Some((remote, affected)) = out else {
+                return Ok(None);
+            };
+            // shortcut: cursor/dead files are node-local and cannot join the root
+            // CAS; cleanup is best-effort after the peer row is gone.
+            if let Some(object) = self.object_control()
+                && let Ok(local) = object.control.local_store()
+            {
+                if let Ok(cursor) = local.cursor(peer_id) {
+                    let _ = cursor.delete();
+                }
+                if let Ok(dead) = local.dead(&remote) {
+                    let _ = dead.delete();
+                }
+            }
+            return Ok(Some(affected));
+        }
         let mut tx = self.pool.begin().await?;
         let remote = SqliteControlTxn::new(&mut tx)
             .site_remote_id(peer_id)
@@ -1390,6 +1446,15 @@ impl Db {
         ts: i64,
         error: Option<&str>,
     ) -> Result<()> {
+        if self.object_control().is_some() {
+            let peer = peer_id.to_owned();
+            let error = error.map(str::to_owned);
+            return self
+                .object_local_write("site-ping", move |txn| {
+                    Box::pin(async move { txn.site_update_ping(&peer, ts, error.as_deref()).await })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         SqliteControlTxn::new(&mut conn)
             .site_update_ping(peer_id, ts, error)
@@ -2835,7 +2900,7 @@ fn site_peer(r: SitePeerRow) -> SitePeer {
     }
 }
 
-fn site_peer_row(p: &SitePeer) -> SitePeerRow {
+pub(crate) fn site_peer_row(p: &SitePeer) -> SitePeerRow {
     SitePeerRow {
         peer_id: p.peer_id.clone(),
         remote_site_id: p.remote_site_id.clone(),

@@ -64,7 +64,7 @@ pub use origin::WriteOrigin;
 #[cfg(test)]
 pub(crate) use root_io::{CRASH_AFTER_ROOT_CAS, CRASH_BEFORE_ROOT_CAS, CrashIo};
 pub use root_io::{PinnedRoot, RootIo};
-pub(crate) use site::{SiteEntityClockRow, clock_key};
+pub(crate) use site::{SiteEntityClockRow, changelog_key, clock_key};
 pub use table::{KNOWN_TABLES, TableId, known_table_ids};
 pub use txn::{CachePublish, CommitStamp, ObjectControlStore, ObjectControlTxn};
 pub use vpc::{VpcStore, VpcTxn};

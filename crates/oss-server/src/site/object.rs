@@ -3,9 +3,11 @@
 
 mod apply;
 mod entity;
+mod pair;
 mod ship;
 
 pub(crate) use apply::apply_changelog;
+pub(crate) use pair::insert_peer_with_snapshot;
 pub(crate) use ship::ship_once;
 
 #[cfg(test)]

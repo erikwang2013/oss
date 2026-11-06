@@ -58,6 +58,11 @@ impl CursorFile {
         payload[8..].copy_from_slice(&updated_at.to_le_bytes());
         atomic_write(&self.path, &encode_frame(KIND_CURSOR, &payload))
     }
+
+    /// Missing file is success (解配幂等).
+    pub fn delete(&self) -> Result<()> {
+        remove_if_exists(&self.path)
+    }
 }
 
 /// 死信行（与 SQLite `site_apply_dead` 同列；payload 已按上限截断）。
@@ -132,6 +137,19 @@ impl DeadFile {
         let mut file = open_private(&self.path, false, true)?;
         file.write_all(&encode_frame(KIND_DEAD, &payload))?;
         file.sync_data()
+    }
+
+    /// Missing file is success (解配幂等).
+    pub fn delete(&self) -> Result<()> {
+        remove_if_exists(&self.path)
+    }
+}
+
+fn remove_if_exists(path: &std::path::Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
