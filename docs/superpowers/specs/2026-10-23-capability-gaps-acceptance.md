@@ -4,26 +4,18 @@
 - 历史发布：**v1.14.0**（2026-10-23）· **v1.15.0** / **v1.16.0**（2026-10-24）·
   **v1.17.0**（2026-10-24，§13 架构切片）· **v1.18.0**（2026-10-25，文档精简）·
   **v1.19.0**（2026-10-26，Wave1 地基）
-- 最新发布：**v1.32.0**（2026-11-07，对象控制存储后端），tag `v1.32.0`；
-  opt-in `[server].control_backend = "objects"`：27 张控制表存为节点本地 COW B+tree，
-  单根 CAS 提交、盘级多数派 quorum、启动 flock 与内容寻址 blob；Raft 使用文件日志/
-  元数据/快照（`<db_path>.d/`）与元数据型 witness；站点 LWW apply/ship/配对、outbox、
-  审计、上传、秒传索引与账户用量缓存全部走缝；离线 `control-migrate` 保留逐字节校验与
-  回滚窗口，A8 goldens 作为永久 oracle；10 万行快照导入 8.3s、导出 1.5s。SQLite 仍为
-  默认后端，对象后端 opt-in，无接口或数据格式变更。
-  此前的 v1.28.1–v1.28.5 为 CI/测试稳定与性能加固补丁（protoc、配额夹具、OLAP 400 映射、
-  缓存重载、DeleteObjects 预加载、列表/探测并发、索引、aether 限流、sync 流式 tee、发布脚本）。功能内容仍见 §23（Raft 日志格式
-  标记与旧区间有界压缩、CMK→legacy 离线全量迁移、M8 follower restore fencing、AP 直连
-  mTLS 与 AWS PrivateLink API 验证、Level C 只读排空、feature 9 opt-in 复制用量账本
-  （严格硬配额）、JWT 多密钥轮换、真实蓝绿/MPU 排空/单机→集群 e2e）与 §21–§22 的
-  v1.27.0 内容
-- 下一版本：**v1.32.0** 移除 SQLite，对象控制根 `.oss.sys/control/` 成为唯一后端；
-  `sqlx`/SQLite、`migrations/`、`[cluster]`/`[stretch]` 与 `database_url` 移除。升级为停全部节点
-  的一次性单向割接，使用归档的 GitHub Release v1.31.0 二进制
+- 最新发布：**v1.32.1**（2026-11-07，对象控制根唯一后端），tag `v1.32.1`；
+  v1.32.0 移除 `sqlx`/SQLite、`migrations/`、`[cluster]`/`[stretch]` 与 `database_url`，
+  对象控制根 `control/state/root` 的 CAS 是唯一提交点；节点/大值内容寻址、文件 Raft 与
+  元数据 witness、站点 LWW/outbox/审计/上传/秒传/账户用量本地缓存全部走缝；A8 goldens
+  冻结为永久 oracle；10 万行快照导入 8.3s、导出 1.5s。v1.32.0 的缺省配置仍选择已删除的
+  SQLite 后端，未写 `[server].control_backend` 的安装启动即 panic；v1.32.1 让对象控制根
+  无条件装配，并拒绝显式 `sqlite`（提示用归档 v1.31.0 执行 `control-migrate`）。
+  升级为停全部节点的一次性单向割接，使用归档的 GitHub Release v1.31.0 二进制
   `oss-server-v1.31.0-linux-x86_64`（sha256
   `fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`）执行
-  `control-migrate`；首次新写入后无反向写入器。历史章节中的 `[cluster]`/`[stretch]` 表述仅作
-  验收记录，不再构成受支持的部署。
+  `control-migrate`；首次新写入后无反向写入器。历史章节中的 `[cluster]`/`[stretch]`
+  表述仅作验收记录，不再构成受支持的部署。
 - 集成结果：已合并到 `main`（v1.14.0 能力代码 `86616eb`；v1.15.0 为 post-1.14 硬化集成；
   v1.16.0 为 §2–§4 backlog 第二轮；v1.17.0 为 §13 架构切片；v1.18.0 文档精简；
   v1.19.0 为 Wave1 地基；v1.20.0 为 §14 Wave2 缺口修复，三条工作流独立评审后合并）

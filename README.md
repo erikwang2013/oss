@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.32.0（2026-11-07）。** v1.31 交付对象控制存储后端（opt-in）：27 张控制表的节点本地 COW B+tree、单根 CAS、盘级多数派 quorum，文件 Raft 日志/元数据/快照与 witness，站点复制 LWW apply/ship/配对走缝；10 万行快照导入 8.3s、导出 1.5s。**下一版本 v1.32.0 移除 SQLite，对象控制根成为唯一后端**：根对象 `control/state/root` 的 CAS 是唯一提交点，节点与大值按内容寻址存于 `<data_dir>/.oss.sys/control/state/{node,blob}/`，节点本地运行态（uploads/审计/outbox/游标/用量缓存）在 `<data_dir>/.oss.sys/local/`，Raft 日志/元数据/快照在 `<raft.db_path>.d/`；`sqlx`/SQLite、`migrations/`、`[cluster]`/`[stretch]` 与 `database_url` 全部移除。升级是一次性单向割接：停全部节点，冷备 `oss.db`、`raft.db` 与数据盘，用归档在 GitHub Release v1.31.0 的 `oss-server-v1.31.0-linux-x86_64`（sha256 `fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`）执行 `oss-server control-migrate --from <oss.db> --state-dir <data_dir> --raft-db <raft.db> --dry-run|--apply`，校验报告后启动 v1.32 二进制；首次新写入后没有反向写入器，回滚只能恢复备份并丢弃割接后的写入（详见 `docs/superpowers/runbooks/2026-11-05-object-control-cutover.md`）。已知控制写 p99 仍高于原预算（debug 单机约 0.64s；目标 ≤20ms/≤50ms），需在 release build 重测并记录偏差，不宣称达标。
+**最新发布：v1.32.1（2026-11-07）。** v1.31 交付对象控制存储后端（opt-in）：27 张控制表的节点本地 COW B+tree、单根 CAS、盘级多数派 quorum，文件 Raft 日志/元数据/快照与 witness，站点复制 LWW apply/ship/配对走缝；10 万行快照导入 8.3s、导出 1.5s。**v1.32.0 移除 SQLite，对象控制根成为唯一后端**：根对象 `control/state/root` 的 CAS 是唯一提交点，节点与大值按内容寻址存于 `<data_dir>/.oss.sys/control/state/{node,blob}/`，节点本地运行态（uploads/审计/outbox/游标/用量缓存）在 `<data_dir>/.oss.sys/local/`，Raft 日志/元数据/快照在 `<raft.db_path>.d/`；`sqlx`/SQLite、`migrations/`、`[cluster]`/`[stretch]` 与 `database_url` 全部移除。升级是一次性单向割接：停全部节点，冷备 `oss.db`、`raft.db` 与数据盘，用归档在 GitHub Release v1.31.0 的 `oss-server-v1.31.0-linux-x86_64`（sha256 `fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`）执行 `oss-server control-migrate --from <oss.db> --state-dir <data_dir> --raft-db <raft.db> --dry-run|--apply`，校验报告后启动 v1.32 二进制；首次新写入后没有反向写入器，回滚只能恢复备份并丢弃割接后的写入（详见 `docs/superpowers/runbooks/2026-11-05-object-control-cutover.md`）。已知控制写 p99 仍高于原预算（debug 单机约 0.64s；目标 ≤20ms/≤50ms），需在 release build 重测并记录偏差，不宣称达标。v1.32.0 的缺省配置仍选择已删除的 SQLite 后端，未写 `[server].control_backend` 的安装会在启动时 panic；v1.32.1 修复为对象控制根无条件装配，显式 `sqlite` 配置会以迁移指引拒绝启动。
 
 ## 功能
 
@@ -186,26 +186,24 @@ aws --endpoint-url $E s3 rm s3://photos/cover.jpg
 
 本版数据面升级按**停写蓝绿**执行，不做滚动升级：新二进制在原数据目录启动，由运维切换流量；旧二进制回退只在没有新格式写入时成立。
 
-1. 升级前跑只读预检：`scripts/upgrade-preflight.sh --data-dir <盘...> --health-json <保存的 /health/cluster> --strict --require-no-mpu`。
+1. 升级前跑只读检查：用 `scripts/mpu-drain.sh` 确认并中止在途 MPU，并保存 `/health/cluster` 的 `data_plane_compatible` 与 `data_wire_version`。
 2. 停客户端流量并停旧服务，确认没有写入者。
-3. 冷备每块数据盘与控制库，保留到验收完成。
+3. 冷备每块数据盘与控制状态（`.oss.sys` 与 `<raft.db_path>.d/`），保留到验收完成。
 4. 用新二进制在原数据目录启动；检查 `/health/ready` 与 `/health/cluster`：`data_plane_compatible: true`，且所有 peer `data_wire_version >= 2`。
 5. 切流；备份继续保留。
 6. 回滚 = 停新二进制、还原冷备、起旧二进制；仅当未发生新格式/CMK 写入时有效，否则按下方 CMK 迁移处理或保持新二进制。
 
 **v1.32.0 的 SQLite 移除是单向割接（与上面的数据面蓝绿不是一回事）。** 停全部节点（Raft voter/witness 一起），冷备 `oss.db`、`raft.db` 与数据盘并记录 sha256；从 GitHub Release v1.31.0 下载归档的 `oss-server-v1.31.0-linux-x86_64`，核对 sha256 `fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`；每节点先 `--dry-run` 后 `--apply` 执行 `control-migrate --from <oss.db> --state-dir <data_dir> --raft-db <raft.db> --json`，确认源库字节未变、报告计数/哈希一致、对象根与 `<raft.db_path>.d/` 已生成；再启动 v1.32 二进制并做 auth/console/S3/site/snapshot 冒烟。首次新写入后没有反向写入器，回滚只能在首次写入前恢复备份并启动旧/归档二进制；之后只能恢复备份并接受割接后写入丢失。完整步骤见 `docs/superpowers/runbooks/2026-11-05-object-control-cutover.md`。
 
-`scripts/blue-green-preflight.sh` 把同一流程的检查做成只读闸门：`--data-dir`、`--backup`、`--config`、`--health-json`、`--health-url`、`--new-binary`、`--min-version`、`--strict`、`--json`；它只检查、不修改数据、不停止服务。
-
 **只读排空（Level C）。** 顶层 `read_only = true` 让节点从客户端写路径摘除：写请求返回 503 并带 `x-oss-read-only: 1`；GET/HEAD/OPTIONS、精确匹配的 `POST /api/v1/login`、健康/指标与 Raft RPC 保持可用，`/health/cluster` 暴露 `read_only`。旧二进制没有此开关，混版窗口内必须把旧节点从客户端 LB 移除，不能依赖只读开关约束旧节点。
 
 **JWT 密钥轮换。** `jwt_previous_secrets` 接受旧签名密钥数组（每个 ≥32 字节、互不重复且不同于 `jwt_secret`），多密钥验证共享黑名单与过期检查。轮换顺序：把当前密钥加入 `jwt_previous_secrets` → 全部节点重启 → 切换 `jwt_secret` → 全部节点重启 → 12 小时后移除旧密钥。登录限流与审计仍是节点本地，不随轮换复制。
 
-**升级 e2e。** `tests/e2e_blue_green.sh` 用真实 v1.26.0 → 当前二进制在同一数据目录切换并验证冷备回滚（22/22 PASS）；`tests/e2e_single_to_cluster_real.sh` 用两个回环服务器跑 plan/copy/verify/resume（6/6 PASS）；`scripts/mpu-drain.sh` 自检 43/0。
+**升级工具自检。** `scripts/mpu-drain.sh` 与 `scripts/single-to-cluster.sh` 提供离线自检（`scripts/tests/mpu-drain-selfcheck.sh`、`scripts/tests/single-to-cluster-selfcheck.sh`）。
 
 **CMK 激活是不归点。** DARE 的 AAD 绑定 `key_id`，只改元数据无法让 pre-CMK 二进制读 CMK 数据；仓库不提供明文/不安全降级。`oss-server cmk rewrap` 默认只在**同一个 CMK** 内把旧版本重加密到该 CMK 当前版本；v1.28.0 起加 `--to-legacy sse-s3|sse-kms --apply` 可把引用该 CMK 的对象**逐版本全量重加密**为 pre-CMK provider（`sse-s3` 的 file key，或 `sse-kms` 默认环当前 `k<n>`），完成后旧 CMK 引用归零，pre-CMK 二进制可读。迁移在扫描/写入前 fail-closed：仍有在途 MPU、桶默认加密指向该 CMK、或目标 provider 未配置都会被拒绝；每个版本独立重加密，单版本失败不影响其他版本；迁移绝不自动删除 CMK。若已有 CMK 对象而必须回到 pre-CMK 二进制：先停写，逐节点跑 `oss-server cmk scan --name <cmk> --json` 核对 `references`/`mpu_references`/`bucket_defaults`，Complete/Abort 所有 MPU 并把桶默认加密切到目标 provider，再执行 `oss-server cmk rewrap --name <cmk> --to-legacy <sse-s3|sse-kms> --apply`；多站点/Raft（`[site]`/`[raft]`）部署的离线 rewrap 会拒绝（分片放置需在线拓扑），当前不支持在线 legacy 迁移。全部节点引用归零后可 `oss-server cmk delete --name <cmk> --yes`（集群需在全站逐节点核实后加 `--force`），或迁移到新集群（如 `scripts/single-to-cluster.sh` 的离线重新灌入，只迁当前版本）。**绝不能删除 CMK 来「强制」降级**；meta-only 降级仍不可能，迁移完成前回滚只能退回仍能读 CMK 的新二进制。
 
-**跨版本 MPU。** 跨节点 UploadPart 转发支持 v1.16+（wire 1 有界回退）与本版 wire 2 流式；≤v1.15 没有 MPU RPC，无法支持。升级/降级前必须 Complete/Abort/排空所有在途 MPU，并用 `upgrade-preflight.sh --require-no-mpu --health-json` 强制门槛（`data_wire_version >= 2`、`data_plane_compatible: true`）。v1.28.0 提供 `scripts/mpu-drain.sh` 列出/中止在途 MPU（只处理未完成上传，绝不删除已提交对象）。
+**跨版本 MPU。** 跨节点 UploadPart 转发支持 v1.16+（wire 1 有界回退）与本版 wire 2 流式；≤v1.15 没有 MPU RPC，无法支持。升级/降级前必须 Complete/Abort/排空所有在途 MPU，并核对 `/health/cluster` 的 `data_wire_version >= 2` 与 `data_plane_compatible: true`。`scripts/mpu-drain.sh` 列出/中止在途 MPU（只处理未完成上传，绝不删除已提交对象）。
 
 **Raft 日志格式（v1.27 引入，v1.28 加固）。** 新版本把 ≥1024 B 的日志 entry 压缩为 `z1:`，并把连续 ≥256 条压成 `raft_log_segment`；`raft_meta.raft_log_format` 记录格式（缺失/`1` = 旧格式，`2` = 压缩/分段；更高或无法解析的值 fail-closed）。v1.27 建库但尚无标记的库，open 时若发现 `z1:` 行或分段即补写 `2`；v1.28 起每次 append 在事务内最多做两段有界压缩（最新连续段 + 一段更旧区间），旧区间不会永久停滞。旧二进制无法读取 `2` 格式日志，因此新二进制一旦写入就不能回退——升级仍按停写蓝绿执行，回滚只在新格式/CMK 写入前成立。
 

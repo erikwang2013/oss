@@ -1,6 +1,11 @@
 # Object control store — final no-database gate record
 
-Status: **PASS (H1/H2 executed 2026-11-07)**. The final tree has no SQLite backend:
+Status: **PASS (H1/H2 executed 2026-11-07; re-run for v1.32.1)**.
+
+v1.32.0 shipped with the SQLite backend still selected by default, so a config without
+`[server].control_backend` panicked at startup. v1.32.1 makes `objects` the only accepted
+backend and attaches the object control root unconditionally; the gates below were re-run
+on that tree. The final tree has no SQLite backend:
 `sqlx`/`libsqlite3-sys`, `migrations/`, SQLite adapters, `[cluster]`/`[stretch]`, the in-tree
 migrator and `database_url` are gone. The object control root is the only backend. One-way cutover
 uses the archived v1.31.0 binary (`oss-server-v1.31.0-linux-x86_64`, sha256
@@ -11,11 +16,11 @@ uses the archived v1.31.0 binary (`oss-server-v1.31.0-linux-x86_64`, sha256
 | Field | Value |
 |-------|-------|
 | Gate | H2 final no-database acceptance |
-| Candidate commit | `3f486a7` (H1 completion commit; this doc commit follows) |
-| Dirty-worktree snapshot | clean at execution (`git status --porcelain` empty) |
-| Binary | `target/debug/oss-server` sha256 `5018c3352cd2ca23b9d4d351116061932b89e2c12b5aae62e8756de9720ac9f6` |
+| Candidate commit | `d7d76a4` (v1.32.1 default-backend fix; release commit follows) |
+| Dirty-worktree snapshot | release tree at v1.32.1; test gate ran before the release metadata commit |
+| Binary | `target/debug/oss-server` v1.32.1 sha256 `a9943415b780a26ae671b2f15f5f02514a69ccb6ac04f8b85c98ca40c208608c` (SSD target dir) |
 | Reference host | Linux 6.6.155-amd64-desktop-hwe x86_64, 8 vCPU, debug build, local single disk |
-| Verdict | **PASS**: strict no-db e2e 114 pass / 0 fail / 0 pending; workspace 1405 pass / 0 fail / 3 ignored; guard clean |
+| Verdict | **PASS**: strict no-db e2e 115 pass / 0 fail / 0 skip; workspace 1405 pass / 0 fail / 3 ignored; clippy/fmt clean; guard clean |
 
 ## Seven gates
 
@@ -43,14 +48,27 @@ uses the archived v1.31.0 binary (`oss-server-v1.31.0-linux-x86_64`, sha256
 
 ### Final rehearsal evidence (2026-11-07)
 
-- `STRICT_NO_DB=1 tests/e2e_no_db.sh`: `PASS=114 FAIL=0 PENDING=0 SKIP=0`, exit 0. Fresh
+- `STRICT_NO_DB=1 tests/e2e_no_db.sh`: `PASS=115 FAIL=0 SKIP=0`, exit 0. Fresh
   standalone, site pair (control apply + data ship), 3-node object Raft, snapshot-joined node,
   witness join and kill-9 restarts all create no `oss.db`/`raft.db`/`state.db` and hold no SQLite fd.
 - `scripts/check_no_db.sh`: PASS. `cargo tree -i sqlx --locked` / `-i libsqlite3-sys`: no package.
-- `cargo test --workspace --locked --no-fail-fast`: 1405 passed, 0 failed, 3 ignored.
+- `cargo test --workspace --locked --no-fail-fast`: 1405 passed, 0 failed, 3 ignored (v1.32.1 tree, `CARGO_TARGET_DIR` on SSD).
 - `cargo clippy --workspace --all-targets -- -D warnings`: clean; `cargo fmt --all -- --check`: clean.
 - The pre-removal G3 evidence remains: standalone cutover e2e 68/68 and cluster 70/70 on v1.31.0,
   recorded in the runbook and release notes.
+
+### v1.32.1 re-run (2026-11-07)
+
+- B1: the v1.32.0 default config selected the deleted SQLite backend, so startup panicked with
+  `object control backend not attached`. `ControlBackend` now accepts only `objects`; `sqlite`
+  is rejected with cutover guidance, and `ObjectControl` attaches unconditionally.
+- Two flaky tests fixed before the re-run: the bucket `creation_date` assertion now checks the
+  write window instead of a second `now()`, and the AP AWS mock waits for its listener before
+  the first request.
+- The snapshot-joined node's admin login is now a hard assertion after `wait_login` (was a
+  pre-H1 pending), and the no-db helper no longer carries the pending machinery.
+- Results: strict e2e `PASS=115 FAIL=0 SKIP=0`; workspace `1405/0/3`; clippy `-D warnings` and
+  fmt clean; guard PASS; `cargo tree -i sqlx` / `-i libsqlite3-sys` no package.
 
 ### Resolved since the first run (2026-11-06)
 
@@ -108,9 +126,9 @@ weakened to make this table green.
 
 ## H1 checklist (from the SQLite audit)
 
-Statuses below mean **implemented on branch, verification pending**: the code is present at
-`9a187d3`, but the strict gate and signed record are not produced. Do not treat a row as accepted
-until its evidence is recorded at execution.
+Historical audit snapshot at `9a187d3`, before the final gate. Every row below was completed and
+verified by the 2026-11-07 gate; the "verification pending" statuses are kept only as the
+pre-verification record.
 
 | Area | Current footprint | Required change | Status |
 |------|-------------------|-----------------|--------|
