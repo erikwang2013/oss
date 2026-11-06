@@ -4,9 +4,9 @@
 
 ## 当前状态
 
-M1–M9 已完成，最新发布 **v1.30.0（2026-11-05）**；M5 安全与锁定全部交付——集群行一致性
+M1–M9 已完成，最新发布 **v1.31.0（2026-11-06）**；M5 安全与锁定全部交付——集群行一致性
 广播 · 密钥库/KMS · 加密数据面 DARE 式 · S3 面 SSE-S3/KMS/C · 对象锁 · STS（含
-`AssumeRoleWithWebIdentity`）· SK 信封加密落库。v1.30 继续控制面去数据库化：在 v1.29 的 `ControlStore`/`ControlTxn` 缝上完成访问点/OLAP、lifecycle/inventory/tier、buckets/bucket_policies/event_configs/replication_rules 的读写、快照与桶删除级联迁移，并加入集群遗留控制对象重认证工具（只读 `ReadControlRaw`、canonical 分组、fenced 标记、CLI dry-run/apply）；自然键身份、快照字段顺序与 site/raft 触发器语义不变，legacy raw SQL 差分测试锁定行为，修复策略覆盖写的 SQLite UPSERT 触发器误报。SQLite 仍为默认后端，无 API、配置、Wire/OSSCTL 或数据格式变更。v1.29 交付 `.oss.sys` 系统命名空间、控制对象 CAS/单调 fencing/持久化锁 token/提交证书与 quorum 读，以及 `vpc_endpoints` 迁移；v1.28 系列交付 Raft 日志格式标记与旧区间有界压缩、M8 follower restore fencing、AP 直连 mTLS/AWS PrivateLink API 验证、CMK→legacy 全量迁移、Level C 只读排空、JWT 多密钥轮换、feature 9 opt-in 严格硬配额，以及真实蓝绿/MPU 排空/单机→集群 e2e；v1.28.1–v1.28.5 为 CI/测试稳定与性能加固补丁。
+`AssumeRoleWithWebIdentity`）· SK 信封加密落库。v1.31 交付对象控制存储后端（opt-in `control_backend="objects"`）：27 张控制表的节点本地 COW B+tree、单根 CAS、盘级多数派 quorum、Root/RootMeta/分配器/blob；读侧热视图按 generation 切换且只重建脏域；文件 Raft 日志/元数据/快照与 witness 元数据状态机；站点 LWW apply/ship/配对走缝，游标/死信本地化；账户用量本地缓存 + 复制账本采样校准；离线迁移保留逐字节校验与回滚窗口；10 万行快照导入 8.3s、导出 1.5s。SQLite 仍为默认后端，无 API、配置、Wire/OSSCTL 或数据格式变更，下一步删除 SQLite。v1.30 完成访问点/OLAP、lifecycle/inventory/tier、buckets/bucket_policies 等切片迁移与集群遗留控制对象重认证；v1.29 交付 `.oss.sys` 命名空间、控制对象 CAS/fencing/quorum 读与 `vpc_endpoints` 迁移。
 **以 docs/ 为准**：
 
 - `docs/superpowers/specs/2026-10-10-minio-clone-design.md` —— 总体设计（9 阶段 M1–M9、盘布局、xl.meta v1；§8 含各阶段落地状态）

@@ -4,13 +4,13 @@
 - 历史发布：**v1.14.0**（2026-10-23）· **v1.15.0** / **v1.16.0**（2026-10-24）·
   **v1.17.0**（2026-10-24，§13 架构切片）· **v1.18.0**（2026-10-25，文档精简）·
   **v1.19.0**（2026-10-26，Wave1 地基）
-- 最新发布：**v1.30.0**（2026-11-05，控制面读写缝全覆盖），tag `v1.30.0`；
-  在 v1.29 的 `ControlStore`/`ControlTxn` 缝上完成访问点/OLAP、lifecycle/inventory/tier、
-  buckets/bucket_policies/event_configs/replication_rules 的读写、快照与桶删除级联迁移，
-  并加入集群遗留控制对象重认证工具（只读 `ReadControlRaw`、canonical 分组、fenced 标记、
-  CLI dry-run/apply）；自然键身份、快照字段顺序与 site/raft 触发器语义不变，legacy raw SQL
-  双后端差分测试锁定行为；修复策略覆盖写的 SQLite UPSERT 触发器误报。SQLite 仍为默认后端，
-  无接口或数据格式变更。
+- 最新发布：**v1.31.0**（2026-11-06，对象控制存储后端），tag `v1.31.0`；
+  opt-in `[server].control_backend = "objects"`：27 张控制表存为节点本地 COW B+tree，
+  单根 CAS 提交、盘级多数派 quorum、启动 flock 与内容寻址 blob；Raft 使用文件日志/
+  元数据/快照（`<db_path>.d/`）与元数据型 witness；站点 LWW apply/ship/配对、outbox、
+  审计、上传、秒传索引与账户用量缓存全部走缝；离线 `control-migrate` 保留逐字节校验与
+  回滚窗口，A8 goldens 作为永久 oracle；10 万行快照导入 8.3s、导出 1.5s。SQLite 仍为
+  默认后端，对象后端 opt-in，无接口或数据格式变更。
   此前的 v1.28.1–v1.28.5 为 CI/测试稳定与性能加固补丁（protoc、配额夹具、OLAP 400 映射、
   缓存重载、DeleteObjects 预加载、列表/探测并发、索引、aether 限流、sync 流式 tee、发布脚本）。功能内容仍见 §23（Raft 日志格式
   标记与旧区间有界压缩、CMK→legacy 离线全量迁移、M8 follower restore fencing、AP 直连

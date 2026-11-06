@@ -127,6 +127,11 @@
 > buckets/bucket_policies/event_configs/replication_rules 的读写、Raft apply、快照
 > 导出/安装与桶删除级联迁移到同一缝；新增集群遗留控制对象重认证工具；修复策略
 > 覆盖写的 SQLite UPSERT 触发器误报；SQLite 仍为默认后端，无接口或数据格式变更。
+> 
+> **v1.31.0 对象控制存储后端**：opt-in `control_backend="objects"`；27 张控制表的
+> 节点本地 COW B+tree、单根 CAS、盘级多数派 quorum；文件 Raft 日志/元数据/快照与
+> witness；站点 LWW apply/ship/配对、outbox/审计/上传/秒传索引与用量缓存走缝；
+> 离线迁移与 goldens；SQLite 仍为默认后端，无接口或数据格式变更。
 >
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。

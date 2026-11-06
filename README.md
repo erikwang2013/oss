@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.30.0（2026-11-05）。** v1.30 继续控制面去数据库化：在 v1.29 的 `ControlStore`/`ControlTxn` 缝上完成访问点/OLAP、lifecycle/inventory/tier、buckets/bucket_policies/event_configs/replication_rules 四组切片的读写收敛，并加入集群遗留控制对象重认证工具（只读 `ReadControlRaw`、canonical 内容分组、fenced 标记写入、CLI dry-run/apply）。单节点写路径、Raft apply、快照导出/安装与桶删除级联均经该缝；身份键使用自然键（`OwnerRef` 只出现在 SQL/JSON 边界），快照字段顺序与 site changelog / raft guard 触发器语义保持不变，legacy raw SQL 差分测试锁定行为。运维修正：修复策略覆盖写时 SQLite UPSERT 与站点触发器组合误报 `UNIQUE` 的问题。SQLite 仍为默认后端；无 API、配置、Wire/OSSCTL 或数据格式变更。v1.29 交付 `.oss.sys` 系统命名空间、控制对象 CAS/单调 fencing/持久化锁 token/提交证书与 quorum 读，以及 `vpc_endpoints` 迁移；v1.28 系列交付 Raft 日志格式标记与旧区间有界压缩、M8 follower restore fencing、AP 直连 mTLS/AWS PrivateLink API 验证、`cmk rewrap --to-legacy` 全量迁移、Level C 只读排空、JWT 多密钥轮换与 feature 9 opt-in 严格硬配额，v1.28.1–v1.28.5 为 CI/测试稳定与性能加固补丁。能力边界见[使用文档](https://oss.erik.xyz/usage.html#boundaries)。
+**最新发布：v1.31.0（2026-11-06）。** v1.31 交付对象控制存储后端（opt-in `[server].control_backend = "objects"`）：控制面按表存为节点本地 COW B+tree，单根 CAS 作为提交点，盘级多数派 quorum、启动 flock、Root/RootMeta/分配器与内容寻址 blob 全部落 `.oss.sys`；IAM/账户/桶/策略/作业/outbox/站点/审计/上传/秒传索引等 27 张控制表均有对象适配器，读侧热视图按 root generation 无锁切换并只重建脏域。Raft 控制面使用文件日志/元数据/快照（`<db_path>.d/`），witness 只存元数据；站点复制的 LWW apply/ship/配对统一走缝，游标与死信落节点本地文件；账户用量热路径落本地缓存，复制账本由采样器校准。离线 `control-migrate` 保留逐字节校验与回滚窗口，A8 goldens 作为对象后端的永久 oracle。性能：10 万行快照导入 8.3s、导出 1.5s（此前导入超时），并修复元数据型提交导致热视图全量重载的问题。SQLite 仍为默认后端，对象后端为 opt-in；无 API、Wire/OSSCTL 或数据格式变更，下一步删除 SQLite。
 
 ## 功能
 
