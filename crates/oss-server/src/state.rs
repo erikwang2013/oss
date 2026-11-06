@@ -838,10 +838,32 @@ impl AppState {
         mesh_of(&self.store)
     }
 
+    /// 对象后端的写缝（None = SQLite：`Acl`/`StsRoute` 的既有 SQL 路径不变）。
+    fn object_writes(&self) -> Option<Arc<crate::control_writes::ObjectControlWrites>> {
+        self.db.object_control().map(|object| {
+            Arc::new(crate::control_writes::ObjectControlWrites::new(Arc::clone(
+                &object.control,
+            )))
+        })
+    }
+
+    /// `Acl` 写缝（对象模式 Some；SQLite 模式 None）。
+    pub(crate) fn acl_writes(&self) -> Option<Arc<dyn xl_s3::control::AclWrites>> {
+        let writes = self.object_writes()?;
+        Some(writes)
+    }
+
+    /// `StsRoute` 会话写入缝（对象模式 Some；SQLite 模式 None）。
+    pub(crate) fn sts_writes(&self) -> Option<Arc<dyn xl_s3::control::StsWrites>> {
+        let writes = self.object_writes()?;
+        Some(writes)
+    }
+
     /// 三面共用的判权实例（Task 9：集群时自动带读扇出；SQL 唯一事实源在 xl-s3::Acl）。
     pub fn acl(&self) -> xl_s3::access::Acl {
         let acl = xl_s3::access::Acl::with_mesh(self.db.pool().clone(), self.control_mesh())
-            .with_quota(Arc::clone(&self.quota));
+            .with_quota(Arc::clone(&self.quota))
+            .with_writes(self.acl_writes());
         let sink = self
             .audit
             .clone()

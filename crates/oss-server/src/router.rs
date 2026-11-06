@@ -223,7 +223,8 @@ pub fn build_router_with_trust(
     let sts: Arc<dyn s3s::route::S3Route> = Arc::new(
         xl_s3::sts::StsRoute::new(state.db.pool().clone())
             .with_vault(state.vault.clone())
-            .with_web_identity(web_identity),
+            .with_web_identity(web_identity)
+            .with_writes(state.sts_writes()),
     );
     // 端点身份验证器（可选）：先证明来源，再查 registry；None = Slice A 行为不变。
     let endpoint_verifier = ap_trust.endpoint_verifier.clone();

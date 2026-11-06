@@ -53,11 +53,12 @@ pub use ap_olap::{AccessPointStore, AccessPointTxn};
 // domain modules themselves stay private.
 pub(crate) use account::{AccountRow, LedgerRow, MemberRow};
 pub(crate) use account_write::{install_member, put_account};
-pub(crate) use bucket::{BucketRow, decode_row, encode_row, key1};
+pub(crate) use bucket::{BucketRow, decode_row, encode_row, key1, txn_scan_all};
 pub(crate) use bucket_write::bucket_clear_owner;
 pub(crate) use iam::{
     AccessKeyRow, PermissionStorageRow, UserRow, permission_key, scan_permissions, scan_users,
 };
+pub(crate) use iam_write::insert_access_key;
 pub use inventory::BucketDomainCleanup;
 pub(crate) use migrate_support::{StoredDeleteIntent, StoredWriteIntent};
 pub use origin::WriteOrigin;

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use xl_store::control_store::ControlError;
 
-use crate::access::{Action, AuthedUser};
+use crate::access::{Action, AuthedUser, BucketRecordOutcome};
 use crate::account_quota::AccountQuota;
 use crate::policy::PolicyDoc;
 
@@ -138,6 +138,67 @@ pub trait ControlAcl: Send + Sync {
     ) -> Result<Option<(String, String)>, ControlError>;
     /// `sites` row count (sync bucket-creation gate).
     async fn site_peer_count(&self) -> Result<usize, ControlError>;
+}
+
+/// Bucket writes reached from `service.rs`/console. The server supplies an
+/// object-backend implementation; without one (`None`) `Acl` keeps its SQLite
+/// SQL byte for byte. Failure maps to the same `sqlx::Error` channel as reads.
+#[async_trait::async_trait]
+pub trait AclWrites: Send + Sync {
+    async fn enable_bucket_lock(&self, bucket: &str) -> Result<(), ControlError>;
+    async fn set_bucket_lock_rule(
+        &self,
+        bucket: &str,
+        mode: Option<&str>,
+        days: Option<i64>,
+    ) -> Result<(), ControlError>;
+    async fn clear_bucket_policy(&self, bucket: &str) -> Result<(), ControlError>;
+    async fn set_bucket_notification(
+        &self,
+        bucket: &str,
+        config_json: &str,
+    ) -> Result<(), ControlError>;
+    async fn clear_bucket_notification(&self, bucket: &str) -> Result<(), ControlError>;
+    async fn set_bucket_default_encryption(
+        &self,
+        bucket: &str,
+        algorithm: &str,
+    ) -> Result<bool, ControlError>;
+    async fn clear_bucket_default_encryption(&self, bucket: &str) -> Result<bool, ControlError>;
+    async fn clear_lifecycle_rules(&self, bucket: &str) -> Result<(), ControlError>;
+    async fn set_bucket_versioning(&self, bucket: &str, status: &str)
+    -> Result<bool, ControlError>;
+    async fn record_bucket_owner(&self, bucket: &str, uid: i64) -> Result<(), ControlError>;
+    /// Upsert with the caller's bootstrap `set` and replication mode; new rows
+    /// run the account bucket-quota guard inside the same transaction.
+    async fn record_bucket_owner_set_mode(
+        &self,
+        bucket: &str,
+        uid: i64,
+        set: u16,
+        replication_mode: &str,
+    ) -> Result<BucketRecordOutcome, ControlError>;
+    async fn pick_least_loaded_set(&self, k: u16) -> Result<u16, ControlError>;
+    /// Delete the bucket's permission rows and its bucket row in one transaction.
+    async fn forget_bucket(&self, bucket: &str) -> Result<(), ControlError>;
+}
+
+/// STS session-key issuance. SQLite keeps the raw INSERT in `sts.rs`; object
+/// mode persists the row through the control root so the placeholder pool is
+/// never touched.
+#[async_trait::async_trait]
+pub trait StsWrites: Send + Sync {
+    #[allow(clippy::too_many_arguments)]
+    async fn issue_session(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        uid: i64,
+        expires_at: i64,
+        created_at: i64,
+        parent_ak: Option<&str>,
+        session_policy: Option<&str>,
+    ) -> Result<(), ControlError>;
 }
 
 /// One request's immutable hot view: auth and ACL reads over the same root

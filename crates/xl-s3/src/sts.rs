@@ -101,6 +101,8 @@ impl IpBuckets {
 
 pub struct StsRoute {
     pool: SqlitePool,
+    /// 对象后端会话写入缝（None = SQLite：`issue` 的既有 INSERT 逐字节不变）。
+    writes: Option<std::sync::Arc<dyn crate::control::StsWrites>>,
     /// M5 切片 6（T5 校正）：SK 加密库——签发会话的 SK 与 console 同口径封存入库
     /// （`issue` 是 `access_keys` 的**第二个写点**，切片 6 核查轮补齐）。
     vault: Option<std::sync::Arc<crate::skvault::SecretVault>>,
@@ -116,11 +118,21 @@ impl StsRoute {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
+            writes: None,
             vault: None,
             web_identity: None,
             web_identity_limiter: Mutex::new(TokenBucket::new(WI_BURST)),
             web_identity_ip_limiter: Mutex::new(IpBuckets::default()),
         }
+    }
+
+    /// 注入对象后端会话写入缝（None = SQLite：既有 `INSERT` 路径逐字节不变）。
+    pub fn with_writes(
+        mut self,
+        writes: Option<std::sync::Arc<dyn crate::control::StsWrites>>,
+    ) -> Self {
+        self.writes = writes;
+        self
     }
 
     /// M5 切片 6：接 SK 加密库（builder 风格；router 装配处调用）。
@@ -179,8 +191,9 @@ impl StsRoute {
         let dur = duration(fields, "DurationSeconds", AR_DEFAULT, AR_MIN, AR_MAX)?;
         let policy = session_policy(fields)?;
         let session_name = field(fields, "RoleSessionName").unwrap_or_else(|| "session".into());
-        let (ak, sk, token) = issue(
+        let (ak, sk, token) = issue_with(
             &self.pool,
+            self.writes.as_deref(),
             self.vault.as_deref(),
             role_uid,
             Some(caller_ak),
@@ -226,8 +239,9 @@ impl StsRoute {
             .await?
             .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?;
         let dur = duration(fields, "DurationSeconds", GST_DEFAULT, GST_MIN, GST_MAX)?;
-        let (ak, sk, token) = issue(
+        let (ak, sk, token) = issue_with(
             &self.pool,
+            self.writes.as_deref(),
             self.vault.as_deref(),
             uid,
             Some(caller_ak),
@@ -325,8 +339,9 @@ impl StsRoute {
         };
         let policy = session_policy(fields)?;
         let session_name = web_identity_session_name(fields)?;
-        let (ak, sk, session_token) = issue(
+        let (ak, sk, session_token) = issue_with(
             &self.pool,
+            self.writes.as_deref(),
             self.vault.as_deref(),
             role_uid,
             None,
@@ -456,10 +471,22 @@ fn signed_caller(caller_ak: Option<&str>) -> S3Result<String> {
 }
 
 /// 落一行会话（S1：AK `ASIA`+32hex / SK 32B hex / token 不落库）。
-// shortcut: STS 签发/父链查询只持 SqlitePool，看不到 oss-server 适配器；会话行写入
-// 与 caller_of 保留 raw SQL，最终移除 SQLite 或引入后端无关 pool 时再迁移（D7）。
+#[cfg(test)]
 async fn issue(
     pool: &SqlitePool,
+    vault: Option<&crate::skvault::SecretVault>,
+    uid: i64,
+    parent_ak: Option<&str>,
+    dur_secs: i64,
+    session_policy: Option<&str>,
+) -> S3Result<(String, String, String)> {
+    issue_with(pool, None, vault, uid, parent_ak, dur_secs, session_policy).await
+}
+
+/// 会话写入：`writes = Some` 走控制根（对象模式），否则走既有 SQLite INSERT。
+async fn issue_with(
+    pool: &SqlitePool,
+    writes: Option<&dyn crate::control::StsWrites>,
     vault: Option<&crate::skvault::SecretVault>,
     uid: i64,
     parent_ak: Option<&str>,
@@ -482,6 +509,23 @@ async fn issue(
         None => sk.clone(),
     };
     let now = now_secs();
+    if let Some(w) = writes {
+        w.issue_session(
+            &ak,
+            &stored,
+            uid,
+            now + dur_secs,
+            now,
+            parent_ak,
+            session_policy,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "STS 会话落控制根失败");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
+        return Ok((ak, sk, token));
+    }
     sqlx::query(
         "INSERT INTO access_keys \
          (access_key, secret_key, user_id, status, expires_at, created_at, parent_ak, session_policy, kind) \

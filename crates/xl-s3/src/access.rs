@@ -280,6 +280,8 @@ pub struct Acl {
     anon_deny: Arc<AnonDenyLimiter>,
     /// 异步审计接收方（None = 同步直写，测试/离线命令语义）。
     audit: Option<Arc<dyn AuditSink>>,
+    /// 对象后端写缝（None = SQLite：下面既有 SQL 逐字节不变）。
+    writes: Option<Arc<dyn crate::control::AclWrites>>,
 }
 
 /// 匿名拒绝审计的令牌桶：未认证请求可无限灌入，拒绝审计不能线性写 SQLite。
@@ -418,6 +420,7 @@ impl Acl {
             mesh: None,
             anon_deny: Arc::new(AnonDenyLimiter::new()),
             audit: None,
+            writes: None,
         }
     }
 
@@ -429,6 +432,7 @@ impl Acl {
             mesh,
             anon_deny: Arc::new(AnonDenyLimiter::new()),
             audit: None,
+            writes: None,
         }
     }
 
@@ -446,6 +450,12 @@ impl Acl {
     /// 注入异步审计接收方（serve 路径）；None = 保持同步直写。
     pub fn with_audit_sink(mut self, sink: Option<Arc<dyn AuditSink>>) -> Self {
         self.audit = sink;
+        self
+    }
+
+    /// 注入对象后端写缝（None = SQLite：既有 SQL 路径逐字节不变）。
+    pub fn with_writes(mut self, writes: Option<Arc<dyn crate::control::AclWrites>>) -> Self {
+        self.writes = writes;
         self
     }
 
@@ -532,6 +542,9 @@ impl Acl {
     /// `x-amz-bucket-object-lock-enabled` 时二者一并生效）。**Upsert**：建桶旗标可能先于记账
     /// 行到达（两条调用序都安全）；冲突时只改锁/版本列，不碰 owner/set/creation_date。
     pub async fn enable_bucket_lock(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w.enable_bucket_lock(bucket).await.map_err(view_err);
+        }
         sqlx::query(
             "INSERT INTO buckets (name, owner_id, creation_date, versioning, set_id, object_lock) \
              VALUES (?, NULL, ?, 'Enabled', 0, 1) \
@@ -551,6 +564,12 @@ impl Acl {
         mode: Option<&str>,
         days: Option<i64>,
     ) -> Result<(), sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w
+                .set_bucket_lock_rule(bucket, mode, days)
+                .await
+                .map_err(view_err);
+        }
         sqlx::query(
             "UPDATE buckets SET object_lock_default_mode = ?, object_lock_default_days = ? \
              WHERE name = ?",
@@ -634,8 +653,10 @@ impl Acl {
     }
 
     /// 清桶策略（删桶时调用——与生命周期规则同款 S6-1 语义）。
-    // shortcut: Acl 只持有 SqlitePool，无法看到 oss-server 适配器；S3 热路径迁移归 Slice 5（IAM/账户）或最终 SQLite 移除。
     pub async fn clear_bucket_policy(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w.clear_bucket_policy(bucket).await.map_err(view_err);
+        }
         sqlx::query("DELETE FROM bucket_policies WHERE bucket = ?")
             .bind(bucket)
             .execute(&self.pool)
@@ -661,6 +682,12 @@ impl Acl {
         bucket: &str,
         config_json: &str,
     ) -> Result<(), sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w
+                .set_bucket_notification(bucket, config_json)
+                .await
+                .map_err(view_err);
+        }
         sqlx::query(
             "INSERT INTO event_configs (bucket, config_json, updated_at) VALUES (?, ?, ?) \
              ON CONFLICT(bucket) DO UPDATE SET config_json = excluded.config_json, \
@@ -676,6 +703,9 @@ impl Acl {
 
     /// M6 切片 0：删桶时清通知配置（防同名重建继承旧规则）。
     pub async fn clear_bucket_notification(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w.clear_bucket_notification(bucket).await.map_err(view_err);
+        }
         sqlx::query("DELETE FROM event_configs WHERE bucket = ?")
             .bind(bucket)
             .execute(&self.pool)
@@ -704,6 +734,12 @@ impl Acl {
         bucket: &str,
         algorithm: &str,
     ) -> Result<bool, sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w
+                .set_bucket_default_encryption(bucket, algorithm)
+                .await
+                .map_err(view_err);
+        }
         let res = sqlx::query("UPDATE buckets SET default_encryption = ? WHERE name = ?")
             .bind(algorithm)
             .bind(bucket)
@@ -714,6 +750,12 @@ impl Acl {
 
     /// M8 缺口 C：清桶默认加密（幂等；返回是否命中桶行）。
     pub async fn clear_bucket_default_encryption(&self, bucket: &str) -> Result<bool, sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w
+                .clear_bucket_default_encryption(bucket)
+                .await
+                .map_err(view_err);
+        }
         let res = sqlx::query("UPDATE buckets SET default_encryption = NULL WHERE name = ?")
             .bind(bucket)
             .execute(&self.pool)
@@ -724,6 +766,9 @@ impl Acl {
     /// 清桶生命周期规则（M4 切片 6：删桶时调用——桶名可复用，旧规则复活会误删新桶
     /// 对象；verifier S6-1）。表在共享 DB（migrations 0001），S3 面与控制面同口径。
     pub async fn clear_lifecycle_rules(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w.clear_lifecycle_rules(bucket).await.map_err(view_err);
+        }
         sqlx::query("DELETE FROM lifecycle_rules WHERE bucket = ?")
             .bind(bucket)
             .execute(&self.pool)
@@ -841,6 +886,12 @@ impl Acl {
         bucket: &str,
         status: &str,
     ) -> Result<bool, sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w
+                .set_bucket_versioning(bucket, status)
+                .await
+                .map_err(view_err);
+        }
         let res = sqlx::query("UPDATE buckets SET versioning = ? WHERE name = ?")
             .bind(status)
             .bind(bucket)
@@ -1301,6 +1352,9 @@ impl Acl {
 
     /// 桶归属登记（历史形态，无 set；幂等——已存在不覆盖，测试钉）。
     pub async fn record_bucket_owner(&self, bucket: &str, uid: i64) -> Result<(), sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w.record_bucket_owner(bucket, uid).await.map_err(view_err);
+        }
         sqlx::query(
             "INSERT OR IGNORE INTO buckets \
              (name, owner_id, creation_date, versioning, set_id, object_lock, \
@@ -1341,6 +1395,12 @@ impl Acl {
         set: u16,
         replication_mode: &str,
     ) -> Result<BucketRecordOutcome, sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w
+                .record_bucket_owner_set_mode(bucket, uid, set, replication_mode)
+                .await
+                .map_err(view_err);
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM buckets WHERE name = ?")
             .bind(bucket)
@@ -1387,6 +1447,9 @@ impl Acl {
         if k <= 1 {
             return Ok(0);
         }
+        if let Some(w) = &self.writes {
+            return w.pick_least_loaded_set(k).await.map_err(view_err);
+        }
         let rows = sqlx::query("SELECT set_id, COUNT(*) AS c FROM buckets GROUP BY set_id")
             .fetch_all(&self.pool)
             .await?;
@@ -1412,6 +1475,9 @@ impl Acl {
     /// 删桶后的记账清理（S3 与控制台两条删桶路径共用同一实现）：
     /// 清该桶的授权行（防重建同名桶继承旧授权）+ 清桶行。
     pub async fn forget_bucket(&self, bucket: &str) -> Result<(), sqlx::Error> {
+        if let Some(w) = &self.writes {
+            return w.forget_bucket(bucket).await.map_err(view_err);
+        }
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM permissions WHERE bucket = ?")
             .bind(bucket)

@@ -4,6 +4,7 @@ mod account;
 mod account_fixtures;
 mod account_snapshot;
 mod account_write;
+mod acl_writes;
 mod basic;
 mod bulk;
 mod conflict;
