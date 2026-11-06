@@ -35,6 +35,7 @@ async fn versioned_bucket(st: &AppState, bucket: &str) {
     let name = bucket.to_owned();
     st.db
         .control_write("lifecycle-long", move |txn| {
+            let name = name.clone();
             Box::pin(async move { txn.bucket_set_versioning(&name, "Enabled").await })
         })
         .await

@@ -30,7 +30,9 @@ use s3s_sigv4::{
     AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
 };
 use sha2::Sha256;
-use xl_store::control_store::sync_intents::{NewSyncDeleteIntent, NewSyncWriteIntent};
+use xl_store::control_store::sync_intents::{
+    NewSyncDeleteIntent, NewSyncWriteIntent, SyncIntentTxn,
+};
 use xl_store::store::{Store, StoreConfig};
 
 const REGION: &str = "us-east-1";
@@ -429,7 +431,7 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
     ));
     sc.sync_max_bytes = sync_max;
     sc.tee_dir = Some(tee_dir.clone());
-    let store = Store::open(sc).await.unwrap();
+    let store = Arc::new(Store::open(sc).await.unwrap());
     let cfg = AppConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: datadir.path().join("data"),

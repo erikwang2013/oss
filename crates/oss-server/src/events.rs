@@ -1287,16 +1287,27 @@ mod tests {
         )
         .await;
         let backend = EventBackend::new(&f.db);
-        let crashed_at = now() - EVENT_LEASE_SECS - 5;
-        let row = backend.claim(crashed_at).await.unwrap().remove(0);
+        let t0 = now();
+        let row = backend.claim(t0).await.unwrap().remove(0);
+        // Simulate a worker that crashed after 3 attempts: retry with attempts=3,
+        // due immediately, then claim it again and let the lease expire.
         let failure = NotifyFailure::retryable("connection refused");
         assert!(
             backend
-                .requeue_or_bury(row.id, row.claimed_at, 3, &failure, crashed_at)
+                .requeue_or_bury(
+                    row.id,
+                    row.claimed_at,
+                    3,
+                    &failure,
+                    t0 - backoff_secs(3)
+                )
                 .await
         );
-        assert_eq!(backend.reclaim_expired(now()).await.unwrap(), 1);
-        let again = backend.claim(now()).await.unwrap().remove(0);
+        let crashed = backend.claim(t0).await.unwrap().remove(0);
+        assert_eq!(crashed.attempts, 3);
+        let later = t0 + EVENT_LEASE_SECS + 1;
+        assert_eq!(backend.reclaim_expired(later).await.unwrap(), 1);
+        let again = backend.claim(later).await.unwrap().remove(0);
         assert_eq!(again.attempts, 3, "回收不计 attempts");
         let failure = NotifyFailure::retryable("connection refused");
         assert!(

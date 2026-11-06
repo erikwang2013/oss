@@ -420,6 +420,19 @@ impl SiteTxn for ObjectControlTxn {
         }
     }
 
+    async fn site_put_clock(
+        &mut self,
+        entity: &str,
+        entity_id: &str,
+        ts: i64,
+        priority: i64,
+        origin_site_id: &str,
+        seq: i64,
+    ) -> Result<(), ControlError> {
+        ObjectControlTxn::site_put_clock(self, entity, entity_id, ts, priority, origin_site_id, seq)
+            .await
+    }
+
     async fn site_delete(&mut self, peer_id: &str) -> Result<u64, ControlError> {
         Ok(u64::from(
             self.delete(TableId::Sites, site_key(peer_id))

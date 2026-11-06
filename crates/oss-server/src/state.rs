@@ -632,9 +632,14 @@ impl AppState {
 
     /// 三面共用的判权实例（对象请求热视图 + 控制根写缝）。
     pub fn acl(&self) -> xl_s3::access::Acl {
-        let acl = xl_s3::access::Acl::new()
+        let mut acl = xl_s3::access::Acl::new()
             .with_quota(Arc::clone(&self.quota))
             .with_writes(self.acl_writes());
+        if let Some(view) = &self.control_view {
+            // Background workers/jobs run outside the request-scoped task-local;
+            // give them a captured generation as the read fallback.
+            acl = acl.with_control(Arc::new(view.capture()));
+        }
         let sink = self
             .audit
             .clone()

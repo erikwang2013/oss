@@ -154,5 +154,15 @@ pub trait SiteTxn: Send {
         remote_site_id: &str,
         error: Option<&str>,
     ) -> Result<(), ControlError>;
+    /// Explicit LWW clock write for `SiteApply` (the former `put_clock`).
+    async fn site_put_clock(
+        &mut self,
+        entity: &str,
+        entity_id: &str,
+        ts: i64,
+        priority: i64,
+        origin_site_id: &str,
+        seq: i64,
+    ) -> Result<(), ControlError>;
     async fn site_delete(&mut self, peer_id: &str) -> Result<u64, ControlError>;
 }

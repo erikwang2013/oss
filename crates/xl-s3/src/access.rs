@@ -217,6 +217,8 @@ pub struct Acl {
     audit: Option<Arc<dyn AuditSink>>,
     /// 对象后端写缝（唯一写路径；缺失 = fail-closed）。
     writes: Option<Arc<dyn crate::control::AclWrites>>,
+    /// Background/non-request reads fallback (a captured hot-view generation).
+    control: Option<Arc<dyn crate::control::Control>>,
 }
 
 /// 匿名拒绝审计的令牌桶：未认证请求可无限灌入，拒绝审计不能线性写存储。
@@ -337,11 +339,6 @@ fn now() -> i64 {
 }
 
 /// 当前请求捕获的热视图（对象后端唯一读路径；缺失 = fail-closed）。
-fn request_view() -> Result<Arc<dyn crate::control::Control>, ControlError> {
-    crate::control::request_view()
-        .ok_or_else(|| ControlError::Backend("control view missing outside request scope".into()))
-}
-
 impl Acl {
     /// 默认无配额后端（测试/离线命令）；serve 路径用 [`Self::with_quota`] 注入。
     pub fn new() -> Self {
@@ -350,7 +347,21 @@ impl Acl {
             anon_deny: Arc::new(AnonDenyLimiter::new()),
             audit: None,
             writes: None,
+            control: None,
         }
+    }
+
+    /// Fallback control snapshot for callers outside a request scope (job workers,
+    /// offline operations). Request-scoped views take precedence.
+    pub fn with_control(mut self, control: Arc<dyn crate::control::Control>) -> Self {
+        self.control = Some(control);
+        self
+    }
+
+    fn control(&self) -> Result<Arc<dyn crate::control::Control>, ControlError> {
+        crate::control::request_view()
+            .or_else(|| self.control.clone())
+            .ok_or_else(|| ControlError::Backend("control view missing".into()))
     }
 
     /// 注入账户硬配额后端（对象后端复制账本）。
@@ -385,22 +396,22 @@ impl Acl {
 
     /// 桶版本控制状态（M4 切片 3；`buckets.versioning`）：无行/旧库缺列值 → "Off"（fail-closed 兼容）。
     pub async fn bucket_versioning(&self, bucket: &str) -> Result<String, ControlError> {
-        request_view()?.bucket_versioning(bucket).await
+        self.control()?.bucket_versioning(bucket).await
     }
     /// M9：桶复制模式行；行不存在 = None（建桶前判「重建不得改模式」）。
     pub async fn bucket_replication_mode_row(
         &self,
         bucket: &str,
     ) -> Result<Option<String>, ControlError> {
-        request_view()?.bucket_replication_mode_row(bucket).await
+        self.control()?.bucket_replication_mode_row(bucket).await
     }
     /// M9：桶复制模式（行不存在 = "async"，与缺行旧桶同口径）。
     pub async fn bucket_replication_mode(&self, bucket: &str) -> Result<String, ControlError> {
-        request_view()?.bucket_replication_mode(bucket).await
+        self.control()?.bucket_replication_mode(bucket).await
     }
     /// M9 S3：sync 建桶前置——数据站点 peer 数必须恰为 1（witness 不写 `sites` 行）。
     pub async fn site_peer_count(&self) -> Result<usize, ControlError> {
-        request_view()?.site_peer_count().await
+        self.control()?.site_peer_count().await
     }
     /// M5 切片 4：桶对象锁状态 → `Some((enabled, 默认模式, 默认天数))`；**行不存在 = None**
     /// （N4 复验补：调用方可据此区分「桶不存在(404)」与「锁未开(400)」）。
@@ -408,7 +419,7 @@ impl Acl {
         &self,
         bucket: &str,
     ) -> Result<Option<(bool, Option<String>, Option<i64>)>, ControlError> {
-        request_view()?.bucket_lock(bucket).await
+        self.control()?.bucket_lock(bucket).await
     }
     /// M5 切片 4：开桶锁——`object_lock=1` **且自动开版本控制**（AWS：锁须版本化，建桶带
     /// `x-amz-bucket-object-lock-enabled` 时二者一并生效）。**Upsert**：建桶旗标可能先于记账
@@ -430,7 +441,7 @@ impl Acl {
         &self,
         bucket: &str,
     ) -> Result<Option<crate::policy::PolicyDoc>, ControlError> {
-        request_view()?.bucket_policy(bucket).await
+        self.control()?.bucket_policy(bucket).await
     }
     /// 审计落行（判定后；允许与拒绝都记；best-effort 由调用方 warn）。
     /// 只入队到 [`AuditSink`]；未注入 sink = fail-closed（不允许静默丢弃审计）。
@@ -472,7 +483,7 @@ impl Acl {
     }
     /// M6 切片 0：桶通知配置（None = 未配置；json 原文，解析在 notify 模块）。
     pub async fn bucket_notification(&self, bucket: &str) -> Result<Option<String>, ControlError> {
-        request_view()?.bucket_notification(bucket).await
+        self.control()?.bucket_notification(bucket).await
     }
     /// M6 切片 0：写桶通知配置（全量替换）。
     pub async fn set_bucket_notification(
@@ -493,7 +504,7 @@ impl Acl {
         &self,
         bucket: &str,
     ) -> Result<Option<String>, ControlError> {
-        request_view()?.bucket_default_encryption(bucket).await
+        self.control()?.bucket_default_encryption(bucket).await
     }
     /// M8 缺口 C：写桶默认加密（全量替换；桶行不存在 → false）。
     pub async fn set_bucket_default_encryption(
@@ -619,12 +630,12 @@ impl Acl {
     ///（认证面与授权面查的是同一行，任一处撤销即同时失效）；**账号停用（users.status）
     /// 同样使 AK 失效**——停用即全链路出局。
     pub async fn user_of_key(&self, access_key: &str) -> Result<Option<AuthedUser>, ControlError> {
-        request_view()?.user_of_key(access_key, now()).await
+        self.control()?.user_of_key(access_key, now()).await
     }
     /// AC-0：用户当前账户（成员行优先，无行回落 uid 派生账户）。
     /// 策略主体把账户根 ARN 映射到账户成员集合时使用；查询失败由调用方 fail-closed。
     pub async fn account_id_of_user(&self, uid: i64) -> Result<Option<String>, ControlError> {
-        request_view()?.account_id_of_user(uid).await
+        self.control()?.account_id_of_user(uid).await
     }
     /// AP 跨账户：请求者账户 + 有效状态（成员行优先，无成员行回落 uid 派生账户）。
     /// - 成员行：账户行必须存在且 `status='active'`（缺失/停用 → false，fail-closed）；
@@ -635,14 +646,14 @@ impl Acl {
         &self,
         uid: i64,
     ) -> Result<(Option<String>, bool), ControlError> {
-        request_view()?.account_identity_of_user(uid).await
+        self.control()?.account_identity_of_user(uid).await
     }
     /// AC-2：账户桶数硬配额（`accounts.bucket_quota`；NULL/负 = 不限）。
     /// 返回 true = 已到上限，拒绝建桶。查询失败由调用方 fail-closed（5xx）。
     /// 这是快速检查（文案/错误码兼容）；权威判定在 standalone 写事务内、Raft leader
     /// append 前，并发建桶不会越过 `accounts.bucket_quota`。
     pub async fn bucket_quota_exceeded(&self, uid: i64) -> Result<bool, ControlError> {
-        request_view()?.bucket_quota_exceeded(uid).await
+        self.control()?.bucket_quota_exceeded(uid).await
     }
     /// M5 切片 5（S8）：AK 的会话策略（`kind='session'` 且 `session_policy` 非空时）。
     /// 本地查无 → 扇出（远端应答带 `session_policy`；NULL/空 = 无约束，与线上口径一致）。
@@ -651,11 +662,11 @@ impl Acl {
         &self,
         access_key: &str,
     ) -> Result<Option<crate::policy::PolicyDoc>, ControlError> {
-        request_view()?.session_policy_of(access_key).await
+        self.control()?.session_policy_of(access_key).await
     }
     /// 桶主？（`buckets.owner_id == uid`）
     pub async fn is_owner(&self, bucket: &str, uid: i64) -> Result<bool, ControlError> {
-        request_view()?.is_owner(bucket, uid).await
+        self.control()?.is_owner(bucket, uid).await
     }
     /// ListObjects 的 Owner 回写：桶主 username；管理员桶/无 DB 行回落管理员。
     /// 返回 `(id, display_name)`，id 用本地 uid 的十进制串（本模型的稳定主体标识）。
@@ -663,7 +674,7 @@ impl Acl {
         &self,
         bucket: &str,
     ) -> Result<Option<(String, String)>, ControlError> {
-        request_view()?.bucket_owner_display(bucket).await
+        self.control()?.bucket_owner_display(bucket).await
     }
     /// 主判权：admin / 桶主 全允许；否则查对应能力位（无行 = 拒）。
     pub async fn can(
@@ -672,12 +683,12 @@ impl Acl {
         action: Action,
         bucket: &str,
     ) -> Result<bool, ControlError> {
-        request_view()?.can(&user, action, bucket).await
+        self.control()?.can(&user, action, bucket).await
     }
     /// 可见桶集合（列举过滤）：自有桶 ∪ 在 `permissions` 任一能力位为 1 的桶。
     /// 与磁盘列表**求交**使用（磁盘是权威——历史桶可能没有 DB 行）。
     pub async fn visible(&self, uid: i64) -> Result<Vec<String>, ControlError> {
-        request_view()?.visible(uid).await
+        self.control()?.visible(uid).await
     }
     /// 桶主账户硬配额（E1）：由注入的配额后端负责请求视图/本地缓存选择。
     pub async fn account_quota_for_bucket(

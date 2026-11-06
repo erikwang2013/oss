@@ -46,7 +46,6 @@ hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
 sha2.workspace = true
-sqlx.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 toml = "1.1"
@@ -77,7 +76,7 @@ olap-wasm = ["xl-s3/olap-wasm"]
 xl-store = { workspace = true, features = ["test-fault-io"] }
 # 测试用独立签发器造边界令牌（换 secret 的伪签、绝对 exp 的过期）：jsonwebtoken 只在测试里被引用。
 jsonwebtoken = "11"
-# bytes 只在集成测试里用（put_object 造体）；sqlx 是 [dependencies] 的重复声明，删
+# bytes 只在集成测试里用（put_object 造体）
 bytes.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 tempfile = "3"

@@ -299,5 +299,3 @@ async fn path_site_apply_clears_m8_and_invalidates_after_commit() {
     assert_cleared(&st, "sitebkt", "site-ap").await;
     assert_not_inherited(&st, "sitebkt", "site-ap").await;
 }
-
-/// ③ commit 失败：cache 不得被失效（回滚后 M8 行仍在，预热缓存仍有效）。
