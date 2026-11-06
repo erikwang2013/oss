@@ -215,8 +215,14 @@ else
   pending "object site control replication (pre-H1: site hooks not wired into object bucket/user writes)"
 fi
 # Seed the bucket on B too, so data-plane ship is exercised independently of
-# control replication. Versioning is required for site data enqueue.
-ck_eq "$(console_post "$PB" "$BT" /api/v1/buckets '{"name":"site-bucket"}')" "204" "site peer seeds ship bucket"
+# control replication. Versioning is required for site data enqueue. Control
+# replication may already have created it (409/Conflict) — both are expected.
+SITE_SEED=$(console_post "$PB" "$BT" /api/v1/buckets '{"name":"site-bucket"}')
+if [ "$SITE_SEED" = 204 ] || [ "$SITE_SEED" = 409 ]; then
+  pass "site peer seeds ship bucket (created or already replicated)"
+else
+  fail "site peer seeds ship bucket (got '$SITE_SEED', want 204/409)"
+fi
 # Data-plane enqueue for a non-version-delete PUT requires bucket versioning.
 if aws_at "$PA" "$A_AK" "$A_SK" s3api put-bucket-versioning --bucket site-bucket --versioning-configuration Status=Enabled; then
   pass "site bucket versioning enabled"
@@ -357,7 +363,6 @@ if [ "$STRICT" = 1 ]; then
 else
   pending "scripts/check_no_db.sh clean (pre-H1 tree still has sqlx/sqlite matches)"
   pending "cargo tree -i sqlx empty (pre-H1 tree still links sqlx)"
-  pending "object-native admin bootstrap (pre-H1 seeds a SQLite fixture)"
 fi
 
 finish

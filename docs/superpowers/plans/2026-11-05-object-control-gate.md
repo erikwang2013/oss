@@ -15,7 +15,7 @@ The signed record is generated at execution after H1
 | Binary | `target/debug/oss-server` sha256 `2c3578fb0da806a9ccb55ca6c13873db4d9c9467f885acff9d51e2172831685d` |
 | Reference host | Linux 6.6.155-amd64-desktop-hwe x86_64, 8 vCPU, debug build, local single disk |
 | Operator / reviewer | H2 rehearsal / `<fill at execution>` |
-| Verdict | **PASS in default mode** (117 pass / 0 fail / 8 pending); **PENDING-H1 in strict mode** |
+| Verdict | **PASS in default mode** (125 pass / 0 fail / 2 pending); **PENDING-H1 in strict mode** |
 
 ## Seven gates
 
@@ -40,19 +40,28 @@ candidate commit. Current values are the pre-H1 rehearsal, not the signed result
 | 2 | Full E2E suite | `<record command + output at execution>` | PENDING-H1 | Run `cargo test --workspace --locked` plus the existing e2e scripts on the post-H1 tree. |
 | 3 | kill -9 restart | `tests/e2e_no_db.sh` §2 and §4 | **PASS** | Repeat with the 100-iteration commit-phase crash matrix. |
 | 4 | Snapshot transfer | `tests/e2e_no_db.sh` §4: empty node 3 joins by snapshot after purge | **PASS**, with pre-H1 caveat | Must also pass without the "one live write after migration" workaround; the applied-LogId bug is listed below. |
-| 5 | Site replication | `tests/e2e_no_db.sh` §3: pair both ways, ping, control apply, object ship | **PARTIAL**: pair/ping PASS; control apply and data ship PENDING-H1 | Wire the object site hooks and object S3 versioning/data ship; re-run. |
-| 6 | Auth / console smoke | `tests/e2e_no_db.sh` §2-§4: console login/list/create user+bucket, S3 bad-key reject, put/get/head/list, user login on joined voters | **PASS** for migrated admin and seeded users | Object-native admin bootstrap and access-key creation are pre-H1 gaps below. |
+| 5 | Site replication | `tests/e2e_no_db.sh` §3: pair both ways, ping, control apply, object ship | **PASS**: pair both ways, ping, control apply visible on peer, versioning + data ship | — |
+| 6 | Auth / console smoke | `tests/e2e_no_db.sh` §2-§4: console login/list/create user+bucket, S3 bad-key reject, put/get/head/list, user login on joined voters | **PASS** for migrated and object-native admins; snapshot-joined voter login and console access-key creation pass | — |
 | 7 | Benchmark numbers | `scripts/bench_control_store.sh` G3 run | Known misses below | Re-run release build; budgets must be met. |
 
 ### Rehearsal evidence (2026-11-06)
 
-- `tests/e2e_no_db.sh` (default, debug binary above): `PASS=117 FAIL=0 PENDING=8 SKIP=0`, exit 0,
-  bounded under the 420 s external timeout.
+- `tests/e2e_no_db.sh` (default, 2026-11-06 final): `PASS=125 FAIL=0 PENDING=2 SKIP=0`, exit 0.
+  Only the two H1 workspace guards remain pending; site control replication, versioning/data ship,
+  object-native admin bootstrap and snapshot-joined admin login now pass.
 - `scripts/check_no_db.sh`: exit 1, `files=702 manifests=7`; dependency 27, `sqlx` 2245, `sqlite`
   2017, DB filenames 203, `SqliteControl*` 563, `migrations/` 18, migrations directory 1 —
   `BLOCKED: 5074 SQLite match(es)`.
 - `tests/e2e_object_control_cluster.sh` (G3 canonical): `PASS=70 FAIL=0`, exit 0 — the new gate
   reproduces its snapshot/witness coverage.
+
+### Resolved since the first run (2026-11-06)
+
+Gaps 1–5 below were fixed before the final run: console access-key creation and the db façade
+writes (`51cf409`, `68d201e`), site hooks wired into domain writes (`e73f58f`), xl-s3 bucket
+versioning/notification/lock writes through the seam (`e91e81c`, `47b76f4`), and object-native
+admin bootstrap (`0505810`, `2199bd4`). Gap 6 still needs the e2e's single live-write workaround;
+gap 7 is the H1 deletion itself.
 
 ## Known pre-H1 gaps surfaced by the gate
 
