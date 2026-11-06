@@ -178,7 +178,6 @@ mod tests {
     #[tokio::test]
     async fn worker_writes_batched_rows() {
         use xl_store::control_state::root::Mode;
-        use xl_store::control_store::audit::AuditStore as _;
         use xl_store::store::{Store, StoreConfig};
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = StoreConfig::new(dir.path());

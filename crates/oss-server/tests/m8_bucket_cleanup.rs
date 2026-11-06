@@ -21,8 +21,8 @@ use s3s::{S3, S3Request};
 use xl_s3::ap::{AccessPoint, ApSource};
 use xl_s3::bucket_cleanup::BucketCleanupSink;
 use xl_s3::service::OssS3;
-use xl_store::control_store::lifecycle::LifecycleRuleEntry;
 use xl_store::control_store::inventory::{InventoryConfigEntry, InventoryRunRow};
+use xl_store::control_store::lifecycle::LifecycleRuleEntry;
 use xl_store::control_store::tier::TierRestoreRow;
 use xl_store::control_store::{AccessPointEntry, OlapConfigEntry, OwnerRef};
 
@@ -145,7 +145,10 @@ async fn assert_cleared(st: &AppState, bucket: &str, ap: &str) {
         "olap_configs 未清（ap={ap}）"
     );
     assert!(
-        cs.inventory_config(bucket, "daily").await.unwrap().is_none(),
+        cs.inventory_config(bucket, "daily")
+            .await
+            .unwrap()
+            .is_none(),
         "inventory_configs 未清（bucket={bucket}）"
     );
     assert!(

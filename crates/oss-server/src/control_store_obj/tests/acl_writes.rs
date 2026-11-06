@@ -58,21 +58,21 @@ async fn missing_write_seam_fails_closed() {
 async fn lock_and_versioning_writes() {
     let fx = fixture().await;
     fx.acl.enable_bucket_lock("locked").await.unwrap();
-    let row = BucketStore::bucket(&*fx.control, "locked")
+    let row = BucketStore::bucket(fx.control.as_ref(), "locked")
         .await
         .unwrap()
         .unwrap();
     assert!(row.object_lock);
     assert_eq!(row.versioning, "Enabled");
     assert_eq!(row.owner_uid, None);
-    assert_eq!(stored_set_id(&fx.control, "locked").await, 0);
+    assert_eq!(stored_set_id(fx.control.as_ref(), "locked").await, 0);
     assert_eq!(row.creation_date, crate::db::now());
 
     fx.acl
         .set_bucket_lock_rule("locked", Some("GOVERNANCE"), Some(3))
         .await
         .unwrap();
-    let row = BucketStore::bucket(&*fx.control, "locked")
+    let row = BucketStore::bucket(fx.control.as_ref(), "locked")
         .await
         .unwrap()
         .unwrap();
@@ -83,7 +83,7 @@ async fn lock_and_versioning_writes() {
         .set_bucket_lock_rule("locked", None, None)
         .await
         .unwrap();
-    let row = BucketStore::bucket(&*fx.control, "locked")
+    let row = BucketStore::bucket(fx.control.as_ref(), "locked")
         .await
         .unwrap()
         .unwrap();
@@ -96,7 +96,7 @@ async fn lock_and_versioning_writes() {
             .await
             .unwrap()
     );
-    let row = BucketStore::bucket(&*fx.control, "locked")
+    let row = BucketStore::bucket(fx.control.as_ref(), "locked")
         .await
         .unwrap()
         .unwrap();
@@ -111,7 +111,7 @@ async fn lock_and_versioning_writes() {
     // Lock on an existing row keeps the owner (upsert touches lock/versioning only).
     fx.acl.record_bucket_owner("owned", 7).await.unwrap();
     fx.acl.enable_bucket_lock("owned").await.unwrap();
-    let row = BucketStore::bucket(&*fx.control, "owned")
+    let row = BucketStore::bucket(fx.control.as_ref(), "owned")
         .await
         .unwrap()
         .unwrap();
@@ -132,7 +132,7 @@ async fn bucket_config_writes() {
             .unwrap()
     );
     assert_eq!(
-        BucketStore::bucket(&*fx.control, "cfg")
+        BucketStore::bucket(fx.control.as_ref(), "cfg")
             .await
             .unwrap()
             .unwrap()
@@ -142,7 +142,7 @@ async fn bucket_config_writes() {
     );
     assert!(fx.acl.clear_bucket_default_encryption("cfg").await.unwrap());
     assert_eq!(
-        BucketStore::bucket(&*fx.control, "cfg")
+        BucketStore::bucket(fx.control.as_ref(), "cfg")
             .await
             .unwrap()
             .unwrap()
@@ -167,7 +167,7 @@ async fn bucket_config_writes() {
         .await
         .unwrap();
     assert_eq!(
-        BucketStore::bucket_notification(&*fx.control, "cfg")
+        BucketStore::bucket_notification(fx.control.as_ref(), "cfg")
             .await
             .unwrap()
             .unwrap()
@@ -176,7 +176,7 @@ async fn bucket_config_writes() {
     );
     fx.acl.clear_bucket_notification("cfg").await.unwrap();
     assert!(
-        BucketStore::bucket_notification(&*fx.control, "cfg")
+        BucketStore::bucket_notification(fx.control.as_ref(), "cfg")
             .await
             .unwrap()
             .is_none()
@@ -208,7 +208,7 @@ async fn bucket_config_writes() {
     .unwrap();
     txn.commit().await.unwrap();
     assert!(
-        BucketStore::bucket_policy(&*fx.control, "cfg")
+        BucketStore::bucket_policy(fx.control.as_ref(), "cfg")
             .await
             .unwrap()
             .is_some()
@@ -216,14 +216,14 @@ async fn bucket_config_writes() {
 
     fx.acl.clear_bucket_policy("cfg").await.unwrap();
     assert!(
-        BucketStore::bucket_policy(&*fx.control, "cfg")
+        BucketStore::bucket_policy(fx.control.as_ref(), "cfg")
             .await
             .unwrap()
             .is_none()
     );
     fx.acl.clear_lifecycle_rules("cfg").await.unwrap();
     assert!(
-        LifecycleStore::lifecycle_rules(&*fx.control, "cfg")
+        LifecycleStore::lifecycle_rules(fx.control.as_ref(), "cfg")
             .await
             .unwrap()
             .is_empty()
@@ -234,18 +234,18 @@ async fn bucket_config_writes() {
 async fn owner_set_and_forget_writes() {
     let fx = fixture().await;
     fx.acl.record_bucket_owner("o1", 5).await.unwrap();
-    let row = BucketStore::bucket(&*fx.control, "o1")
+    let row = BucketStore::bucket(fx.control.as_ref(), "o1")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(row.owner_uid, Some(5));
     assert_eq!(row.versioning, "Off");
-    assert_eq!(stored_set_id(&fx.control, "o1").await, 0);
+    assert_eq!(stored_set_id(fx.control.as_ref(), "o1").await, 0);
     assert_eq!(row.replication_mode, "async");
     // INSERT OR IGNORE: an existing row keeps its owner.
     fx.acl.record_bucket_owner("o1", 9).await.unwrap();
     assert_eq!(
-        BucketStore::bucket(&*fx.control, "o1")
+        BucketStore::bucket(fx.control.as_ref(), "o1")
             .await
             .unwrap()
             .unwrap()
@@ -260,12 +260,12 @@ async fn owner_set_and_forget_writes() {
             .unwrap(),
         BucketRecordOutcome::Written
     );
-    let first = BucketStore::bucket(&*fx.control, "o2")
+    let first = BucketStore::bucket(fx.control.as_ref(), "o2")
         .await
         .unwrap()
         .unwrap();
     assert_eq!(first.owner_uid, Some(8));
-    assert_eq!(stored_set_id(&fx.control, "o2").await, 2);
+    assert_eq!(stored_set_id(fx.control.as_ref(), "o2").await, 2);
     assert_eq!(first.versioning, "Enabled");
     assert_eq!(first.replication_mode, "sync");
 
@@ -274,11 +274,11 @@ async fn owner_set_and_forget_writes() {
         .record_bucket_owner_set_mode("o2", 8, 1, "async")
         .await
         .unwrap();
-    let second = BucketStore::bucket(&*fx.control, "o2")
+    let second = BucketStore::bucket(fx.control.as_ref(), "o2")
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(stored_set_id(&fx.control, "o2").await, 1);
+    assert_eq!(stored_set_id(fx.control.as_ref(), "o2").await, 1);
     assert_eq!(second.versioning, "Off");
     assert_eq!(second.creation_date, first.creation_date);
 
@@ -297,7 +297,7 @@ async fn owner_set_and_forget_writes() {
         .unwrap();
     txn.commit().await.unwrap();
     assert_eq!(
-        IamStore::permissions_for_user(&*fx.control, 5)
+        IamStore::permissions_for_user(fx.control.as_ref(), 5)
             .await
             .unwrap()
             .len(),
@@ -305,13 +305,13 @@ async fn owner_set_and_forget_writes() {
     );
     fx.acl.forget_bucket("o1").await.unwrap();
     assert!(
-        BucketStore::bucket(&*fx.control, "o1")
+        BucketStore::bucket(fx.control.as_ref(), "o1")
             .await
             .unwrap()
             .is_none()
     );
     assert!(
-        IamStore::permissions_for_user(&*fx.control, 5)
+        IamStore::permissions_for_user(fx.control.as_ref(), 5)
             .await
             .unwrap()
             .is_empty()
@@ -358,7 +358,7 @@ async fn sts_session_lands_in_root_with_parent_chain_and_expiry() {
     .await
     .unwrap();
 
-    let view = HotView::load(&*fx.control).await.unwrap().capture();
+    let view = HotView::load(fx.control.as_ref()).await.unwrap().capture();
     match ControlAuth::key_auth(&view, "ASIA_SESSION", now)
         .await
         .unwrap()
@@ -390,12 +390,11 @@ async fn sts_session_lands_in_root_with_parent_chain_and_expiry() {
     )
     .await
     .unwrap();
-    let view = HotView::load(&*fx.control).await.unwrap().capture();
+    let view = HotView::load(fx.control.as_ref()).await.unwrap().capture();
     assert_eq!(
         ControlAuth::key_auth(&view, "ASIA_ORPHAN", now)
             .await
             .unwrap(),
         KeyLookup::Invalid
     );
-
 }

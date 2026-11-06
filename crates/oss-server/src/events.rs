@@ -580,9 +580,9 @@ impl SqlEventSink {
             let enqueued = self
                 .db
                 .object_local_write("events", move |txn| {
-                    Box::pin(async move {
-                        txn.event_enqueue(&bucket_s, &target, &payload, now()).await
-                    })
+                    Box::pin(
+                        async move { txn.event_enqueue(&bucket_s, &target, &payload, now()).await },
+                    )
                 })
                 .await
                 .map_err(|e| ControlError::Backend(e.to_string()));
@@ -1294,13 +1294,7 @@ mod tests {
         let failure = NotifyFailure::retryable("connection refused");
         assert!(
             backend
-                .requeue_or_bury(
-                    row.id,
-                    row.claimed_at,
-                    3,
-                    &failure,
-                    t0 - backoff_secs(3)
-                )
+                .requeue_or_bury(row.id, row.claimed_at, 3, &failure, t0 - backoff_secs(3))
                 .await
         );
         let crashed = backend.claim(t0).await.unwrap().remove(0);

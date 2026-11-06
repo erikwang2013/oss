@@ -118,4 +118,3 @@ pub(super) async fn apply(
     write_ledger(txn, account, used, count).await?;
     Ok(Some(ControlResponse::Ok))
 }
-

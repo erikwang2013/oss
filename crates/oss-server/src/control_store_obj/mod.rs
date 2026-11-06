@@ -31,7 +31,6 @@ mod jobs_snapshot;
 mod jobs_write;
 mod lifecycle;
 mod local_ops;
-pub(crate) mod migrate_support;
 mod origin;
 mod repl_outbox;
 mod root_io;
@@ -52,7 +51,6 @@ pub use ap_olap::{AccessPointStore, AccessPointTxn};
 // Row shapes are re-exported for the generation-tagged read view (C2); the
 // domain modules themselves stay private.
 pub(crate) use account::{AccountRow, LedgerRow, MemberRow};
-pub(crate) use account_write::{install_member, put_account};
 pub(crate) use bucket::{BucketRow, decode_row, encode_row, key1, txn_scan_all};
 pub(crate) use bucket_write::bucket_clear_owner;
 pub(crate) use iam::{
@@ -60,7 +58,6 @@ pub(crate) use iam::{
 };
 pub(crate) use iam_write::insert_access_key;
 pub use inventory::BucketDomainCleanup;
-pub(crate) use migrate_support::{StoredDeleteIntent, StoredWriteIntent};
 pub use origin::WriteOrigin;
 #[cfg(test)]
 pub(crate) use root_io::{CRASH_AFTER_ROOT_CAS, CRASH_BEFORE_ROOT_CAS, CrashIo};

@@ -255,7 +255,6 @@ impl IamStore for ObjectControlStore {
     }
 
     async fn permissions_for_user(&self, uid: i64) -> Result<Vec<PermissionRow>, ControlError> {
-
         let txn = self
             .begin(WriteOrigin::local("read"))
             .await

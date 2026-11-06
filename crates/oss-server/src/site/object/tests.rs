@@ -416,7 +416,7 @@ async fn duplicate_peer_seq_is_idempotent() {
         serde_json::json!({"username": "x"}),
         100,
     );
-    apply(&fx, &[bad.clone()]).await;
+    apply(&fx, std::slice::from_ref(&bad)).await;
     apply(&fx, &[bad]).await;
     assert_eq!(fx.local.dead("remote-b").unwrap().count().unwrap(), 1);
 }

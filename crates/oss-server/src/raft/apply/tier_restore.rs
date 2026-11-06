@@ -45,4 +45,3 @@ pub(crate) async fn delete(
         .await?;
     Ok(ControlResponse::Ok)
 }
-

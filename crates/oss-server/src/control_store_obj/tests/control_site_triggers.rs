@@ -307,7 +307,7 @@ async fn cell(case: &str, ent: Ent, op: Op) {
     let (entity_name, clock_id) = (entity(ent), id.clone());
     run_hook(&real, move |txn| {
         Box::pin(async move {
-            txn.site_put_clock(&entity_name, &clock_id, future, 9, "remote-z", 1)
+            txn.site_put_clock(entity_name, clock_id.as_str(), future, 9, "remote-z", 1)
                 .await
         })
     })

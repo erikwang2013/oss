@@ -166,8 +166,8 @@ async fn audit_filters_by_time_identity_resource_and_op() {
         (400, 2, "GetObject", "b1", "other/d.txt", "allow"),
     ]
     .into_iter()
-    .map(|(ts, uid, op, bucket, key, decision)| {
-        xl_store::control_store::audit::NewAuditRecord {
+    .map(
+        |(ts, uid, op, bucket, key, decision)| xl_store::control_store::audit::NewAuditRecord {
             ts,
             uid,
             op: op.into(),
@@ -175,8 +175,8 @@ async fn audit_filters_by_time_identity_resource_and_op() {
             object_key: Some(key.into()),
             decision: decision.into(),
             detail: None,
-        }
-    })
+        },
+    )
     .collect();
     st.db
         .object_local_write("policy-audit-seed", move |txn| {

@@ -169,7 +169,7 @@ async fn memory_cap_fails_closed() {
 async fn random_put(t: &mut ObjectControlTxn, s: &mut u64) {
     let uid = (lcg(s) % 5) as i64 + 1;
     let bucket_name = format!("b{}", lcg(s) % 5);
-    let status = if lcg(s) % 3 == 0 {
+    let status = if lcg(s).is_multiple_of(3) {
         "disabled"
     } else {
         "active"
@@ -179,14 +179,18 @@ async fn random_put(t: &mut ObjectControlTxn, s: &mut u64) {
             let row = user(
                 uid,
                 &format!("u{uid}"),
-                lcg(s) % 4 == 0,
-                if lcg(s) % 4 == 0 { "disabled" } else { status },
+                lcg(s).is_multiple_of(4),
+                if lcg(s).is_multiple_of(4) {
+                    "disabled"
+                } else {
+                    status
+                },
             );
             put(t, TableId::Users, &uid_key(uid), &row).await;
         }
         1 => {
             let ak = format!("k{}", lcg(s) % 5);
-            let kind = if lcg(s) % 2 == 0 {
+            let kind = if lcg(s).is_multiple_of(2) {
                 "long-term"
             } else {
                 "session"
@@ -195,15 +199,19 @@ async fn random_put(t: &mut ObjectControlTxn, s: &mut u64) {
                 access_key: ak.clone(),
                 secret_key: format!("enc:v1:s{}", lcg(s) % 7),
                 user_id: uid,
-                status: if lcg(s) % 4 == 0 {
+                status: if lcg(s).is_multiple_of(4) {
                     "inactive".into()
                 } else {
                     "active".into()
                 },
-                expires_at: if lcg(s) % 5 == 0 { Some(50) } else { None },
+                expires_at: if lcg(s).is_multiple_of(5) {
+                    Some(50)
+                } else {
+                    None
+                },
                 created_at: 1,
                 parent_ak: (kind == "session").then(|| format!("k{}", lcg(s) % 5)),
-                session_policy: (lcg(s) % 3 == 0).then(|| POLICY_JSON.to_string()),
+                session_policy: (lcg(s).is_multiple_of(3)).then(|| POLICY_JSON.to_string()),
                 kind: kind.into(),
             };
             put(t, TableId::AccessKeys, ak.as_bytes(), &row).await;
@@ -212,14 +220,14 @@ async fn random_put(t: &mut ObjectControlTxn, s: &mut u64) {
             let row = perm(
                 uid,
                 &bucket_name,
-                lcg(s) % 2 == 0,
-                lcg(s) % 2 == 0,
-                lcg(s) % 2 == 0,
+                lcg(s).is_multiple_of(2),
+                lcg(s).is_multiple_of(2),
+                lcg(s).is_multiple_of(2),
             );
             put(t, TableId::Permissions, bucket_name.as_bytes(), &row).await;
         }
         3 => {
-            let id = if lcg(s) % 2 == 0 {
+            let id = if lcg(s).is_multiple_of(2) {
                 format!("{uid:012}")
             } else {
                 format!("acct{}", lcg(s) % 3)
@@ -227,14 +235,14 @@ async fn random_put(t: &mut ObjectControlTxn, s: &mut u64) {
             let row = account(
                 &id,
                 status,
-                (lcg(s) % 3 == 0).then(|| lcg(s) as i64 % 3),
-                (lcg(s) % 3 == 0).then_some(1000),
+                (lcg(s).is_multiple_of(3)).then(|| lcg(s) as i64 % 3),
+                (lcg(s).is_multiple_of(3)).then_some(1000),
                 None,
             );
             put(t, TableId::Accounts, id.as_bytes(), &row).await;
         }
         4 => {
-            let id = if lcg(s) % 2 == 0 {
+            let id = if lcg(s).is_multiple_of(2) {
                 format!("{uid:012}")
             } else {
                 format!("acct{}", lcg(s) % 3)
@@ -252,13 +260,24 @@ async fn random_put(t: &mut ObjectControlTxn, s: &mut u64) {
             .await;
         }
         6 => {
-            let mut b = bucket(&bucket_name, (lcg(s) % 3 != 0).then_some(uid));
-            b.versioning = if lcg(s) % 2 == 0 { "Enabled" } else { "Off" }.into();
-            b.object_lock = lcg(s) % 2 == 0;
-            b.default_encryption = (lcg(s) % 2 == 0).then(|| "AES256".to_string());
-            b.object_lock_default_mode = (lcg(s) % 2 == 0).then(|| "GOVERNANCE".to_string());
-            b.object_lock_default_days = (lcg(s) % 2 == 0).then_some(7);
-            b.replication_mode = if lcg(s) % 2 == 0 { "sync" } else { "async" }.into();
+            let mut b = bucket(&bucket_name, (!lcg(s).is_multiple_of(3)).then_some(uid));
+            b.versioning = if lcg(s).is_multiple_of(2) {
+                "Enabled"
+            } else {
+                "Off"
+            }
+            .into();
+            b.object_lock = lcg(s).is_multiple_of(2);
+            b.default_encryption = (lcg(s).is_multiple_of(2)).then(|| "AES256".to_string());
+            b.object_lock_default_mode =
+                (lcg(s).is_multiple_of(2)).then(|| "GOVERNANCE".to_string());
+            b.object_lock_default_days = (lcg(s).is_multiple_of(2)).then_some(7);
+            b.replication_mode = if lcg(s).is_multiple_of(2) {
+                "sync"
+            } else {
+                "async"
+            }
+            .into();
             put(t, TableId::Buckets, bucket_name.as_bytes(), &b).await;
         }
         7 => {
@@ -284,7 +303,7 @@ async fn random_put(t: &mut ObjectControlTxn, s: &mut u64) {
             let row = StoredAp {
                 name: name.clone(),
                 bucket: bucket_name,
-                owner_id: if lcg(s) % 3 == 0 { 0 } else { uid },
+                owner_id: if lcg(s).is_multiple_of(3) { 0 } else { uid },
                 policy_json: None,
                 created_at: 1,
                 updated_at: 1,
@@ -378,7 +397,7 @@ async fn published_cache_equals_fresh_scan_after_random_transactions() {
     for i in 0..30 {
         let mut t = txn(&fx).await;
         for _ in 0..1 + lcg(&mut seed) % 4 {
-            if lcg(&mut seed) % 5 == 0 {
+            if lcg(&mut seed).is_multiple_of(5) {
                 random_delete(&mut t, &mut seed).await;
             } else {
                 random_put(&mut t, &mut seed).await;

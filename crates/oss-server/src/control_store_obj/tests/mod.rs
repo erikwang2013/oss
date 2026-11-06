@@ -12,8 +12,7 @@ mod control_site_triggers_extras;
 mod crash;
 mod db_facade;
 mod db_object;
-#[path = "../../../tests/support/golden.rs"]
-mod golden;
+use crate::test_support::golden;
 mod hooks_wired;
 mod site_common;
 mod support;

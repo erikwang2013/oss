@@ -25,7 +25,6 @@ fn config_path(dir: &Path) -> PathBuf {
 listen = "127.0.0.1:0"
 data_dir = "{data}"
 staging_dir = "{staging}"
-database_url = "sqlite://{db}?mode=rwc"
 jwt_secret = "{JWT_SECRET}"
 
 [server]
@@ -37,7 +36,6 @@ region = "us-east-1"
 "#,
         data = dir.join("data").display(),
         staging = dir.join("staging").display(),
-        db = dir.join("oss.db").display(),
     );
     let path = dir.join("oss.toml");
     std::fs::write(&path, text).unwrap();

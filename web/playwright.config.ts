@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { defineConfig } from '@playwright/test'
 
-// 独立临时数据目录/DB：不读写开发者的 ./data 与 ./oss.db。后端只接受配置文件，
+// 独立临时数据目录：不读写开发者的 ./data。后端只接受配置文件，
 // 故生成一份临时 oss.toml（分组映射 file→files / image→images 与控制台用例一致）。
 const e2eRoot = mkdtempSync(join(tmpdir(), 'oss-web-e2e-'))
 const e2eConfig = join(e2eRoot, 'oss.toml')
@@ -14,7 +14,6 @@ writeFileSync(
 listen = "127.0.0.1:9000"
 data_dir = ${q(join(e2eRoot, 'data'))}
 staging_dir = ${q(join(e2eRoot, 'staging'))}
-database_url = "sqlite://${join(e2eRoot, 'oss.db')}?mode=rwc"
 jwt_secret = "web-e2e-only-jwt-secret-0123456789abcdef"
 max_put_bytes = 268435456
 

@@ -42,15 +42,13 @@ jobs:
         run: echo "Cargo.toml 尚未存在（规划阶段），跳过 Rust 检查"
 
   no-db-guard:
-    # TODO(H1): 移除 continue-on-error、去掉 no-db 标签门槛并加入 push/pull_request
-    # 触发；SQLite 删除前该守卫按设计报告当前存量，不能把 CI 变红。
-    continue-on-error: true
-    if: github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'no-db')
+    # H1/H2: blocking gate. Rejects sqlx/SQLite code, connection strings,
+    # migrations and legacy control/witness database filenames.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: No-database guard（H1 前仅报告）
+      - name: No-database guard
         run: scripts/check_no_db.sh
 
   web:

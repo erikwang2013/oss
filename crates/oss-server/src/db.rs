@@ -3,20 +3,15 @@
 use serde::Serialize;
 
 use crate::raft::FencingEpoch;
-use xl_store::control_store::account::AccountTxn;
-use xl_store::control_store::bucket::BucketTxn;
 use xl_store::control_store::event_outbox::EventOutboxTxn;
-use xl_store::control_store::iam::{IamTxn, PermissionRow as IamPermissionRow};
+use xl_store::control_store::iam::PermissionRow as IamPermissionRow;
 use xl_store::control_store::inventory::{
     InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
-    InventoryTxn,
 };
-use xl_store::control_store::jobs::{JobTxn, NewJob as JobInsert, NewTask as JobTaskInsert};
-use xl_store::control_store::lifecycle::LifecycleTxn;
+use xl_store::control_store::jobs::{NewJob as JobInsert, NewTask as JobTaskInsert};
 use xl_store::control_store::repl_outbox::ReplOutboxTxn;
 use xl_store::control_store::sites::{SitePeerRow, SiteTxn};
-use xl_store::control_store::tier::{TierRestoreRow, TierTxn};
-use xl_store::control_store::uploads::{NewUpload, UploadTxn};
+use xl_store::control_store::tier::TierRestoreRow;
 use xl_store::control_store::{AccessPointEntry, ControlTxn, OlapConfigEntry, OwnerRef};
 
 /// Backend-neutral control-plane error (H1: no SQLite error type survives).
@@ -476,7 +471,7 @@ impl Db {
             .site_identity()
             .await
             .map_err(crate::db::to_db)?
-            .ok_or_else(|| crate::db::DbError::RowNotFound)?;
+            .ok_or(crate::db::DbError::RowNotFound)?;
         Ok(SiteIdentity {
             id: r.id,
             name: r.name,
@@ -608,7 +603,7 @@ impl Db {
                 let _ = dead.delete();
             }
         }
-        return Ok(Some(affected));
+        Ok(Some(affected))
     }
 
     pub async fn update_site_ping(
@@ -725,12 +720,14 @@ impl Db {
         let out = f(&mut txn).await;
         match out {
             Ok(value) => {
-                txn.commit()
-                    .await
-                    .map_err(|e| crate::db::DbError::Protocol(format!("对象控制面提交失败：{e}")))?;
+                txn.commit().await.map_err(|e| {
+                    crate::db::DbError::Protocol(format!("对象控制面提交失败：{e}"))
+                })?;
                 Ok(value)
             }
-            Err(e) => Err(crate::db::DbError::Protocol(format!("对象控制面本地写失败：{e}"))),
+            Err(e) => Err(crate::db::DbError::Protocol(format!(
+                "对象控制面本地写失败：{e}"
+            ))),
         }
     }
 
@@ -739,10 +736,7 @@ impl Db {
     pub async fn owner_uid(&self, owner: &OwnerRef) -> Result<i64> {
         let store = self.control_store();
         let id = match owner {
-            OwnerRef::Admin => store
-                .admin_id()
-                .await
-                .map_err(crate::db::to_db)?,
+            OwnerRef::Admin => store.admin_id().await.map_err(crate::db::to_db)?,
             OwnerRef::User(name) => store
                 .user(name)
                 .await
@@ -780,14 +774,8 @@ impl Db {
                         .user_create_default_status(&username, &hash, is_admin, now())
                         .await?;
                     if !is_admin && let Some(acct) = xl_s3::access::account_id_of(id) {
-                        txn.account_insert_derived_if_absent(
-                            &acct,
-                            &username,
-                            id,
-                            now(),
-                            now(),
-                        )
-                        .await?;
+                        txn.account_insert_derived_if_absent(&acct, &username, id, now(), now())
+                            .await?;
                         txn.account_member_insert_if_absent(&acct, id, "owner", now())
                             .await?;
                     }
@@ -1037,9 +1025,7 @@ impl Db {
         return self
             .control_write("console", move |txn| {
                 let name = name.clone();
-                Box::pin(
-                    async move { txn.bucket_set_deleting(&name, deleting).await.map(|_| ()) },
-                )
+                Box::pin(async move { txn.bucket_set_deleting(&name, deleting).await.map(|_| ()) })
             })
             .await;
     }
@@ -1131,7 +1117,7 @@ impl Db {
         etag: &str,
     ) -> Result<()> {
         let uploads = self.object_uploads()?;
-        return uploads
+        uploads
             .put_if_absent(&crate::local_store::UploadRecord {
                 saved_path: saved_path.to_string(),
                 bucket: bucket.to_string(),
@@ -1145,7 +1131,7 @@ impl Db {
                 expires_at: None,
             })
             .map(|_| ())
-            .map_err(crate::db::DbError::Io);
+            .map_err(crate::db::DbError::Io)
     }
 
     /// 登记上传的 `original_name` 与归属（规格 §5.4）。
@@ -1169,7 +1155,7 @@ impl Db {
         record.original_name = Some(original_name.to_string());
         record.owner_uid = Some(owner_id);
         uploads.put(&record).map_err(crate::db::DbError::Io)?;
-        return Ok(true);
+        Ok(true)
     }
 
     /// 记录对应的桶（登记前判权用；记录不存在 → None）。
@@ -1377,7 +1363,7 @@ impl Db {
                 }
             }
         }
-        return Ok(deleted);
+        Ok(deleted)
     }
 
     // ---- AC-0：多租户账户（standalone 直写；Raft 经 ControlCommand apply）----
@@ -1540,9 +1526,9 @@ impl Db {
                 return Ok(id);
             }
         }
-        return Err(crate::db::DbError::Protocol(
+        Err(crate::db::DbError::Protocol(
             "account id generation collision (retry)".into(),
-        ));
+        ))
     }
 
     pub async fn rename_account(&self, id: &str, name: &str) -> Result<bool> {
@@ -1740,7 +1726,7 @@ impl Db {
         }
         record.owner_uid = Some(uid);
         uploads.put(&record).map_err(crate::db::DbError::Io)?;
-        return Ok(true);
+        Ok(true)
     }
 
     /// 某用户自己的上传记录（子账户视野）。
@@ -2972,9 +2958,7 @@ impl Db {
         let (term, leader) = (fence.term_i64(), fence.leader_i64());
         return self
             .control_write("inventory", move |txn| {
-                Box::pin(
-                    async move { txn.inventory_run_started(run_id, now, term, leader).await },
-                )
+                Box::pin(async move { txn.inventory_run_started(run_id, now, term, leader).await })
             })
             .await;
     }
@@ -3199,4 +3183,3 @@ pub struct AuditFilter<'a> {
     pub bucket: Option<&'a str>,
     pub key_prefix: Option<&'a str>,
 }
-

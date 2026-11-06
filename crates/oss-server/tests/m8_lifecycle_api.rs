@@ -411,12 +411,7 @@ async fn sweep_transitions_enqueues_and_dedupes() {
     let jobs = st.db.list_jobs(10).await.unwrap();
     assert_eq!(jobs.len(), 1);
     let job_id = jobs[0]["id"].as_i64().unwrap();
-    let rows = st
-        .db
-        .control_store()
-        .job_tasks(job_id)
-        .await
-        .unwrap();
+    let rows = st.db.control_store().job_tasks(job_id).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].action, "Transition");
     assert_eq!(
@@ -428,7 +423,12 @@ async fn sweep_transitions_enqueues_and_dedupes() {
     assert_eq!(payload["version_id"], a.version_id.unwrap());
 
     // C7：任务终态清空 dedupe_key，同键可再次入队。
-    let claim = st.db.claim_task(0, 3600).await.unwrap().unwrap();
+    let claim = st
+        .db
+        .claim_task(4_000_000_000, 3600)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(claim.job_id, job_id);
     st.db
         .finish_task(claim.job_id, claim.task_no, true, "ok", None, 0, 3)

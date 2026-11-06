@@ -16,7 +16,7 @@ use super::super::data;
 use super::ObjectStateMachine;
 use super::snapshot_tests::{build, golden, install, meta, seed_admin};
 use crate::control_store_obj::{
-    CRASH_AFTER_ROOT_CAS, CRASH_BEFORE_ROOT_CAS, CrashIo, ObjectControlStore, RootIo, WriteOrigin,
+    CRASH_AFTER_ROOT_CAS, CRASH_BEFORE_ROOT_CAS, CrashIo, ObjectControlStore, WriteOrigin,
 };
 use crate::local_store::LocalStore;
 

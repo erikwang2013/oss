@@ -1,8 +1,7 @@
 //! S7.1：witness 运行时（`oss-server witness --config <w.toml>`）。
 //!
 //! witness 只有控制面：文件 Raft 日志 + 元数据状态机 + `/api/v1/site/raft/*` HTTP。
-//! 无 `AppState`、无 JWT、无 `[site]`/数据目录/S3 面；F2 起不再打开 SQLite（`state_db`
-//! 只作为旧库迁移输入保留）。
+//! 无 `AppState`、无 JWT、无 `[site]`/数据目录/S3 面；不再打开或创建 SQLite 状态库。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -42,9 +41,6 @@ pub async fn run(config_path: &Path) -> Result<i32, Box<dyn std::error::Error + 
 async fn start(
     cfg: &WitnessToml,
 ) -> Result<(Arc<RaftHandle>, Arc<crate::tls::Tls>), Box<dyn std::error::Error + Send + Sync>> {
-    if cfg.raft.state_db.is_some() {
-        tracing::warn!("witness [raft].state_db 仅作为旧库迁移输入保留；本进程不打开 SQLite");
-    }
     let settings =
         RaftSettings::from_toml(&cfg.raft).map_err(|e| format!("[raft] 配置非法: {e}"))?;
     if let Some(dir) = settings
@@ -101,10 +97,8 @@ bootstrap = false
 advertise_endpoint = "http://127.0.0.1:1"
 cluster_token = "witness-token"
 db_path = "{}"
-state_db = "{}"
 "#,
                 dir.path().join("raft.db").display(),
-                dir.path().join("state.db").display(),
             ),
         )
         .unwrap();
@@ -112,8 +106,8 @@ state_db = "{}"
         let (handle, _tls) = start(&cfg).await.unwrap();
         assert!(!handle.membership_nonempty());
 
-        // F2：状态在 `<db_path>.d/witness/state`；旧 state_db 不再打开。
-        assert!(!dir.path().join("state.db").exists(), "state_db 不得被打开");
+        // F2：状态在 `<db_path>.d/witness/state`；不再有 SQLite 状态库。
+        assert!(!dir.path().join("state.db").exists(), "不得创建 state.db");
         let state_path = dir.path().join("raft.db.d").join("witness").join("state");
         let state: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();

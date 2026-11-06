@@ -85,48 +85,25 @@ async fn state_with_targets_max(
     max_put_bytes: usize,
     maintenance: bool,
 ) -> AppState {
-    state_with_db_url(
-        dir,
-        site,
-        tiers,
-        max_put_bytes,
-        maintenance,
-        "sqlite::memory:".into(),
-        vec![],
-    )
-    .await
+    state_with_db_url(dir, site, tiers, max_put_bytes, maintenance, vec![]).await
 }
 
 /// JWT 轮换测试用：`jwt_secret` 仍为 [`JWT_SECRET`]，另配一组旧密钥。
 #[allow(dead_code)]
 pub async fn state_with_previous_secrets(dir: &std::path::Path, previous: Vec<String>) -> AppState {
-    state_with_db_url(
-        dir,
-        None,
-        vec![],
-        1024 * 1024,
-        false,
-        "sqlite::memory:".into(),
-        previous,
-    )
-    .await
+    state_with_db_url(dir, None, vec![], 1024 * 1024, false, previous).await
 }
 
-/// AC-2 并发建桶用例：真实文件库（WAL + busy_timeout）。内存 shared-cache 库在并发
-/// `BEGIN IMMEDIATE` 下以 `SQLITE_LOCKED` 立即失败，不能用来验证写锁排队语义。
+/// Legacy alias: tests that needed a file-backed DB now use the object root.
 #[allow(dead_code)]
 pub async fn state_with_file_db(dir: &std::path::Path) -> AppState {
-    let url = format!("sqlite://{}?mode=rwc", dir.join("control.db").display());
-    state_with_db_url(dir, None, vec![], 1024 * 1024, false, url, vec![]).await
+    state_with_db_url(dir, None, vec![], 1024 * 1024, false, vec![]).await
 }
 
-/// 长跑用例专用：文件库。`sqlite::memory:` 是命名共享缓存内存库，sqlx 默认
-/// `idle_timeout=600s` 回收最后一个连接后库即销毁；高负载下单用例 >600s 不碰 DB，
-/// 后续访问报 `no such table`。文件库在连接重建后 schema 仍在（不改生产默认值）。
+/// Legacy alias for long-running tests; the object root has no connection lifetime.
 #[allow(dead_code)]
 pub async fn state_with_tiers_file_db(dir: &std::path::Path, tiers: Vec<TierTarget>) -> AppState {
-    let url = format!("sqlite://{}?mode=rwc", dir.join("test.db").display());
-    state_with_db_url(dir, None, tiers, 1024 * 1024, false, url, vec![]).await
+    state_with_db_url(dir, None, tiers, 1024 * 1024, false, vec![]).await
 }
 
 async fn state_with_db_url(
@@ -135,7 +112,6 @@ async fn state_with_db_url(
     tiers: Vec<TierTarget>,
     max_put_bytes: usize,
     maintenance: bool,
-    database_url: String,
     jwt_previous_secrets: Vec<String>,
 ) -> AppState {
     let mut cfg = AppConfig {
@@ -146,7 +122,6 @@ async fn state_with_db_url(
         maintenance,
         read_only: false,
         staging_dir: dir.join("staging"),
-        database_url,
         jwt_secret: JWT_SECRET.into(),
         jwt_previous_secrets,
         max_put_bytes,
@@ -172,9 +147,13 @@ async fn state_with_db_url(
     };
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();
-    // H1：对象控制面是唯一后端；测试统一跑对象根（`database_url` 仅为兼容字段保留）。
     cfg.server.control_backend = oss_server::config::ControlBackend::Objects;
-    let store = Arc::new(Store::open(StoreConfig::new(&cfg.data_dir)).await.unwrap());
+    // Tests exercise semantics, not power-loss durability: object control commits
+    // do several fsyncs each, which makes the 1000-task job tests take tens of
+    // minutes in debug builds. Crash/durability matrices use their own stores.
+    let mut store_cfg = StoreConfig::new(&cfg.data_dir);
+    store_cfg.fsync = false;
+    let store = Arc::new(Store::open(store_cfg).await.unwrap());
     let db = Db::connect_object().await.unwrap();
     let object = oss_server::control_backend::ObjectControl::open(
         Arc::clone(&store),

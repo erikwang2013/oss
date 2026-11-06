@@ -790,11 +790,18 @@ async fn preempted_job_surfaces_as_runtime_state_not_failure() {
                 kind: "batch".into(),
                 bucket: "src".into(),
                 requested_by: Some(admin_uid),
-                tasks: vec![NewJobTask {
-                    action: "Copy".into(),
-                    payload: "{}".into(),
-                    dedupe_key: None,
-                }],
+                tasks: vec![
+                    NewJobTask {
+                        action: "Copy".into(),
+                        payload: "{}".into(),
+                        dedupe_key: None,
+                    },
+                    NewJobTask {
+                        action: "Copy".into(),
+                        payload: "{}".into(),
+                        dedupe_key: None,
+                    },
+                ],
                 ..Default::default()
             },
             1000,
@@ -855,7 +862,7 @@ async fn preempted_job_surfaces_as_runtime_state_not_failure() {
     assert_eq!(detail["job"]["state"], "preempted");
     assert_eq!(detail["job"]["failed"], 0);
     assert!(detail["job"]["finished_at"].is_null());
-    assert_eq!(detail["job"]["started_at"], 1001);
+    assert_eq!(detail["job"]["started_at"], 1000);
 }
 
 /// M8 S1：访问点 CRUD/策略 API（owner/admin、严格策略 400、缓存同步）。
@@ -2046,10 +2053,11 @@ async fn dead_letter_list_and_redeliver() {
             .is_empty(),
         "重投后不得留在死信列表"
     );
+    let future = 4_000_000_000i64;
     let claims = st
         .db
-        .control_write("console-dead-redeliver-check", |txn| {
-            Box::pin(async move { txn.event_claim(2, 100).await })
+        .control_write("console-dead-redeliver-check", move |txn| {
+            Box::pin(async move { txn.event_claim(future, 100).await })
         })
         .await
         .unwrap();
@@ -2058,7 +2066,7 @@ async fn dead_letter_list_and_redeliver() {
         .find(|c| c.event_json.contains("ObjectCreated"))
         .expect("redelivered event is pending");
     assert_eq!(revived.attempts, 0);
-    assert_eq!(revived.claimed_at, Some(2));
+    assert_eq!(revived.claimed_at, Some(future));
 
     // 二次重投（已不是 dead）→ 404
     let r = client

@@ -20,7 +20,6 @@ use xl_s3::events::EventSink as _;
 use xl_s3::sync_delete::SyncDeleteSink as _;
 use xl_store::control_store::OwnerRef;
 use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry};
-use xl_store::control_store::repl_outbox::ReplOutboxStore;
 use xl_store::store::VersioningMode;
 
 use crate::state::AppState;

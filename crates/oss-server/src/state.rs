@@ -92,6 +92,50 @@ pub struct AppState {
     pub control_view: Option<Arc<crate::control_view::ViewCache>>,
 }
 
+/// Synchronous audit fallback: writes one row through the control seam when the
+/// async audit queue is not installed (tests, offline commands, job workers).
+pub struct DbAuditFallback {
+    db: Arc<Db>,
+}
+
+impl DbAuditFallback {
+    pub fn new(db: Arc<Db>) -> Self {
+        Self { db }
+    }
+}
+
+#[async_trait::async_trait]
+impl xl_s3::access::AuditFallback for DbAuditFallback {
+    #[allow(clippy::too_many_arguments)]
+    async fn write_audit(
+        &self,
+        uid: i64,
+        op: &str,
+        bucket: Option<&str>,
+        object_key: Option<&str>,
+        decision: &str,
+        detail: Option<&str>,
+    ) -> Result<(), xl_store::control_store::ControlError> {
+        use xl_store::control_store::audit::{AuditTxn, NewAuditRecord};
+        let row = NewAuditRecord {
+            ts: crate::db::now(),
+            uid,
+            op: op.to_owned(),
+            bucket: bucket.map(str::to_owned),
+            object_key: object_key.map(str::to_owned),
+            decision: decision.to_owned(),
+            detail: detail.map(str::to_owned),
+        };
+        self.db
+            .object_local_write("audit", move |txn| {
+                Box::pin(async move { txn.audit_insert_batch(&[row]).await })
+            })
+            .await
+            .map_err(|e| xl_store::control_store::ControlError::Backend(e.to_string()))?;
+        Ok(())
+    }
+}
+
 /// M8 S0/S1：删桶清理的跨 crate 实现（Db 清表 + AP 缓存失效）。
 pub struct SqlBucketCleanup {
     db: Arc<Db>,
@@ -487,7 +531,7 @@ impl AppState {
         }
 
         // M9 H3/H5：Raft 模式下桶/行以日志为事实源，不得做本地对账回填。
-        let raft_enabled = cfg.raft.is_some();
+        let _raft_enabled = cfg.raft.is_some();
 
         // M1 还没有注册界面：用环境变量引导出第一个管理员（幂等，已存在则跳过）。
         // 口令来源：OSS_ADMIN_PASSWORD 非空优先；空/缺时用密钥文件解析值（配了
@@ -637,14 +681,15 @@ impl AppState {
             .with_writes(self.acl_writes());
         if let Some(view) = &self.control_view {
             // Background workers/jobs run outside the request-scoped task-local;
-            // give them a captured generation as the read fallback.
-            acl = acl.with_control(Arc::new(view.capture()));
+            // capture a fresh generation per read.
+            let view = Arc::clone(view);
+            acl = acl.with_control_provider(Arc::new(move || Arc::new(view.capture())));
         }
-        let sink = self
-            .audit
-            .clone()
-            .map(|q| q as Arc<dyn xl_s3::access::AuditSink>);
-        acl.with_audit_sink(sink)
+        if let Some(q) = self.audit.clone() {
+            acl.with_audit_sink(Some(q as Arc<dyn xl_s3::access::AuditSink>))
+        } else {
+            acl.with_audit_fallback(Arc::new(DbAuditFallback::new(Arc::clone(&self.db))))
+        }
     }
 
     /// M8 S6：控制面写操作审计（best-effort——落行失败只 warn，绝不改变动作结果）。
@@ -819,10 +864,7 @@ impl AppState {
         // M6 切片 0/1：事件接收方（worker 在 serve 路径挂载；Kafka 目标优先，否则 env 文件 sink）
         let notifier =
             crate::events::notifier_from_config_tls(&cfg.kafka.targets, Arc::clone(&tls));
-        let events = Arc::new(crate::events::SqlEventSink::new(
-            Arc::clone(&db),
-            notifier,
-        ));
+        let events = Arc::new(crate::events::SqlEventSink::new(Arc::clone(&db), notifier));
         // M9 S6：门面与副作用执行器共享同一批 Arc；Raft 句柄来自 load。
         // 先于共享存储构造——S6c 起它们的控制写要经同一门面。
         let control = Arc::new(match &raft {
@@ -894,7 +936,12 @@ impl AppState {
         let tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink> =
             Arc::new(crate::tier::S3TierGc::new(Arc::clone(&tiers)));
         // M8 S5：Inventory 配置存储与执行器（共用三面判权实例语义）。
-        let inv_acl = xl_s3::access::Acl::new();
+        // Background inventory runs outside a request scope; use the captured view.
+        let mut inv_acl = xl_s3::access::Acl::new();
+        if let Some(object) = db.object_control() {
+            let view = Arc::clone(&object.view);
+            inv_acl = inv_acl.with_control_provider(Arc::new(move || Arc::new(view.capture())));
+        }
         let inventory: Arc<dyn xl_s3::inventory::InventoryStore> = Arc::new(
             crate::inventory_store::SqlInventoryStore::new(Arc::clone(&db), inv_acl.clone())
                 .with_control(Arc::clone(&control)),

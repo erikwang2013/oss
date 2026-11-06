@@ -1,7 +1,6 @@
 //! sync_write_intents / sync_delete_intents 域的行类型与后端中立 trait。
 //!
-//! 写路径的 `PRAGMA synchronous = FULL` 仍由调用方在同一连接上执行（落盘保证），
-//! 适配器只执行 SQL，不 begin/commit/rollback。
+//! 落盘保证由节点本地存储提供；适配器只读写行，不持有事务边界。
 
 use super::ControlError;
 

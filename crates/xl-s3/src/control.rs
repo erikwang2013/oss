@@ -1,9 +1,8 @@
 //! Backend-neutral hot-read seam for SigV4 auth, STS and ACL evaluation (C2/D7).
 //!
-//! The traits expose only point lookups and the exact predicates the SQLite
-//! statements use today; callers never see a `SqlitePool`. Implementations are
-//! supplied by the server (the object-root hot view) and must keep the documented
-//! fail-closed semantics.
+//! The traits expose only point lookups and the documented fail-closed
+//! predicates. Implementations are supplied by the server (the object-root hot
+//! view or a captured generation for background work).
 
 use std::future::Future;
 use std::sync::Arc;
@@ -140,9 +139,9 @@ pub trait ControlAcl: Send + Sync {
     async fn site_peer_count(&self) -> Result<usize, ControlError>;
 }
 
-/// Bucket writes reached from `service.rs`/console. The server supplies an
-/// object-backend implementation; without one (`None`) `Acl` keeps its SQLite
-/// SQL byte for byte. Failure maps to the same `sqlx::Error` channel as reads.
+/// Bucket writes reached from `service.rs`/console. The server supplies the
+/// object-backend implementation; without one (`None`) writes fail closed.
+/// Failure maps to the same `ControlError` channel as reads.
 #[async_trait::async_trait]
 pub trait AclWrites: Send + Sync {
     async fn enable_bucket_lock(&self, bucket: &str) -> Result<(), ControlError>;

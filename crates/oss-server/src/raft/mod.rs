@@ -1076,9 +1076,7 @@ mod tests {
         let control = object_control(dir.path()).await;
         let mut settings = test_settings(dir.path());
         settings.feature_level = 3;
-        let handle = spawn_object(settings, control, None, None)
-            .await
-            .unwrap();
+        let handle = spawn_object(settings, control, None, None).await.unwrap();
         wait_leader(&handle).await;
         // 直接加一个不可达 learner（非阻塞）：只验证能力表，不验证复制。
         handle

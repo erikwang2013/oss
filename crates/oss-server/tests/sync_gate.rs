@@ -440,7 +440,6 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
         maintenance: false,
         read_only: false,
         staging_dir: datadir.path().join("staging"),
-        database_url: String::new(),
         jwt_secret: "0123456789abcdef0123456789abcdef".into(),
         jwt_previous_secrets: vec![],
         max_put_bytes: 1024 * 1024,

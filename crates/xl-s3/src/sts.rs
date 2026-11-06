@@ -168,14 +168,10 @@ impl StsRoute {
             .ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing RoleArn"))?;
         let role = parse_role_arn(&arn)
             .ok_or_else(|| s3s::s3_error!(InvalidRequest, "invalid RoleArn"))?;
-        let role_uid = self
-            .view()?
-            .active_user_uid(&role)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, role, "control view role lookup failed");
-                s3s::s3_error!(InternalError, "internal error")
-            })?;
+        let role_uid = self.view()?.active_user_uid(&role).await.map_err(|e| {
+            tracing::error!(error = %e, role, "control view role lookup failed");
+            s3s::s3_error!(InternalError, "internal error")
+        })?;
         let Some(role_uid) = role_uid else {
             return Err(s3s::s3_error!(AccessDenied, "role not found or disabled"));
         };

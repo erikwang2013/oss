@@ -1,13 +1,7 @@
 #!/usr/bin/env bash
-# H2 final no-database gate (pre-H1 build): every object-backed node must start
-# and serve without creating or opening SQLite state.
-#
-# Default mode runs the runtime gate against the current object backend. The
-# pre-H1 tree still needs a SQLite fixture to seed an admin/root (and still
-# links sqlx), so fixture seeding and the workspace guards are recorded as
-# PENDING-H1 instead of false green. Strict mode
-# (STRICT_NO_DB=1 or --require-no-sqlite) promotes every pending item to a
-# failure and runs the H1 guards; expect it to fail until H1.
+# H2 final no-database gate: fresh standalone/site/Raft/witness nodes must
+# start and serve without creating or opening any SQLite file. The object
+# control root is the only backend; sqlx and migrations are gone.
 #
 # Prereq: cargo build -p oss-server; aws-cli; curl; python3.
 # Usage: OSS_BIN=target/debug/oss-server tests/e2e_no_db.sh [--require-no-sqlite]
@@ -102,33 +96,30 @@ ck [ ! -e "$W/freshraft/no-sqlite" ]
 ck wait_leader "$P0" 1
 stop_pid "$S"
 
-# Fixture seeding is pre-H1 only. H1 replaces it with the archived seed DB.
-echo "== 2. standalone: SQLite seed -> object backend, S3/console smoke, kill -9 =="
+echo "== 2. fresh standalone: S3/console smoke, kill -9 =="
 P1=$(free_port)
-mkcfg standalone "$P1" standalone "" "" sqlite fixture.toml
 mkcfg standalone "$P1" standalone
-if start_node standalone "$P1" fixture.log fixture.toml; then pass "SQLite seed fixture started"; else fail "SQLite seed fixture start"; tail -30 "$W/fixture.log"; finish; fi
-S=$STARTED
-T=$(login "$P1" "$ADMIN" "$APW")
-ck [ -n "$T" ]
-ck_eq "$(console_post "$P1" "$T" /api/v1/buckets '{"name":"nd-bucket"}')" "204" "seed console bucket"
-ck_eq "$(console_post "$P1" "$T" /api/v1/users "{\"username\":\"bob\",\"password\":\"bob-pw-1234\"}")" "200" "seed console user"
-KEYS=$(mint "$P1" "$T")
-AK=$(printf '%s' "$KEYS" | jval access_key)
-SK=$(printf '%s' "$KEYS" | jval secret_key)
-ck [ -n "$AK" ]
-ck [ -n "$SK" ]
-printf 'no-db-object\n' >"$W/one.bin"
-ck aws_at "$P1" "$AK" "$SK" s3 cp "$W/one.bin" s3://nd-bucket/one.bin
-stop_pid "$S"
-ck migrate_fixture standalone
-stash_sqlite standalone
-ck [ ! -e "$W/standalone/oss.db" ]
-if start_node standalone "$P1" standalone.log; then pass "object standalone started from migrated root"; else fail "object standalone start"; tail -40 "$W/standalone.log"; finish; fi
+if start_node standalone "$P1" standalone.log; then pass "object standalone started"; else fail "object standalone start"; tail -40 "$W/standalone.log"; finish; fi
 S=$STARTED
 ck_node_no_db object-standalone "$S" "$W/standalone"
 ck [ ! -e "$W/standalone/no-sqlite" ]
-T=$(login "$P1" "$ADMIN" "$APW")
+T=$(wait_login "$P1" "$ADMIN" "$APW")
+ck [ -n "$T" ]
+ck_eq "$(console_post "$P1" "$T" /api/v1/buckets '{"name":"nd-bucket"}')" "204" "console create bucket"
+ck_eq "$(console_post "$P1" "$T" /api/v1/users "{\"username\":\"bob\",\"password\":\"bob-pw-1234\"}")" "200" "console create user"
+KEYS=$(mint "$P1" "$T")
+AK=$(printf '%s' "$KEYS" | jval access_key)
+SK=$(printf '%s' "$KEYS" | jval secret_key)
+ck [ -n "$AK" ]; ck [ -n "$SK" ]
+printf 'no-db-object\n' >"$W/one.bin"
+ck aws_at "$P1" "$AK" "$SK" s3 cp "$W/one.bin" s3://nd-bucket/one.bin
+ck_node_no_db object-standalone-smoke "$S" "$W/standalone"
+ck_node_no_db object-standalone-after-smoke "$S" "$W/standalone"
+stop_pid "$S"
+if start_node standalone "$P1" standalone-restart.log; then pass "object standalone restarted after kill -9"; else fail "object standalone restart"; tail -40 "$W/standalone-restart.log"; finish; fi
+S=$STARTED
+ck_node_no_db object-standalone-restart "$S" "$W/standalone"
+T=$(wait_login "$P1" "$ADMIN" "$APW")
 ck [ -n "$T" ]
 ck_eq "$(code "http://127.0.0.1:$P1/api/v1/users")" "401" "console rejects unauthenticated users list"
 BODY=$(curl -s --max-time 10 "http://127.0.0.1:$P1/api/v1/users" -H "authorization: Bearer $T")
@@ -137,24 +128,14 @@ BODY=$(curl -s --max-time 10 "http://127.0.0.1:$P1/api/v1/buckets" -H "authoriza
 body_has "$BODY" '"name":"nd-bucket"' && pass "console buckets list shows seeded bucket" || fail "console buckets list shows seeded bucket"
 ck_eq "$(console_post "$P1" "$T" /api/v1/buckets '{"name":"nd-bucket-2"}')" "204" "object console create bucket"
 ck_eq "$(console_post "$P1" "$T" /api/v1/users '{"username":"carol","password":"carol-pw-123"}')" "200" "object console create user"
-if printf '%s' "$(mint "$P1" "$T")" | grep -q '"access_key"'; then
-  pass "object console create access key"
-else
-  pending "object console create access key (pre-H1 db.rs raw SQLite write; no access_keys table in object root)"
-fi
+ck printf '%s' "$(mint "$P1" "$T")" | grep -q '"access_key"'
+pass "object console create access key"
 if aws_at "$P1" bad-key bad-secret s3 ls >/dev/null 2>&1; then fail "S3 rejects bad credentials"; else pass "S3 rejects bad credentials"; fi
 ck aws_at "$P1" "$AK" "$SK" s3 cp s3://nd-bucket/one.bin "$W/one.back"
 ck cmp -s "$W/one.bin" "$W/one.back"
 ck aws_at "$P1" "$AK" "$SK" s3api head-object --bucket nd-bucket --key one.bin
 ck aws_at "$P1" "$AK" "$SK" s3 ls s3://nd-bucket
 ck aws_at "$P1" "$AK" "$SK" s3 cp "$W/one.bin" s3://nd-bucket-2/two.bin
-ck_node_no_db object-standalone-after-smoke "$S" "$W/standalone"
-stop_pid "$S"
-if start_node standalone "$P1" standalone-restart.log; then pass "object standalone restarted after kill -9"; else fail "object standalone restart"; tail -40 "$W/standalone-restart.log"; finish; fi
-S=$STARTED
-ck_node_no_db object-standalone-restart "$S" "$W/standalone"
-T=$(login "$P1" "$ADMIN" "$APW")
-ck [ -n "$T" ]
 ck wait_until 60 0.25 bucket_visible "$P1" "$T" nd-bucket
 ck aws_at "$P1" "$AK" "$SK" s3 cp s3://nd-bucket/one.bin "$W/one.back2"
 ck cmp -s "$W/one.bin" "$W/one.back2"
@@ -164,29 +145,16 @@ echo "== 3. site-enabled pair: pair/apply/ship =="
 read -r PA PB <<<"$(alloc_ports 2)"
 for side in sitea siteb; do
   port=$PA; [ "$side" = siteb ] && port=$PB
-  mkcfg "$side" "$port" site "" "" sqlite fixture.toml
   mkcfg "$side" "$port" site
-  if start_node "$side" "$port" "$side-fixture.log" fixture.toml; then
-    pass "$side SQLite seed started"
-  else
-    fail "$side SQLite seed start"; tail -30 "$W/$side-fixture.log"; finish
-  fi
-  SS=$STARTED
-  ST=$(login "$port" "$ADMIN" "$APW")
+  if start_node "$side" "$port" "$side.log"; then pass "$side object site node started"; else fail "$side object start"; tail -40 "$W/$side.log"; finish; fi
+  ST=$(wait_login "$port" "$ADMIN" "$APW")
   ck [ -n "$ST" ]
-  # Pre-H1: access-key creation is still a raw SQLite write, so seed the pair
-  # keys in the fixture and carry them through migration (S3 reads work).
   SEED_KEYS=$(mint "$port" "$ST")
   if [ "$side" = sitea ]; then
     A_AK=$(printf '%s' "$SEED_KEYS" | jval access_key); A_SK=$(printf '%s' "$SEED_KEYS" | jval secret_key)
   else
     B_AK=$(printf '%s' "$SEED_KEYS" | jval access_key); B_SK=$(printf '%s' "$SEED_KEYS" | jval secret_key)
   fi
-  stop_pid "$SS"
-  ck migrate_fixture "$side"
-  stash_sqlite "$side"
-  ck [ ! -e "$W/$side/oss.db" ]
-  if start_node "$side" "$port" "$side.log"; then pass "$side object site node started"; else fail "$side object start"; tail -40 "$W/$side.log"; finish; fi
   if [ "$side" = sitea ]; then SA=$STARTED; else SB=$STARTED; fi
 done
 ck_node_no_db site-A "$SA" "$W/sitea"
@@ -207,12 +175,10 @@ ck_eq "$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST "http://12
   -H "authorization: Bearer $AT")" "200" "site ping"
 ck_eq "$(console_post "$PA" "$AT" /api/v1/buckets '{"name":"site-bucket"}')" "204" "site console create bucket"
 ck_eq "$(console_post "$PA" "$AT" /api/v1/users "{\"username\":\"$SITE_USER\",\"password\":\"$SITE_PW\"}")" "200" "site console create user"
-# Pre-H1 gap: object domain writes do not call the site hooks yet, so a write
-# on A is not enqueued for B. Bounded probe; default mode records it.
 if wait_until 20 0.5 bucket_visible "$PB" "$BT" site-bucket; then
   pass "site control replication (bucket visible on peer)"
 else
-  pending "object site control replication (pre-H1: site hooks not wired into object bucket/user writes)"
+  fail "site control replication (bucket visible on peer)"
 fi
 # Seed the bucket on B too, so data-plane ship is exercised independently of
 # control replication. Versioning is required for site data enqueue. Control
@@ -233,11 +199,11 @@ if aws_at "$PA" "$A_AK" "$A_SK" s3api put-bucket-versioning --bucket site-bucket
     ck cmp -s "$W/site.bin" "$W/site.back"
     pass "object site data ship"
   else
-    pending "object site data ship (pre-H1: no row enqueued/replicated on object backend)"
+    fail "object site data ship"
   fi
 else
-  pending "object S3 bucket versioning write (pre-H1: xl-s3 raw SQL; no buckets table)"
-  pending "object site data ship (requires object S3 versioning for data enqueue)"
+  fail "object S3 bucket versioning write"
+  fail "object site data ship (requires versioning)"
 fi
 ck_node_no_db site-A-after-ship "$SA" "$W/sitea"
 ck_node_no_db site-B-after-ship "$SB" "$W/siteb"
@@ -246,35 +212,24 @@ stop_pid "$SB"
 
 echo "== 4. 3-node object Raft + witness, snapshot transfer, kill -9 =="
 read -r R1 R2 R3 RW <<<"$(alloc_ports 4)"
-mkcfg ra "$R1" raft 1 true sqlite fixture.toml
 mkcfg ra "$R1" raft 1 true
-if start_node ra "$R1" fixture.log fixture.toml; then pass "Raft SQLite seed started"; else fail "Raft SQLite seed start"; tail -40 "$W/fixture.log"; finish; fi
-RA=$STARTED
-TA=$(login "$R1" "$ADMIN" "$APW")
-ck [ -n "$TA" ]
-ck_eq "$(console_post "$R1" "$TA" /api/v1/buckets '{"name":"raft-bucket"}')" "204" "Raft seed console bucket"
-ck_eq "$(console_post "$R1" "$TA" /api/v1/users "{\"username\":\"$RAFT_USER\",\"password\":\"$RAFT_PW\"}")" "200" "Raft seed console user"
-TL=$(login "$R1" "$RAFT_USER" "$RAFT_PW")
-ck [ -n "$TL" ]
-ck_eq "$(console_post "$R1" "$TL" /api/v1/buckets '{"name":"raft-user-bucket"}')" "204" "Raft seed user bucket"
-stop_pid "$RA"
-ck set_fixture_feature_level "$W/ra/oss.db" 3
-ck migrate_fixture ra
-stash_sqlite ra
-ck [ ! -e "$W/ra/oss.db" ]
 if start_node ra "$R1" ra.log; then pass "object Raft node 1 started"; else fail "object Raft node 1 start"; tail -40 "$W/ra.log"; finish; fi
 RA=$STARTED
+TA=$(wait_login "$R1" "$ADMIN" "$APW")
+ck [ -n "$TA" ]
+ck_eq "$(console_post "$R1" "$TA" /api/v1/buckets '{"name":"raft-bucket"}')" "204" "Raft console create bucket"
+ck_eq "$(console_post "$R1" "$TA" /api/v1/users "{\"username\":\"$RAFT_USER\",\"password\":\"$RAFT_PW\"}")" "200" "Raft console create user"
+TL=$(wait_login "$R1" "$RAFT_USER" "$RAFT_PW")
+ck [ -n "$TL" ]
+ck_eq "$(console_post "$R1" "$TL" /api/v1/buckets '{"name":"raft-user-bucket"}')" "204" "Raft user bucket"
 ck_node_no_db raft-node1 "$RA" "$W/ra"
 ck wait_leader "$R1" 1
-TA=$(login "$R1" "$ADMIN" "$APW")
+TA=$(wait_login "$R1" "$ADMIN" "$APW")
 ck [ -n "$TA" ]
 ck wait_until 60 0.25 bucket_visible "$R1" "$TA" raft-bucket
-# A live write after migration advances the applied LogId past the migrated
-# T0-N0 entry; without it the first snapshot build trips openraft's validity
-# check (see the gate record's known pre-H1 issue).
 ck_eq "$(console_post "$R1" "$TA" /api/v1/buckets '{"name":"raft-bucket-2"}')" "204" "Raft console create second bucket"
 ck wait_until 60 0.25 bucket_visible "$R1" "$TA" raft-bucket-2
-TL=$(login "$R1" "$RAFT_USER" "$RAFT_PW")
+TL=$(wait_login "$R1" "$RAFT_USER" "$RAFT_PW")
 ck [ -n "$TL" ]
 ck wait_until 60 0.25 bucket_visible "$R1" "$TL" raft-user-bucket
 mkcfg rb "$R2" raft 2 false
@@ -353,16 +308,11 @@ ck_node_no_db final-raft-node3 "$RC" "$W/rc"
 ck_node_no_db final-witness "$SW" "$W/w"
 
 echo "== 5. H1 workspace guards =="
-if [ "$STRICT" = 1 ]; then
-  ck scripts/check_no_db.sh
-  if cargo tree -i sqlx --locked >/dev/null 2>&1; then
-    fail "cargo tree -i sqlx is empty"
-  else
-    pass "cargo tree -i sqlx is empty"
-  fi
+ck scripts/check_no_db.sh
+if cargo tree -i sqlx --locked >/dev/null 2>&1; then
+  fail "cargo tree -i sqlx is empty"
 else
-  pending "scripts/check_no_db.sh clean (pre-H1 tree still has sqlx/sqlite matches)"
-  pending "cargo tree -i sqlx empty (pre-H1 tree still links sqlx)"
+  pass "cargo tree -i sqlx is empty"
 fi
 
 finish

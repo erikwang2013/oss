@@ -423,7 +423,7 @@ async fn witness_joins_as_voter_with_metadata_only_state() {
     assert!(!w_db.exists(), "witness 不得创建 legacy raft.db");
     assert!(
         !witness_dir.join("state.db").exists(),
-        "witness 不得打开 SQLite state_db"
+        "witness 不得创建 SQLite 状态库"
     );
     assert!(raft_dir(&w_db).join("log").is_dir());
     let state: serde_json::Value =

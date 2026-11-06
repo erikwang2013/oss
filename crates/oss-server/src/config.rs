@@ -54,7 +54,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub ec: EcToml,
     pub staging_dir: PathBuf,
-    pub database_url: String,
     pub jwt_secret: String,
     /// JWT 轮换期的旧签名密钥：只验签，不签发。每项须 ≥32 字节、互不重复且异于
     /// `jwt_secret`。轮换流程见 [`crate::state::AppState::jwt_previous`]。
@@ -195,9 +194,6 @@ pub struct RaftToml {
     pub cluster_token: String,
     #[serde(default)]
     pub db_path: Option<PathBuf>,
-    /// witness 专用控制库（voter 出现即拒绝）；witness 必填。
-    #[serde(default)]
-    pub state_db: Option<PathBuf>,
     #[serde(default = "default_election_timeout_ms")]
     pub election_timeout_ms: u64,
     #[serde(default = "default_heartbeat_interval_ms")]
@@ -338,7 +334,7 @@ impl WitnessToml {
         if r.bootstrap {
             return Err("witness 配置的 [raft].bootstrap 必须为 false".into());
         }
-        // F2：witness 状态在 `<db_path>.d/witness/state`；state_db 仅保留为迁移输入，
+        // F2：witness 状态在 `<db_path>.d/witness/state`。
         // 因此可选且运行时不再打开。
         if r.db_path.is_none() {
             return Err("witness 配置缺少 [raft].db_path".into());
@@ -1120,9 +1116,6 @@ impl AppConfig {
             if r.role == RaftRole::Witness {
                 return Err("witness 必须使用 witness 子命令（serve 不接受 role=witness）".into());
             }
-            if r.state_db.is_some() {
-                return Err("[raft].state_db 仅 witness 使用，voter 不得配置".into());
-            }
             if self.site.is_none() {
                 return Err("[raft] 需要 [site]（站点身份由 M7 [site] 提供）".into());
             }
@@ -1429,7 +1422,6 @@ mod tests {
             maintenance: false,
             read_only: false,
             staging_dir: "s".into(),
-            database_url: "sqlite::memory:".into(),
             jwt_secret: String::new(),
             jwt_previous_secrets: vec![],
             max_put_bytes: 1024,
@@ -1455,7 +1447,6 @@ mod tests {
         let base = "listen = \"127.0.0.1:0\"\n\
                     data_dir = \"d\"\n\
                     staging_dir = \"s\"\n\
-                    database_url = \"sqlite::memory:\"\n\
                     jwt_secret = \"\"\n";
         // 未配置 [sts]：缺省关闭（现有部署零改动，启动校验通过）
         let c: AppConfig = toml::from_str(base).unwrap();
@@ -1501,7 +1492,6 @@ mod tests {
         let base = "listen = \"127.0.0.1:0\"\n\
                     data_dir = \"d\"\n\
                     staging_dir = \"s\"\n\
-                    database_url = \"sqlite::memory:\"\n\
                     jwt_secret = \"\"\n";
         let c: AppConfig = toml::from_str(base).unwrap();
         assert!(c.ap.vpc_endpoints.is_empty(), "缺省 [ap] 必须为空");
@@ -1566,7 +1556,6 @@ mod tests {
         let base = "listen = \"127.0.0.1:0\"\n\
                     data_dir = \"d\"\n\
                     staging_dir = \"s\"\n\
-                    database_url = \"sqlite::memory:\"\n\
                     jwt_secret = \"\"\n";
         let off: AppConfig = toml::from_str(base).unwrap();
         assert!(!off.maintenance);
@@ -1584,7 +1573,6 @@ mod tests {
         let base = "listen = \"127.0.0.1:0\"\n\
                     data_dir = \"d\"\n\
                     staging_dir = \"s\"\n\
-                    database_url = \"sqlite::memory:\"\n\
                     jwt_secret = \"\"\n";
         let off: AppConfig = toml::from_str(base).unwrap();
         assert!(!off.read_only);
@@ -1779,7 +1767,6 @@ mod tests {
         let base = "listen = \"127.0.0.1:0\"\n\
                     data_dir = \"d\"\n\
                     staging_dir = \"s\"\n\
-                    database_url = \"sqlite::memory:\"\n\
                     jwt_secret = \"0123456789abcdef0123456789abcdef\"\n";
         let c: AppConfig = toml::from_str(base).unwrap();
         assert!(c.jwt_previous_secrets.is_empty());
@@ -2109,7 +2096,6 @@ mod tests {
             maintenance: false,
             read_only: false,
             staging_dir: std::path::PathBuf::from("/tmp/x"),
-            database_url: "sqlite::memory:".into(),
             jwt_secret: "k".repeat(32),
             jwt_previous_secrets: vec![],
             max_put_bytes: 1,
@@ -2177,7 +2163,6 @@ mod tests {
             advertise_endpoint: "http://a:9000".into(),
             cluster_token: "t".repeat(64),
             db_path: None,
-            state_db: None,
             election_timeout_ms: default_election_timeout_ms(),
             heartbeat_interval_ms: default_heartbeat_interval_ms(),
             rpc_timeout_ms: default_rpc_timeout_ms(),
@@ -2256,7 +2241,7 @@ cluster_token = "x"
         assert_eq!(w.role, RaftRole::Witness);
     }
 
-    /// S7.1：witness TOML（仅 `[raft]` 表）解析/校验；serve 拒绝 witness 与 voter state_db。
+    /// S7.1：witness TOML（仅 `[raft]` 表）解析/校验；serve 拒绝 role=witness。
     #[test]
     fn m9_witness_toml_and_serve_role_guards() {
         let text = r#"
@@ -2266,7 +2251,6 @@ role = "witness"
 advertise_endpoint = "http://w:9100"
 cluster_token = "x"
 db_path = "/x/raft.db"
-state_db = "/x/state.db"
 "#;
         let dir = std::env::temp_dir().join(format!("oss-cfg-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2275,26 +2259,19 @@ state_db = "/x/state.db"
         let w = WitnessToml::load(&path).unwrap();
         assert_eq!(w.raft.node_id, 3);
         assert_eq!(w.raft.role, RaftRole::Witness);
-        assert!(w.raft.state_db.is_some());
         std::fs::remove_dir_all(&dir).unwrap();
 
         let mut bad = w.clone();
         bad.raft.bootstrap = true;
         assert!(bad.validate().is_err());
-        let mut no_state = w.clone();
-        no_state.raft.state_db = None;
-        assert!(no_state.validate().is_ok(), "state_db 只是迁移输入，可缺省");
         let mut bad = w;
         bad.raft.role = RaftRole::Voter;
         assert!(bad.validate().is_err());
 
-        // serve：role=witness / voter+state_db 均拒绝
+        // serve：role=witness 拒绝
         let mut c = m9_cfg();
         c.raft.as_mut().unwrap().role = RaftRole::Witness;
         assert!(c.raft_validate().unwrap_err().contains("witness 子命令"));
-        let mut c = m9_cfg();
-        c.raft.as_mut().unwrap().state_db = Some(PathBuf::from("/x"));
-        assert!(c.raft_validate().unwrap_err().contains("state_db"));
     }
 
     #[test]
@@ -2483,7 +2460,6 @@ mesh_secret = "x"
         let base = "listen = \"127.0.0.1:0\"\n\
                     data_dir = \"d\"\n\
                     staging_dir = \"s\"\n\
-                    database_url = \"sqlite::memory:\"\n\
                     jwt_secret = \"0123456789abcdef0123456789abcdef\"\n";
         let c: AppConfig = toml::from_str(base).unwrap();
         assert_eq!(

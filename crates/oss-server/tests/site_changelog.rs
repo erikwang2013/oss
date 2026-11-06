@@ -7,11 +7,9 @@ mod common;
 
 use common::state_with_site;
 use oss_server::config::SiteToml;
-use oss_server::db::SitePeer;
 use oss_server::site::{Entry, apply_changelog};
 use oss_server::state::AppState;
 use serde_json::json;
-use xl_store::control_store::iam::IamStore as _;
 
 fn now() -> i64 {
     std::time::SystemTime::now()
@@ -30,25 +28,6 @@ fn site(name: &str, ch: char) -> SiteToml {
     }
 }
 
-fn peer(peer_id: &str, remote_site_id: &str) -> SitePeer {
-    SitePeer {
-        peer_id: peer_id.into(),
-        remote_site_id: remote_site_id.into(),
-        name: peer_id.into(),
-        endpoint: "http://127.0.0.1:9".into(),
-        region: "us-east-1".into(),
-        priority: 0,
-        s3_access_key: "AKIATEST000000001".into(),
-        s3_secret_key: "SKTEST000000000001".into(),
-        peer_site_token: "b".repeat(32),
-        created_at: now(),
-        last_seen: None,
-        last_error: None,
-        raft_node_id: None,
-        reconcile_required: false,
-    }
-}
-
 async fn hash_of(st: &AppState, username: &str) -> Option<String> {
     st.db
         .control_store()
@@ -56,18 +35,6 @@ async fn hash_of(st: &AppState, username: &str) -> Option<String> {
         .await
         .unwrap()
         .map(|u| u.password_hash)
-}
-
-async fn clock(st: &AppState, entity: &str, id: &str) -> Option<(i64, i64, String, i64)> {
-    let c = st
-        .db
-        .object_control()
-        .unwrap()
-        .control
-        .site_clock(entity, id)
-        .await
-        .unwrap()?;
-    Some((c.ts, c.priority, c.origin_site_id, c.seq))
 }
 
 fn local(st: &AppState) -> &oss_server::local_store::LocalStore {
@@ -342,7 +309,10 @@ async fn apply_lww_poison_admin_and_bucket_reconcile() {
         .await
         .unwrap();
     assert_eq!(s.applied, 1);
-    assert_eq!(st.db.get_bucket_versioning("keep").await.unwrap(), "Enabled");
+    assert_eq!(
+        st.db.get_bucket_versioning("keep").await.unwrap(),
+        "Enabled"
+    );
     // 重投同一批（如 2xx 丢失）：跳过后仍按最终行对账，不报错。
     let s = apply_changelog(&st, vec![up(t - 5, "Enabled")])
         .await

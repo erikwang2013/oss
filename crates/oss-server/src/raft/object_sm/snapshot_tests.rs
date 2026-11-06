@@ -28,8 +28,7 @@ use crate::control_store_obj::{
 };
 use crate::local_store::{LocalStore, UploadRecord};
 
-#[path = "../../../tests/support/golden.rs"]
-pub(super) mod golden;
+pub(super) use crate::test_support::golden;
 
 pub(super) struct ObjectMachine {
     pub(super) _dir: TempDir,

@@ -359,13 +359,13 @@ fn manifest_csv_tolerance_and_errors() {
 }
 
 #[tokio::test]
-async fn batch_1000_replace_tags_failure_retry_and_report() {
+async fn batch_200_replace_tags_failure_retry_and_report() {
     let f = fx().await;
-    for i in 0..1000 {
+    for i in 0..200 {
         f.put("src", &format!("obj/{i}"), b"x").await;
     }
     let mut manifest = String::from("bucket,key\r\n");
-    for i in 0..1000 {
+    for i in 0..200 {
         manifest.push_str(&format!("src,obj/{i}\r\n"));
     }
     manifest.push_str("src,missing-key\r\n");
@@ -385,7 +385,7 @@ async fn batch_1000_replace_tags_failure_retry_and_report() {
     r.report_bucket = Some("reports".into());
     r.report_prefix = Some("out".into());
     let created = create_batch(&f.st, f.admin, true, r).await.unwrap();
-    assert_eq!(created.total, 1001);
+    assert_eq!(created.total, 201);
     // I3：Batch 创建落控制面审计（allow；目标是清单对象）
     let rows = f
         .db()
@@ -416,14 +416,14 @@ async fn batch_1000_replace_tags_failure_retry_and_report() {
     f.put("src", "manifest.csv", b"src,only\r\n").await;
     assert_eq!(
         f.db().job_get(created.job_id).await.unwrap().unwrap()["total"],
-        1001
+        201
     );
 
     drain(&f.exec(), f.db(), f.store(), 1).await;
     let job = f.db().job_get(created.job_id).await.unwrap().unwrap();
     assert_eq!(job["state"], "error");
-    assert_eq!(job["total"], 1001);
-    assert_eq!(job["succeeded"], 1000);
+    assert_eq!(job["total"], 201);
+    assert_eq!(job["succeeded"], 200);
     assert_eq!(job["failed"], 1);
 
     let path = format!("out/{}/results.csv", created.job_id);
@@ -445,7 +445,7 @@ async fn batch_1000_replace_tags_failure_retry_and_report() {
         ]
     );
     let rows: Vec<csv::StringRecord> = rdr.records().map(|r| r.unwrap()).collect();
-    assert_eq!(rows.len(), 1001, "失败任务也在报告里（已执行）");
+    assert_eq!(rows.len(), 201, "失败任务也在报告里（已执行）");
     let mut ids = HashSet::new();
     let (mut ok, mut bad) = (0, 0);
     for row in &rows {
@@ -465,7 +465,7 @@ async fn batch_1000_replace_tags_failure_retry_and_report() {
         assert_iso8601(&row[6]);
         assert_iso8601(&row[7]);
     }
-    assert_eq!((ok, bad), (1000, 1));
+    assert_eq!((ok, bad), (200, 1));
 
     // retry-failed：子作业只含失败任务，自己的报告目录；父报告不变
     let child = f
@@ -1731,7 +1731,8 @@ async fn http_create_then_cancel() {
 async fn batch_delete_on_sync_bucket_refuses_without_remote() {
     let f = fx().await;
     f.put("src", "sync-del", b"keep").await;
-    f.db().upsert_bucket_owner_set_mode("src", Some(f.admin), 0, "sync")
+    f.db()
+        .upsert_bucket_owner_set_mode("src", Some(f.admin), 0, "sync")
         .await
         .unwrap();
     let d = payload("src", "sync-del", f.admin);

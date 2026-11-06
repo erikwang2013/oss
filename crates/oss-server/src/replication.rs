@@ -12,10 +12,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use xl_s3::replication::{ReplRule, ReplicationSink, ReplicationStore, WriteInfo};
 use xl_store::control_store::ControlError;
-use xl_store::control_store::bucket::BucketStore;
-use xl_store::control_store::bucket::BucketTxn;
 use xl_store::control_store::repl_outbox::{NewReplOutbox, ReplOutboxRow, ReplOutboxTxn};
-use xl_store::control_store::sites::SiteStore;
 use xl_store::meta::ObjectTag;
 use xl_store::store::Store;
 

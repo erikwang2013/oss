@@ -25,7 +25,7 @@ impl<T: IamTxn + IamSnapshotTxn> Iam for T {}
 
 pub(super) struct Obj {
     pub(super) _dir: TempDir,
-    pub(super) store: Arc<Store>,
+    pub(super) _store: Arc<Store>,
     pub(super) control: Arc<ObjectControlStore>,
 }
 
@@ -42,7 +42,7 @@ pub(super) async fn object_store(mode: Mode) -> Obj {
     control.bootstrap(mode, 100).await.unwrap();
     Obj {
         _dir: dir,
-        store,
+        _store: store,
         control,
     }
 }

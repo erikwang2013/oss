@@ -1,9 +1,6 @@
 //! M9 S7.5：`sync-reconcile [--repair]`——B′ 同 origin id 重推、映射刷新与本地 intent/outbox 清理。
 
 use serde::Serialize;
-use xl_store::control_store::repl_outbox::ReplOutboxTxn;
-use xl_store::control_store::sites::SiteTxn;
-use xl_store::control_store::sync_intents::SyncIntentTxn;
 use xl_store::store::Store;
 
 use crate::config::RemoteTarget;

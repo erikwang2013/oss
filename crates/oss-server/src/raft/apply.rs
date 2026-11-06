@@ -8,7 +8,6 @@ use base64::Engine as _;
 use std::collections::HashSet;
 
 use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry};
-use xl_store::control_store::iam::IamTxn;
 use xl_store::control_store::inventory::InventoryConfigEntry;
 use xl_store::control_store::{
     AccessPointEntry, ControlError, ControlTxn, OlapConfigEntry, OwnerRef,
@@ -1134,8 +1133,6 @@ async fn purge_jobs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Db;
-    use xl_store::control_store::account::AccountTxn;
 
     /// 状态机白名单必须覆盖 worker 的真实转换（含 paused/preempted 收尾），且终态冻结。
     #[test]
@@ -1171,5 +1168,4 @@ mod tests {
             assert!(!job_state_ok(from, to), "{from} -> {to}");
         }
     }
-
 }

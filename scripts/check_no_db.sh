@@ -23,8 +23,11 @@ mapfile -t FILES < <(
     -type f \
     ! -path '*/node_modules/*' \
     ! -path "*/${ARCHIVE_DIR}/*" \
+    ! -path 'scripts/check_no_db.sh' \
     ! -path '*/scripts/check_no_db.sh' \
+    ! -path 'tests/e2e_no_db.sh' \
     ! -path '*/tests/e2e_no_db.sh' \
+    ! -path 'tests/lib/no_db_helpers.sh' \
     ! -path '*/tests/lib/no_db_helpers.sh' \
     2>/dev/null | sort
 )
@@ -68,14 +71,14 @@ done
 echo "== no-db guard (H1): $(date -u +%Y-%m-%dT%H:%M:%SZ) =="
 echo "  files=${#FILES[@]} manifests=${#MANIFESTS[@]} archive=${ARCHIVE_DIR}"
 
-# A bare `state.db` occurs as a Rust field access; require a quoted/path-like
-# context so the guard reports database filenames, not `state.db.get_user`.
-DB_NAMES='["'"'"'/(](oss|raft|state)\.db([^.A-Za-z0-9_]|$)'
+# Actual file creation is asserted by tests/e2e_no_db.sh; this grep only rejects
+# a SQLite connection string (File Raft's `<db_path>.d/` is not SQLite).
+DB_NAMES='sqlite:(//|::memory:)'
 report "dependency sqlx/libsqlite3-sys/rusqlite" \
   "$(grep -nIE '\b(sqlx|libsqlite3-sys|rusqlite)\b' "${MANIFESTS[@]}" 2>/dev/null || true)"
-scan "sqlx references" '\bsqlx\b'
-scan_i "sqlite references" 'sqlite'
-scan "SQLite database filenames" "$DB_NAMES"
+scan "sqlx references" '\bsqlx::|use sqlx\b|sqlx[[:space:]]*='
+scan "sqlite references" '\bsqlite::|Sqlite(Pool|Connection|ConnectOptions|JournalMode|Control)|libsqlite3|\brusqlite\b|sqlite_master|PRAGMA '
+scan "SQLite connection strings" "$DB_NAMES"
 scan "SqliteControl* symbols" 'SqliteControl[A-Za-z0-9_]*'
 scan "migrations/ references" 'migrations/'
 

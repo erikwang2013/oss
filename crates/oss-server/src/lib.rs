@@ -13,6 +13,9 @@ pub mod config;
 pub mod console;
 pub mod control_backend;
 pub mod control_recertify;
+#[cfg(test)]
+pub(crate) mod test_support;
+
 pub mod control_store_obj;
 pub mod control_view;
 mod control_writes;

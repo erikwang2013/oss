@@ -5,7 +5,6 @@ mod common;
 use common::{state, state_with_site};
 use oss_server::config::SiteToml;
 use oss_server::router::build_router;
-use xl_store::control_store::sites::SiteTxn;
 
 async fn serve(app: axum::Router) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

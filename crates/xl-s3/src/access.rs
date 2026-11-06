@@ -195,6 +195,22 @@ pub enum Action {
 
 /// 审计接收方（S3 请求路径只入队，不碰 DB）。实现方须自行持有字符串并保证有界；
 /// `false` = 丢弃（队列满/已关闭）——审计 best-effort，调用方不得据此改变判定。
+#[async_trait::async_trait]
+pub trait AuditFallback: Send + Sync {
+    /// Synchronous-audit equivalent for callers without an async queue (tests,
+    /// offline commands, jobs): write one row through the control seam.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_audit(
+        &self,
+        uid: i64,
+        op: &str,
+        bucket: Option<&str>,
+        object_key: Option<&str>,
+        decision: &str,
+        detail: Option<&str>,
+    ) -> Result<(), ControlError>;
+}
+
 pub trait AuditSink: Send + Sync {
     fn enqueue(
         &self,
@@ -219,6 +235,10 @@ pub struct Acl {
     writes: Option<Arc<dyn crate::control::AclWrites>>,
     /// Background/non-request reads fallback (a captured hot-view generation).
     control: Option<Arc<dyn crate::control::Control>>,
+    /// Dynamic fallback: called per read so long-lived workers see new generations.
+    control_provider: Option<Arc<dyn Fn() -> Arc<dyn crate::control::Control> + Send + Sync>>,
+    /// Synchronous audit fallback when no async queue is installed.
+    audit_fallback: Option<Arc<dyn AuditFallback>>,
 }
 
 /// 匿名拒绝审计的令牌桶：未认证请求可无限灌入，拒绝审计不能线性写存储。
@@ -348,7 +368,15 @@ impl Acl {
             audit: None,
             writes: None,
             control: None,
+            audit_fallback: None,
+            control_provider: None,
         }
+    }
+
+    /// Synchronous audit writer used when [`Self::audit`] is absent.
+    pub fn with_audit_fallback(mut self, writer: Arc<dyn AuditFallback>) -> Self {
+        self.audit_fallback = Some(writer);
+        self
     }
 
     /// Fallback control snapshot for callers outside a request scope (job workers,
@@ -358,10 +386,25 @@ impl Acl {
         self
     }
 
+    /// Per-read provider for long-lived workers (captures a fresh generation).
+    pub fn with_control_provider(
+        mut self,
+        provider: Arc<dyn Fn() -> Arc<dyn crate::control::Control> + Send + Sync>,
+    ) -> Self {
+        self.control_provider = Some(provider);
+        self
+    }
+
     fn control(&self) -> Result<Arc<dyn crate::control::Control>, ControlError> {
         crate::control::request_view()
+            .or_else(|| self.control_provider.as_ref().map(|f| f()))
             .or_else(|| self.control.clone())
             .ok_or_else(|| ControlError::Backend("control view missing".into()))
+    }
+
+    /// 默认构造（无配额/无审计/无写缝）：仅用于测试与显式装配。
+    pub fn default_unwired() -> Self {
+        Self::new()
     }
 
     /// 注入账户硬配额后端（对象后端复制账本）。
@@ -434,7 +477,9 @@ impl Acl {
         mode: Option<&str>,
         days: Option<i64>,
     ) -> Result<(), ControlError> {
-        self.writes()?.set_bucket_lock_rule(bucket, mode, days).await
+        self.writes()?
+            .set_bucket_lock_rule(bucket, mode, days)
+            .await
     }
     /// 桶策略读取（M4 切片 7）：None = 未配；**解析失败 = Err**（check 里 fail-closed 拒）。
     pub async fn bucket_policy(
@@ -454,14 +499,19 @@ impl Acl {
         decision: &str,
         detail: Option<&str>,
     ) -> Result<(), ControlError> {
-        let Some(sink) = &self.audit else {
-            return Err(ControlError::Backend(
-                "audit sink missing: refusing synchronous audit write".into(),
-            ));
-        };
-        // 丢弃计数与告警由 sink 负责（每次请求 warn 会在过载时洪水式刷日志）。
-        sink.enqueue(uid, op, bucket, object_key, decision, detail);
-        Ok(())
+        if let Some(sink) = &self.audit {
+            // 丢弃计数与告警由 sink 负责（每次请求 warn 会在过载时洪水式刷日志）。
+            sink.enqueue(uid, op, bucket, object_key, decision, detail);
+            return Ok(());
+        }
+        if let Some(writer) = &self.audit_fallback {
+            return writer
+                .write_audit(uid, op, bucket, object_key, decision, detail)
+                .await;
+        }
+        Err(ControlError::Backend(
+            "audit sink missing: refusing synchronous audit write".into(),
+        ))
     }
     /// 匿名拒绝审计（限流；uid=0 哨兵）。返回 Ok 不代表已落行——洪水期会丢弃。
     pub async fn write_anonymous_deny_audit(
@@ -517,7 +567,10 @@ impl Acl {
             .await
     }
     /// M8 缺口 C：清桶默认加密（幂等；返回是否命中桶行）。
-    pub async fn clear_bucket_default_encryption(&self, bucket: &str) -> Result<bool, ControlError> {
+    pub async fn clear_bucket_default_encryption(
+        &self,
+        bucket: &str,
+    ) -> Result<bool, ControlError> {
         self.writes()?.clear_bucket_default_encryption(bucket).await
     }
     /// 清桶生命周期规则（M4 切片 6：删桶时调用——桶名可复用，旧规则复活会误删新桶
@@ -614,7 +667,11 @@ impl Acl {
         }
         Ok((
             (allow_dst, allow_src),
-            Some(if denied { "session:deny" } else { "session:allow" }),
+            Some(if denied {
+                "session:deny"
+            } else {
+                "session:allow"
+            }),
         ))
     }
     /// 写桶版本控制状态（PutBucketVersioning；授权门已确认桶主/管理员）。
@@ -1263,4 +1320,10 @@ fn classify(op: &str) -> Option<Gate> {
         // 未实现/未知 op：fail-closed（下游本来也是 501；这里统一 403）
         _ => return None,
     })
+}
+
+impl Default for Acl {
+    fn default() -> Self {
+        Self::new()
+    }
 }

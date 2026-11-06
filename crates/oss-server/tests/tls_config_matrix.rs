@@ -14,7 +14,6 @@ fn base_toml(extra: &str) -> String {
 listen = "127.0.0.1:0"
 data_dir = "/tmp/oss-tls-test/data"
 staging_dir = "/tmp/oss-tls-test/staging"
-database_url = "sqlite::memory:"
 jwt_secret = "0123456789abcdef0123456789abcdef"
 {extra}
 "#
@@ -230,7 +229,6 @@ bootstrap = false
 advertise_endpoint = "https://127.0.0.1:9100"
 cluster_token = "token-token-token-token-token-token"
 db_path = "/tmp/w/raft.db"
-state_db = "/tmp/w/state.db"
 "#,
     )
     .unwrap();
@@ -244,7 +242,6 @@ bootstrap = false
 advertise_endpoint = "https://127.0.0.1:9100"
 cluster_token = "token-token-token-token-token-token"
 db_path = "/tmp/w/raft.db"
-state_db = "/tmp/w/state.db"
 [tls.server]
 cert = "c.pem"
 key = "k.pem"

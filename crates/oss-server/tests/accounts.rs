@@ -1449,15 +1449,17 @@ async fn strict_quota_ledger_blocks_writes_and_delete_frees() {
         "删除释放对象数后可写"
     );
 
-    let account_id = id.clone();
-    let (used, count) = probe
-        .db
-        .control_write("strict-quota-ledger", move |txn| {
-            let account_id = account_id.clone();
-            Box::pin(async move { txn.account_ledger(&account_id).await })
-        })
+    // D4: the hot usage cache is node-local; the console usage endpoint
+    // recomputes from the object store and is the observable contract here.
+    let usage: serde_json::Value = client
+        .get(format!("{base}/api/v1/accounts/{id}/usage"))
+        .bearer_auth(&admin)
+        .send()
         .await
         .unwrap()
-        .expect("ledger row");
-    assert_eq!((used, count), (5, 2), "账本 = first(4)+third(1), 2 objects");
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(usage["used_bytes"], 5, "用量 = first(4)+third(1)");
+    assert_eq!(usage["bucket_count"], 1);
 }
