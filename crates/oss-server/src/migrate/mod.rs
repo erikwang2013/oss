@@ -5,6 +5,25 @@
 //! the object backend serves. `--apply` writes the node-local files and Raft
 //! file stores first and the object root last (single CAS); `--dry-run` opens no
 //! target path at all. Every apply is idempotent and every mismatch fails closed.
+//!
+//! # Cutover path before SQLite deletion (H1)
+//!
+//! Keep this command and a SQLite-capable binary in the support matrix until
+//! the deletion release is the **only** supported upgrade source:
+//!
+//! 1. Archive the last release that contains `control-migrate` (v1.31.0 at the
+//!    time of writing) with its checksum; it is the only binary that can read
+//!    both `oss.db` and `raft.db`. Object-only binaries cannot open a SQLite
+//!    source and must not be deployed before the cutover.
+//! 2. Cutover command (same flags as `oss-server control-migrate`):
+//!    `--from <oss.db> --state-dir <data root> --raft-db <raft.db> [--apply]`.
+//!    Run `--dry-run` first (no target writes), then `--apply`; re-running an
+//!    applied migration is a verified no-op.
+//! 3. Only after the object+raft cluster is validated may SQLite support be
+//!    deleted. That deletion removes this module's `source.rs`/`source_rows.rs`/
+//!    `local_rows.rs`/`raft_source.rs` (the only SQLite readers here), the CLI
+//!    `control-migrate` branch and the SQLx dependency; keep the archived binary
+//!    as the migration artifact for older deployments.
 
 mod export;
 mod local_rows;
@@ -23,7 +42,8 @@ use std::path::Path;
 use serde::Serialize;
 use xl_store::store::{Store, StoreConfig};
 
-use crate::control_store_obj::{ObjectControlStore, RootIo};
+use crate::control_store_obj::{ObjectControlStore, RootIo, WriteOrigin};
+use crate::raft::compat::{META_INVENTORY_ACTIVATED, META_RUNSTATE_ACTIVATED};
 use crate::raft::data;
 use crate::raft::runstate;
 
@@ -157,14 +177,17 @@ pub(crate) async fn run(
         .lock_local_control_root()
         .map_err(|e| std::io::Error::other(format!("root lock: {e}")))?;
     let local_dir = crate::control_backend::local_state_dir(state_dir);
-    let control = ObjectControlStore::new(std::sync::Arc::new(RootIo::new(store)))
-        .with_local_dir(&local_dir)?;
+    let control = std::sync::Arc::new(
+        ObjectControlStore::new(std::sync::Arc::new(RootIo::new(store)))
+            .with_local_dir(&local_dir)?,
+    );
 
     let existing = control.root.load().await?;
     if existing.is_some() {
         report.status = "already-applied";
         let object = export::verify(&control, &source).await?;
         report.object = Some(object_report(object));
+        repair_activation_markers(&control, &source).await?;
     }
 
     let local = local_sink::apply(&control, &source)?;
@@ -205,6 +228,41 @@ pub(crate) async fn run(
         return error("raft source database checksum changed during apply");
     }
     Ok(report)
+}
+
+/// Re-running an already applied migration repairs activation markers that
+/// v1.31.0 migrated roots predate: the rows are verified identical, and the
+/// object startup guard must see the same activation facts as the SQLite source.
+async fn repair_activation_markers(
+    control: &std::sync::Arc<ObjectControlStore>,
+    source: &Source,
+) -> Result<(), BoxError> {
+    let pinned = control.pin().await?;
+    let markers = &pinned.root.meta.markers;
+    let mut missing = Vec::new();
+    for (key, wanted) in [
+        (META_RUNSTATE_ACTIVATED, source.runstate_activated),
+        (META_INVENTORY_ACTIVATED, source.inventory_activated),
+    ] {
+        if wanted && markers.get(key).map(String::as_str) != Some("1") {
+            missing.push(key);
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    control
+        .transaction(WriteOrigin::local("control-migrate-repair"), move |txn| {
+            let missing = missing.clone();
+            Box::pin(async move {
+                for key in missing {
+                    txn.set_marker(key, "1");
+                }
+                Ok(())
+            })
+        })
+        .await?;
+    Ok(())
 }
 
 async fn open_store(root: &Path) -> Result<std::sync::Arc<Store>, BoxError> {

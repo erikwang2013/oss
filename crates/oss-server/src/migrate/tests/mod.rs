@@ -12,7 +12,8 @@ use xl_store::control_store::sites::SiteStore;
 
 use super::source::{self, Source};
 use super::{export, object_install, run};
-use crate::control_store_obj::{ObjectControlStore, RootIo};
+use crate::control_store_obj::{ObjectControlStore, RootIo, WriteOrigin};
+use crate::raft::compat::{META_INVENTORY_ACTIVATED, META_RUNSTATE_ACTIVATED};
 use fixture::{
     Fixture, checkpoint, fixture, log_id, open_store, raft_checksum, read_control, read_source,
     source_checksum,
@@ -102,6 +103,25 @@ async fn apply_boots_and_rerun_is_idempotent() {
     let pinned = boot.control.pin().await.unwrap();
     assert_eq!(pinned.root.meta.mode, Mode::Raft);
     assert_eq!(pinned.root.meta.feature_level, 9);
+    assert_eq!(
+        pinned
+            .root
+            .meta
+            .markers
+            .get(META_RUNSTATE_ACTIVATED)
+            .map(String::as_str),
+        Some("1"),
+        "源激活事实必须随迁移写入对象根"
+    );
+    assert_eq!(
+        pinned
+            .root
+            .meta
+            .markers
+            .get(META_INVENTORY_ACTIVATED)
+            .map(String::as_str),
+        Some("1")
+    );
     assert_eq!(
         pinned.root.meta.next_site_seq,
         source.raw.changelog.iter().map(|r| r.seq).max().unwrap() + 1
@@ -212,6 +232,56 @@ async fn raft_files_preserve_vote_committed_log_and_snapshot() {
     assert_eq!(snapshot.meta.snapshot_id, "snap-1");
     assert_eq!(snapshot.meta.last_log_id, Some(log_id(2)));
     assert_eq!(snapshot.snapshot.get_ref().as_slice(), b"snapshot-bytes");
+}
+
+/// v1.31.0 的已应用根没有激活 marker；重跑 control-migrate 必须在验证数据一致后补写，
+/// 否则对象+raft 启动守卫会拒绝非空运行态。
+#[tokio::test]
+async fn rerun_repairs_missing_activation_markers_on_legacy_root() {
+    let f = fixture().await;
+    apply(&f).await;
+    let control = Arc::new(read_control(&f).await);
+    control
+        .transaction(WriteOrigin::local("test-legacy-root"), |txn| {
+            Box::pin(async move {
+                txn.remove_marker(META_RUNSTATE_ACTIVATED);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+    assert!(
+        control
+            .pin()
+            .await
+            .unwrap()
+            .root
+            .meta
+            .markers
+            .get(META_RUNSTATE_ACTIVATED)
+            .is_none()
+    );
+
+    let report = apply(&f).await;
+    assert_eq!(report.status, "already-applied");
+    let pinned = control.pin().await.unwrap();
+    assert_eq!(
+        pinned
+            .root
+            .meta
+            .markers
+            .get(META_RUNSTATE_ACTIVATED)
+            .map(String::as_str),
+        Some("1")
+    );
+    // 补写后必须能通过对象+raft 启动守卫（用空文件快照隔离 Raft sink 的合成快照）。
+    let snap_dir = tempfile::tempdir().unwrap();
+    let snapshots =
+        crate::raft::file_snapshot::FileSnapshotStore::open(&snap_dir.path().join("raft.db"))
+            .unwrap();
+    crate::raft::compat::guard_object_startup(&control, &snapshots, 9)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

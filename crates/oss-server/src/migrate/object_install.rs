@@ -16,7 +16,7 @@ use crate::control_store_obj::migrate_support::{
 use crate::control_store_obj::{
     AccessPointTxn, ObjectControlStore, PinnedRoot, VpcTxn, WriteOrigin,
 };
-use crate::raft::compat::MAX_FEATURE_LEVEL;
+use crate::raft::compat::{MAX_FEATURE_LEVEL, META_INVENTORY_ACTIVATED, META_RUNSTATE_ACTIVATED};
 use xl_store::control_store::bucket::BucketSnapshotTxn;
 use xl_store::control_store::inventory::InventoryTxn;
 use xl_store::control_store::jobs::JobSnapshotTxn;
@@ -154,6 +154,14 @@ pub(crate) async fn install_with(
     }
     if source.accounts_canonical {
         txn.set_marker(crate::db::META_ACCOUNTS_CANONICAL, "done");
+    }
+    // Copy the source activation facts verbatim: the object startup guard is the
+    // same as SQLite's, and a migrated non-empty runstate must stay bootable.
+    if source.runstate_activated {
+        txn.set_marker(META_RUNSTATE_ACTIVATED, "1");
+    }
+    if source.inventory_activated {
+        txn.set_marker(META_INVENTORY_ACTIVATED, "1");
     }
 
     // The offline local sink imports the source `account_usage` rows before this

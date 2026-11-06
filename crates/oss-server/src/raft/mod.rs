@@ -943,6 +943,11 @@ pub async fn spawn_object(
     let log_store = file_log::FileLogStore::open(&settings.db_path).await?;
     let has_logs = log_store.has_logs().await?;
     let snapshots = Arc::new(file_snapshot::FileSnapshotStore::open(&settings.db_path)?);
+    // R8 + 运行态/inventory 激活标记 + applied/membership + 最新快照封套：全部在
+    // 对象根/文件存储上校验，不构造 SQLite 状态机或连接池。
+    compat::guard_object_startup(&control, &snapshots, settings.feature_level)
+        .await
+        .map_err(std::io::Error::other)?;
     let state_machine = object_sm::ObjectStateMachine::open(
         control,
         snapshots,
@@ -951,9 +956,6 @@ pub async fn spawn_object(
         settings.feature_level,
     )
     .await?;
-    // R8：根 feature level 高于本机配置 → 拒绝启动（与 SQLite 同一守卫）。
-    compat::guard_startup(state_machine.activation_level(), settings.feature_level)
-        .map_err(std::io::Error::other)?;
     let counters = Arc::clone(state_machine.counters());
     let peers = Arc::new(compat::PeerVersions::default());
     let network = build_network(&settings, &peers, &tls)?;
@@ -1597,5 +1599,37 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(epoch, FencingEpoch { term: 1, leader: 1 });
+    }
+
+    /// 对象+raft 启动只装配文件日志/快照 + 对象状态机：不构造 SqliteStateMachine，
+    /// 不创建 legacy `raft.db`（占位池只在对象后端的非 raft 门面里，且无 schema）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn object_spawn_uses_file_stores_and_object_sm_only() {
+        use xl_store::control_state::root::Mode;
+        use xl_store::store::{Store, StoreConfig};
+
+        use crate::control_store_obj::{ObjectControlStore, RootIo};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = StoreConfig::new(dir.path());
+        cfg.fsync = false;
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let control = Arc::new(ObjectControlStore::new(Arc::new(RootIo::new(store))));
+        control.bootstrap(Mode::Raft, 100).await.unwrap();
+        let settings = test_settings(dir.path());
+        let handle = spawn_object(settings.clone(), control.clone(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(wait_leader(&handle).await, 1);
+        assert!(matches!(&handle.state_machine, RaftSm::Object(_)));
+        assert!(handle.sqlite_state_machine().is_none());
+        assert!(
+            !settings.db_path.exists(),
+            "对象后端不得创建 SQLite raft.db"
+        );
+        let raft_dir = file_log::raft_dir(&settings.db_path);
+        assert!(raft_dir.join("log").is_dir());
+        assert!(raft_dir.join("snapshot").is_dir());
+        handle.shutdown().await;
     }
 }

@@ -13,7 +13,9 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteConnection};
 use sqlx::{Connection, Row};
 use xl_store::control_state::root::Mode;
 
-use crate::raft::compat::{MAX_FEATURE_LEVEL, META_FEATURE_LEVEL};
+use crate::raft::compat::{
+    MAX_FEATURE_LEVEL, META_FEATURE_LEVEL, META_INVENTORY_ACTIVATED, META_RUNSTATE_ACTIVATED,
+};
 use crate::raft::data::{self, ControlData};
 use crate::raft::runstate::{self, RunState};
 
@@ -39,6 +41,10 @@ pub(crate) struct Source {
     pub checksum: String,
     pub raft_checksum: Option<String>,
     pub feature_marker: u8,
+    /// Source `schema_meta` activation markers; the object root must carry the
+    /// same facts or its startup guard would reject migrated runstate rows.
+    pub runstate_activated: bool,
+    pub inventory_activated: bool,
     pub accounts_canonical: bool,
     pub mode: Mode,
     pub applied: Option<LogId<u64>>,
@@ -165,6 +171,17 @@ pub(crate) async fn read_control(path: &Path, raft_db: &Path) -> Result<Source, 
             "source feature level {marker} exceeds this binary's maximum {MAX_FEATURE_LEVEL}"
         ));
     }
+    let activation = |key: &str| -> Result<bool, BoxError> {
+        match schema_meta.get(key).map(String::as_str) {
+            None => Ok(false),
+            Some("1") => Ok(true),
+            Some(other) => error(format!(
+                "source schema_meta.{key}={other:?} 非法（只认 \"1\"）"
+            )),
+        }
+    };
+    let runstate_activated = activation(META_RUNSTATE_ACTIVATED)?;
+    let inventory_activated = activation(META_INVENTORY_ACTIVATED)?;
     let raft = raft_source::read_raft(raft_db).await?;
     let raft_checksum = raft.checksum.clone();
     let raft_on = schema_meta.get("raft_mode").is_some_and(|v| v == "on");
@@ -185,6 +202,8 @@ pub(crate) async fn read_control(path: &Path, raft_db: &Path) -> Result<Source, 
         checksum: before,
         raft_checksum,
         feature_marker: marker,
+        runstate_activated,
+        inventory_activated,
         accounts_canonical: canonical,
         mode,
         applied,

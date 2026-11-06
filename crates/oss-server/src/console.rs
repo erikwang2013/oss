@@ -4546,7 +4546,13 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
         peer.reconcile_required = true;
     }
     let initialized = state.raft.as_ref().is_some_and(|h| h.membership_nonempty());
-    let _ = crate::raft::identity::record_initialized(&state.db, initialized).await;
+    let recorded = match state.db.object_control() {
+        Some(control) => {
+            crate::raft::identity::record_initialized_object(&control.control, initialized).await
+        }
+        None => crate::raft::identity::record_initialized(&state.db, initialized).await,
+    };
+    let _ = recorded;
     Json(peer_json(&peer)).into_response()
 }
 

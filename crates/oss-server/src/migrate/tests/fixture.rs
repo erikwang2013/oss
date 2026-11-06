@@ -414,6 +414,9 @@ pub(super) async fn fixture() -> Fixture {
     .unwrap();
     for (key, value) in [
         (crate::raft::compat::META_FEATURE_LEVEL, "9"),
+        // 非空运行态在 feature 9 下必须已激活，否则 SQLite 启动守卫本身会拒绝。
+        (crate::raft::compat::META_RUNSTATE_ACTIVATED, "1"),
+        (crate::raft::compat::META_INVENTORY_ACTIVATED, "1"),
         (crate::db::META_ACCOUNTS_CANONICAL, "done"),
     ] {
         sqlx::query(

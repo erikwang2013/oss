@@ -1407,17 +1407,17 @@ fn sqlite_url(path: &std::path::Path) -> String {
     format!("sqlite://{}?mode=rw", path.display())
 }
 
-/// 对象后端没有 SQLite 控制库；离线 export/cutover/force-recover 仍只读 SQLite，
-/// 误跑会改写一个与运行态无关的库。对象导出一致性在 F3/G1 接线前 fail-closed。
+/// 对象后端没有 SQLite 控制库；这些离线命令仍只读写 SQLite（或占位库），
+/// 误跑会打开/改写一个与对象根无关的库。必须在任何连接之前 fail-closed；
+/// SQLite→对象根的迁移走 `control-migrate`（本函数不拦截它）。
 fn require_sqlite_backend(
     cfg: &crate::config::AppConfig,
     op: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if cfg.server.control_backend == crate::config::ControlBackend::Objects {
         return Err(format!(
-            "control_backend=objects 不支持 {op}：离线 cutover/export/force-recover 仍只读 \
-             SQLite 控制库（对象后端的导出/安装由 F3/G1 接线）。请在 SQLite 后端执行，\
-             或等待迁移器完成"
+            "control_backend=objects 不支持 {op}：该离线命令仍只读写 SQLite 控制库，\
+             对象根没有等价实现；命令未接触数据库。SQLite→对象根迁移请用 control-migrate"
         )
         .into());
     }
@@ -1631,6 +1631,7 @@ async fn replica_reconcile_cmd(
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     // 离线：只做 meta 读与定点版本删，不 AppState::load（会二次打开 raft.db）。
     let cfg = crate::config::AppConfig::load(cfg_path)?;
+    require_sqlite_backend(&cfg, "replica-reconcile")?;
     let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
     let drives = cfg
         .data_dirs
@@ -1778,6 +1779,7 @@ async fn sync_reconcile_cmd(
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     // 离线：绝不 AppState::load（会二次打开 raft.db 并启动运行时/启动对账）。
     let cfg = crate::config::AppConfig::load(cfg_path)?;
+    require_sqlite_backend(&cfg, "sync-reconcile")?;
     let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
     // sync-reconcile 是运维修数据路径：open_local_store 不注入写门/集群拓扑。
     let store = open_local_store(&cfg).await?;
@@ -1858,9 +1860,8 @@ async fn cmk_cmd(
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     let cfg = crate::config::AppConfig::load(cfg_path)?;
     let cluster = cfg.cluster.is_some() || cfg.stretch.is_some();
-    let store = open_local_store(&cfg).await?;
     // 桶默认加密在控制面库：仅引用守卫类子命令才离线只读打开（不重放 schema/不切 raft 模式）。
-    let db = if matches!(
+    let needs_db = matches!(
         &cmd,
         CmkCommand::Scan { .. }
             | CmkCommand::Delete { .. }
@@ -1869,7 +1870,12 @@ async fn cmk_cmd(
                 to_legacy: Some(_),
                 ..
             }
-    ) {
+    );
+    if needs_db {
+        require_sqlite_backend(&cfg, "cmk scan/delete/trash-purge/rewrap --to-legacy")?;
+    }
+    let store = open_local_store(&cfg).await?;
+    let db = if needs_db {
         Some(crate::db::Db::connect_offline(&cfg.database_url).await?)
     } else {
         None
@@ -2679,5 +2685,62 @@ mod tests {
         }
         // 上限之外的天数也拒绝（挡住按天换算时的乘法溢出）
         assert_eq!(parse_args(&args(&["clean", "36526"])), Err(USAGE));
+    }
+
+    /// 对象后端的 SQLite-only 离线命令必须在任何连接/建库之前 fail-closed；
+    /// 错误要可操作（指向 control-migrate），且不得创建 oss.db 或 data 目录。
+    #[tokio::test]
+    async fn object_backend_offline_commands_fail_closed_before_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("oss.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                r#"
+listen = "127.0.0.1:0"
+data_dir = "{}"
+staging_dir = "{}"
+database_url = "sqlite://{}?mode=rwc"
+jwt_secret = "0123456789abcdef0123456789abcdef"
+
+[server]
+control_backend = "objects"
+"#,
+                dir.path().join("data").display(),
+                dir.path().join("staging").display(),
+                dir.path().join("oss.db").display(),
+            ),
+        )
+        .unwrap();
+        let db_path = dir.path().join("oss.db");
+        let commands = [
+            Command::SyncReconcile {
+                repair: false,
+                bucket: None,
+                json: false,
+            },
+            Command::ReplicaReconcile {
+                bucket: "b".into(),
+                key: "k".into(),
+                delete: Vec::new(),
+                apply: false,
+                json: false,
+            },
+            Command::Cmk(CmkCommand::Scan {
+                name: "0".into(),
+                json: false,
+            }),
+        ];
+        for cmd in commands {
+            let err = run_offline(cmd, &cfg_path).await.unwrap_err().to_string();
+            assert!(err.contains("control_backend=objects"), "{err}");
+            assert!(err.contains("命令未接触数据库"), "{err}");
+            assert!(err.contains("control-migrate"), "{err}");
+            assert!(!db_path.exists(), "守卫必须早于 Db::connect_offline: {err}");
+            assert!(
+                !dir.path().join("data").exists(),
+                "守卫必须早于 Store::open: {err}"
+            );
+        }
     }
 }
