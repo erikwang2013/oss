@@ -214,6 +214,15 @@ pub(super) async fn install(
     scrub_local_uploads(&sm.store, |owner| {
         owner.is_some_and(|uid| !admins.contains(&uid))
     })?;
+    // The account-usage cache is recomputable and belongs to the old root;
+    // drop it so the sampler rebuilds from the installed accounts (design §6.1).
+    crate::quota_object::clear_account_usage(&sm.store).map_err(|e| {
+        storage_err(
+            ErrorSubject::Snapshot(None),
+            ErrorVerb::Write,
+            std::io::Error::other(e.to_string()),
+        )
+    })?;
     // Root switch is the install commit; the snapshot file only feeds future
     // replication. A crash in between leaves the new root with an older snapshot
     // (normal lag), never the reverse.

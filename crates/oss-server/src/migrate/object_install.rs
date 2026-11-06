@@ -156,6 +156,8 @@ pub(crate) async fn install_with(
         txn.set_marker(crate::db::META_ACCOUNTS_CANONICAL, "done");
     }
 
+    // The offline local sink imports the source `account_usage` rows before this
+    // install; they belong to the root being committed, so do not clear them.
     // On error the transaction is dropped uncommitted: no root CAS, no visibility.
     before_commit()?;
     let stamp = txn.commit().await?;
