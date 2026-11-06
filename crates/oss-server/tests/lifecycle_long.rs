@@ -32,9 +32,11 @@ fn spec() -> LifecycleRuleSpec {
 async fn versioned_bucket(st: &AppState, bucket: &str) {
     st.store.create_bucket(bucket).await.unwrap();
     st.db.insert_bucket(bucket, None).await.unwrap();
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = ?")
-        .bind(bucket)
-        .execute(st.db.pool())
+    let name = bucket.to_owned();
+    st.db
+        .control_write("lifecycle-long", move |txn| {
+            Box::pin(async move { txn.bucket_set_versioning(&name, "Enabled").await })
+        })
         .await
         .unwrap();
 }

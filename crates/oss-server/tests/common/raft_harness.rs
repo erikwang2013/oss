@@ -1,4 +1,4 @@
-//! S7.x in-process Raft 节点骨架：独立 raft.db + 真实 HTTP RPC 监听（随机端口）。
+//! S7.x in-process Raft 节点骨架：对象控制根 + 文件日志 + 真实 HTTP RPC 监听。
 //!
 //! S7.3（成员变更）与 S7.6（端到端）可直接用它组 3-voter 集群：`spawn_node` 返回
 //! 真实 advertise 地址，成员表里的节点地址即可达。
@@ -9,14 +9,17 @@ use std::path::Path;
 use std::sync::Arc;
 
 use oss_server::config::RaftRole;
+use oss_server::control_store_obj::{ObjectControlStore, RootIo};
 use oss_server::raft::{RaftHandle, RaftSettings, routes};
+use xl_store::control_state::root::Mode;
+use xl_store::store::{Store, StoreConfig};
 
 pub struct TestNode {
     pub handle: Arc<RaftHandle>,
     pub base: String,
     pub token: String,
-    /// 传入控制库时保留一份句柄，测试可直接断言行。
-    pub pool: Option<sqlx::SqlitePool>,
+    /// 节点控制根；测试可直接断言行。
+    pub control: Arc<ObjectControlStore>,
 }
 
 impl TestNode {
@@ -46,23 +49,41 @@ pub fn settings(dir: &Path, node_id: u64, bootstrap: bool) -> RaftSettings {
     }
 }
 
-/// 启动节点并在随机端口暴露 `rpc_router`；`advertise_endpoint` 改写为该地址。
-pub async fn spawn_node(settings: RaftSettings) -> TestNode {
-    spawn_node_with_pool(settings, None).await
+async fn open_control(settings: &RaftSettings) -> Arc<ObjectControlStore> {
+    let dir = settings
+        .db_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!("control-{}.store", settings.node_id));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut cfg = StoreConfig::new(dir);
+    cfg.fsync = false;
+    let store = Arc::new(Store::open(cfg).await.unwrap());
+    let control = Arc::new(ObjectControlStore::new(Arc::new(RootIo::new(store))));
+    control.bootstrap(Mode::Raft, 100).await.unwrap();
+    control
 }
 
-/// 与 [`spawn_node`] 相同，但把控制库连接池交给状态机（成员/转发测试需要真实控制表）。
-pub async fn spawn_node_with_pool(
+/// 启动节点并在随机端口暴露 `rpc_router`；`advertise_endpoint` 改写为该地址。
+pub async fn spawn_node(settings: RaftSettings) -> TestNode {
+    spawn_node_with_control(settings, None).await
+}
+
+/// 与 [`spawn_node`] 相同，但由调用方提供已引导的对象控制根。
+pub async fn spawn_node_with_control(
     mut settings: RaftSettings,
-    control_pool: Option<sqlx::SqlitePool>,
+    control: Option<Arc<ObjectControlStore>>,
 ) -> TestNode {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     settings.advertise_endpoint = format!("http://{addr}");
     let token = settings.cluster_token.clone();
-    let pool = control_pool.clone();
+    let control = match control {
+        Some(control) => control,
+        None => open_control(&settings).await,
+    };
     let handle = Arc::new(
-        oss_server::raft::spawn_with_control(settings, control_pool, None)
+        oss_server::raft::spawn_object(settings, Arc::clone(&control), None, None)
             .await
             .unwrap(),
     );
@@ -72,7 +93,7 @@ pub async fn spawn_node_with_pool(
         handle,
         base: format!("http://{addr}"),
         token,
-        pool,
+        control,
     }
 }
 

@@ -297,13 +297,17 @@ async fn transition_restore_roundtrip_and_reaper() {
     );
 
     // 执行作业：prepare → row restored → meta commit
-    let task: String = sqlx::query_scalar(
-        "SELECT payload_json FROM job_tasks WHERE action = 'RestoreObject' \
-         ORDER BY job_id DESC LIMIT 1",
-    )
-    .fetch_one(st.db.pool())
-    .await
-    .unwrap();
+    let latest = st.db.control_store().recent_jobs(1).await.unwrap();
+    let task = st
+        .db
+        .control_store()
+        .job_tasks(latest[0].id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.action == "RestoreObject")
+        .expect("RestoreObject task row")
+        .payload_json;
     assert_eq!(
         executor(&st).execute("RestoreObject", &task).await.unwrap(),
         "restored"

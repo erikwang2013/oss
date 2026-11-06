@@ -4,26 +4,11 @@
 //! 全程使用调用方事务——失败时由调用方回滚，绝不留下半套表。激活标记不由本模块
 //! 写：来源级别决定 `m8_runstate_activated`（见 `compat::mark/clear_runstate_activated_tx`）。
 
-use sqlx::{SqliteConnection, SqlitePool};
-
 use super::model::RunState;
-use crate::raft::data::DataError;
 use xl_store::control_store::{ControlError, ControlTxn};
 
 const META_NEXT_JOB_ID: &str = "next_job_id";
 const META_NEXT_RUN_ID: &str = "next_run_id";
-
-fn sql(e: sqlx::Error) -> DataError {
-    DataError::Format(format!("runstate sql: {e}"))
-}
-
-fn control_err(e: ControlError) -> DataError {
-    match e {
-        ControlError::Invalid(m) => DataError::Format(m),
-        ControlError::Backend(m) => DataError::Format(format!("control store backend: {m}")),
-        ControlError::MissingOwner(id) => DataError::MissingUser(id),
-    }
-}
 
 /// 调用方事务/连接内读取九表（行序 = 主键序，checksum 确定性来源）。
 pub async fn read_runstate_txn(txn: &mut dyn ControlTxn) -> Result<RunState, ControlError> {
@@ -64,57 +49,7 @@ pub async fn read_runstate_txn(txn: &mut dyn ControlTxn) -> Result<RunState, Con
     Ok(state)
 }
 
-/// SQLite 包装。
-pub async fn read_runstate_tx(conn: &mut SqliteConnection) -> Result<RunState, DataError> {
-    let mut txn = crate::control_store::SqliteControlTxn::new(conn);
-    read_runstate_txn(&mut txn).await.map_err(control_err)
-}
-
-/// 连接池便捷入口（校验/单次读）。快照或导出构建必须用 [`read_runstate_tx`] 和
-/// 控制面同处一个读事务，避免撕裂读。
-pub async fn read_runstate(pool: &SqlitePool) -> Result<RunState, DataError> {
-    let mut conn = pool.acquire().await.map_err(sql)?;
-    read_runstate_tx(&mut conn).await
-}
-
-/// 九表整表替换。先做语义校验（不通过则一行不写），再在 savepoint 内删除+插入：
-/// 裸连接（自动提交）中途失败也只回滚本次安装；嵌套在调用方事务里同样安全。
-pub async fn install_runstate_tx(
-    conn: &mut SqliteConnection,
-    state: &RunState,
-) -> Result<(), DataError> {
-    state.validate()?;
-    sqlx::query("SAVEPOINT install_runstate")
-        .execute(&mut *conn)
-        .await
-        .map_err(sql)?;
-    let result = {
-        let mut txn = crate::control_store::SqliteControlTxn::new(&mut *conn);
-        install_runstate_rows(&mut txn, state)
-            .await
-            .map_err(|e| DataError::Format(e.to_string()))
-    };
-    match result {
-        Ok(()) => {
-            sqlx::query("RELEASE SAVEPOINT install_runstate")
-                .execute(&mut *conn)
-                .await
-                .map_err(sql)?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = sqlx::query("ROLLBACK TO SAVEPOINT install_runstate")
-                .execute(&mut *conn)
-                .await;
-            let _ = sqlx::query("RELEASE SAVEPOINT install_runstate")
-                .execute(&mut *conn)
-                .await;
-            Err(e)
-        }
-    }
-}
-
-/// 后端无关的九表整表替换（调用方持有事务/根 CAS）。
+/// 九表整表替换：先做语义校验（不通过则一行不写），再由调用方事务/根 CAS 提交。
 pub async fn install_runstate_rows(
     txn: &mut dyn ControlTxn,
     state: &RunState,

@@ -3,9 +3,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use oss_server::control_backend::ObjectControl;
 use oss_server::db::{Db, JobSpec, NewJobTask};
 use oss_server::jobs::{JobEnv, TaskExecutor, worker_once, worker_tick};
 use oss_server::raft::{FencingEpoch, LeaderGate, LeadershipSource};
+use xl_store::control_state::root::Mode;
 use xl_store::store::{Store, StoreConfig};
 
 struct OkExec;
@@ -39,12 +41,14 @@ impl TaskExecutor for SlowExec {
 async fn setup() -> (Db, Arc<Store>, tempfile::TempDir, tempfile::TempDir) {
     let db_dir = tempfile::tempdir().unwrap();
     let store_dir = tempfile::tempdir().unwrap();
-    let db = Db::connect(&format!(
-        "sqlite://{}?mode=rwc",
-        db_dir.path().join("jobs.db").display()
-    ))
-    .await
-    .unwrap();
+    let mut cfg = StoreConfig::new(db_dir.path());
+    cfg.fsync = false;
+    let control_store = Arc::new(Store::open(cfg).await.unwrap());
+    let object = ObjectControl::open(control_store, Mode::Standalone, None)
+        .await
+        .unwrap();
+    let db = Db::connect_object().await.unwrap();
+    db.attach_object_control(object).unwrap();
     let store = Arc::new(
         Store::open(StoreConfig::new(store_dir.path()))
             .await
@@ -175,12 +179,14 @@ async fn set_task_deadline_updates_running_row_only() {
     db.set_task_deadline(id, 1, 1900, FencingEpoch::UNFENCED)
         .await
         .unwrap();
-    let deadline: i64 =
-        sqlx::query_scalar("SELECT deadline_at FROM job_tasks WHERE job_id = ? AND task_no = 1")
-            .bind(id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let deadline: i64 = db
+        .control_store()
+        .job_task(id, 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .deadline_at
+        .expect("claimed task has a deadline");
     assert_eq!(deadline, 1900);
 
     db.finish_task(id, 1, true, "OK", None, 1001, 3)
@@ -189,12 +195,14 @@ async fn set_task_deadline_updates_running_row_only() {
     db.set_task_deadline(id, 1, 9999, FencingEpoch::UNFENCED)
         .await
         .unwrap();
-    let deadline: i64 =
-        sqlx::query_scalar("SELECT deadline_at FROM job_tasks WHERE job_id = ? AND task_no = 1")
-            .bind(id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let deadline: i64 = db
+        .control_store()
+        .job_task(id, 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .deadline_at
+        .expect("claimed task has a deadline");
     assert_eq!(deadline, 1900, "终态任务不应再改 deadline");
 }
 
@@ -214,12 +222,14 @@ async fn worker_tightens_deadline_by_action() {
         .await
         .unwrap();
     assert!(worker_once(&db, &store, &OkExec, e, 1000).await.unwrap());
-    let deadline: i64 =
-        sqlx::query_scalar("SELECT deadline_at FROM job_tasks WHERE job_id = ? AND task_no = 1")
-            .bind(id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let deadline: i64 = db
+        .control_store()
+        .job_task(id, 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .deadline_at
+        .expect("claimed task has a deadline");
     assert_eq!(deadline, 1030, "非 tier 动作按 timeout_secs 收紧");
 
     let id = db
@@ -227,12 +237,14 @@ async fn worker_tightens_deadline_by_action() {
         .await
         .unwrap();
     assert!(worker_once(&db, &store, &OkExec, e, 2000).await.unwrap());
-    let deadline: i64 =
-        sqlx::query_scalar("SELECT deadline_at FROM job_tasks WHERE job_id = ? AND task_no = 1")
-            .bind(id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let deadline: i64 = db
+        .control_store()
+        .job_task(id, 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .deadline_at
+        .expect("claimed task has a deadline");
     assert_eq!(deadline, 5600, "tier 动作按 tier_timeout_secs");
 }
 

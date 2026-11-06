@@ -1449,12 +1449,15 @@ async fn strict_quota_ledger_blocks_writes_and_delete_frees() {
         "删除释放对象数后可写"
     );
 
-    let (used, count): (i64, i64) = sqlx::query_as(
-        "SELECT used_bytes, object_count FROM account_usage_ledger WHERE account_id = ?",
-    )
-    .bind(&id)
-    .fetch_one(probe.db.pool())
-    .await
-    .unwrap();
+    let account_id = id.clone();
+    let (used, count) = probe
+        .db
+        .control_write("strict-quota-ledger", move |txn| {
+            let account_id = account_id.clone();
+            Box::pin(async move { txn.account_ledger(&account_id).await })
+        })
+        .await
+        .unwrap()
+        .expect("ledger row");
     assert_eq!((used, count), (5, 2), "账本 = first(4)+third(1), 2 objects");
 }

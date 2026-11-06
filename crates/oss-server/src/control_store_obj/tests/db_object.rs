@@ -68,7 +68,7 @@ async fn object_db_create_user_derives_account_and_rejects_duplicate() {
         f.db.create_user("alice", "alice-pw-123", false)
             .await
             .unwrap_err();
-    assert!(crate::control_store::is_unique_violation(&err));
+    assert!(crate::db::is_unique_violation(&err));
 
     // Admin: no derived account/member (system account semantics).
     let admin = f.db.create_user("root", "root-pw-123", true).await.unwrap();

@@ -255,6 +255,7 @@ impl IamStore for ObjectControlStore {
     }
 
     async fn permissions_for_user(&self, uid: i64) -> Result<Vec<PermissionRow>, ControlError> {
+
         let txn = self
             .begin(WriteOrigin::local("read"))
             .await
@@ -286,5 +287,30 @@ impl IamStore for ObjectControlStore {
             .collect();
         keys.sort_by(|a, b| (a.created_at, &a.access_key).cmp(&(b.created_at, &b.access_key)));
         Ok(keys.into_iter().map(|k| k.access_key).collect())
+    }
+}
+
+impl ObjectControlStore {
+    /// 配对需要一把活跃的管理员长期 AK（含封装后的 SK）。
+    pub(crate) async fn admin_long_term_access_key(
+        &self,
+    ) -> Result<Option<(String, String)>, ControlError> {
+        let txn = self
+            .begin(WriteOrigin::local("read"))
+            .await
+            .map_err(backend)?;
+        let Some(admin) = scan_users(&txn).await?.into_iter().find(|u| u.is_admin) else {
+            return Ok(None);
+        };
+        Ok(scan_access_keys(&txn)
+            .await?
+            .into_iter()
+            .find(|k| {
+                k.user_id == admin.uid
+                    && k.kind == "long-term"
+                    && k.parent_ak.is_none()
+                    && k.status == "active"
+            })
+            .map(|k| (k.access_key, k.secret_key)))
     }
 }

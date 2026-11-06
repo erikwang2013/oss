@@ -309,16 +309,17 @@ async fn bucket_delete_conflict_restores_physical_and_returns_409() {
         .unwrap();
     st.store.create_bucket("conflict-bkt").await.unwrap();
     st.db.insert_bucket("conflict-bkt", None).await.unwrap();
-    // 远端钟领先 → DELETE FROM buckets 会被 BEFORE 门控 ABORT。
-    sqlx::query(
-        "INSERT OR REPLACE INTO site_entity_clock \
-         (entity, entity_id, ts, priority, origin_site_id, seq) \
-         VALUES ('bucket', 'conflict-bkt', ?, 0, 'remote-b', 9)",
-    )
-    .bind(now() + 120)
-    .execute(st.db.pool())
-    .await
-    .unwrap();
+    // 远端钟领先 → 本地删桶必须被站点时钟门控拒绝。
+    let ts = now() + 120;
+    st.db
+        .control_write("site-api-clock", move |txn| {
+            Box::pin(async move {
+                txn.site_put_clock("bucket", "conflict-bkt", ts, 0, "remote-b", 9)
+                    .await
+            })
+        })
+        .await
+        .unwrap();
 
     let base = serve(build_router(st.clone()).unwrap()).await;
     let tok = login(&base).await;
@@ -333,9 +334,8 @@ async fn bucket_delete_conflict_restores_physical_and_returns_409() {
         st.store.bucket_exists("conflict-bkt").await.unwrap(),
         "冲突时必须恢复物理桶"
     );
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets WHERE name='conflict-bkt'")
-        .fetch_one(st.db.pool())
-        .await
-        .unwrap();
-    assert_eq!(n, 1, "行/授权保持原样");
+    assert!(
+        st.db.bucket_exists("conflict-bkt").await.unwrap(),
+        "行/授权保持原样"
+    );
 }

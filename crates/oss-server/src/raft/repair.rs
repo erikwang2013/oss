@@ -7,7 +7,6 @@ use xl_store::control_store::sync_intents::SyncIntentTxn;
 use xl_store::store::Store;
 
 use crate::config::RemoteTarget;
-use crate::control_store::SqliteControlTxn;
 use crate::db::Db;
 use crate::repl_client::ReplClient;
 
@@ -388,36 +387,23 @@ pub async fn run_tls(
     }
     // `--bucket` 只用于诊断：未验证其余 sync 桶前不得清站点级门/intents。
     if opts.repair && opts.bucket.is_none() && !report.has_errors() {
-        let mut tx = db.pool().begin().await.map_err(|e| e.to_string())?;
-        let intents = SqliteControlTxn::new(&mut tx)
-            .sync_write_intent_count()
-            .await
-            .map_err(|e| e.to_string())? as u64;
-        let deletes = SqliteControlTxn::new(&mut tx)
-            .sync_delete_intent_count()
-            .await
-            .map_err(|e| e.to_string())? as u64;
-        let outbox = SqliteControlTxn::new(&mut tx)
-            .repl_site_total(&peer.peer_id)
-            .await
-            .map_err(|e| e.to_string())? as u64;
-        SqliteControlTxn::new(&mut tx)
-            .sync_write_intent_delete_all()
-            .await
-            .map_err(|e| e.to_string())?;
-        SqliteControlTxn::new(&mut tx)
-            .sync_delete_intent_delete_all()
+        let peer_id = peer.peer_id.clone();
+        let (intents, deletes, outbox) = db
+            .control_write("repair", move |txn| {
+                let peer_id = peer_id.clone();
+                Box::pin(async move {
+                    let intents = txn.sync_write_intent_count().await? as u64;
+                    let deletes = txn.sync_delete_intent_count().await? as u64;
+                    let outbox = txn.repl_site_total(&peer_id).await? as u64;
+                    txn.sync_write_intent_delete_all().await?;
+                    txn.sync_delete_intent_delete_all().await?;
+                    txn.repl_delete_site_all(&peer_id).await?;
+                    txn.site_set_reconcile_required(&peer_id, false).await?;
+                    Ok((intents, deletes, outbox))
+                })
+            })
             .await
             .map_err(|e| e.to_string())?;
-        SqliteControlTxn::new(&mut tx)
-            .repl_delete_site_all(&peer.peer_id)
-            .await
-            .map_err(|e| e.to_string())?;
-        SqliteControlTxn::new(&mut tx)
-            .site_set_reconcile_required(&peer.peer_id, false)
-            .await
-            .map_err(|e| e.to_string())?;
-        tx.commit().await.map_err(|e| e.to_string())?;
         report.intents_cleared = intents + deletes;
         report.outbox_cleared = outbox;
     }

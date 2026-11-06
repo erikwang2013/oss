@@ -132,93 +132,6 @@ mod set_group_tests {
     }
 }
 
-mod stretch_startup_tests {
-    use super::*;
-
-    fn drives(tmp: &tempfile::TempDir) -> Vec<PathBuf> {
-        let d = tmp.path().join("d0");
-        std::fs::create_dir_all(&d).unwrap();
-        vec![d]
-    }
-
-    async fn empty_db() -> Db {
-        Db::connect("sqlite::memory:").await.unwrap()
-    }
-
-    #[tokio::test]
-    async fn fresh_store_ok_then_marker_skips_emptiness() {
-        let db = empty_db().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let ds = drives(&tmp);
-        std::fs::create_dir_all(ds[0].join(".oss.sys")).unwrap();
-        assert!(stretch_startup_check(&db, &ds).await.unwrap());
-        db.schema_meta_set_if_absent("stretch_initialized", "1")
-            .await
-            .unwrap();
-        // 非首次启动不再要求空库/空盘（历史数据正常服务）
-        db.insert_bucket("old-b", None).await.unwrap();
-        assert!(!stretch_startup_check(&db, &ds).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn fresh_store_with_missing_dirs_ok() {
-        let db = empty_db().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let missing = vec![tmp.path().join("not-created-yet")];
-        assert!(stretch_startup_check(&db, &missing).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn old_store_with_buckets_rejected() {
-        let db = empty_db().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let ds = drives(&tmp);
-        db.insert_bucket_full("b", None, 0, "async").await.unwrap();
-        let e = stretch_startup_check(&db, &ds).await.unwrap_err();
-        assert!(e.contains("全新空库"), "{e}");
-        assert!(e.contains("buckets 共 1 行"), "{e}");
-    }
-
-    #[tokio::test]
-    async fn sync_bucket_rejected() {
-        let db = empty_db().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let ds = drives(&tmp);
-        db.insert_bucket_full("s", None, 0, "sync").await.unwrap();
-        let e = stretch_startup_check(&db, &ds).await.unwrap_err();
-        assert!(e.contains("sync 桶 1 个"), "{e}");
-    }
-
-    #[tokio::test]
-    async fn bucket_dir_rejected() {
-        let db = empty_db().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let ds = drives(&tmp);
-        std::fs::create_dir_all(ds[0].join("oldbucket")).unwrap();
-        let e = stretch_startup_check(&db, &ds).await.unwrap_err();
-        assert!(e.contains("全新空存储"), "{e}");
-    }
-
-    #[tokio::test]
-    async fn site_outbox_rows_rejected_even_after_marker() {
-        let db = empty_db().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let ds = drives(&tmp);
-        db.schema_meta_set_if_absent("stretch_initialized", "1")
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, \
-             dest_bucket, target_kind) VALUES ('b','k','v','e',1,'r','b','site')",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
-        let e = stretch_startup_check(&db, &ds).await.unwrap_err();
-        assert!(e.contains("target_kind='site'"), "{e}");
-    }
-}
-
 mod object_admin_tests {
     use super::*;
     use crate::control_backend::ObjectControl;
@@ -386,7 +299,18 @@ mod ap_endpoint_registry_tests {
     /// 启动校验：账户存在且 active 才放行；查无/停用失败；空表零改动。
     #[tokio::test]
     async fn validates_account_exists_and_active() {
-        let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
+        use crate::control_backend::ObjectControl;
+        use xl_store::control_state::root::Mode;
+        use xl_store::store::{Store, StoreConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = StoreConfig::new(dir.path());
+        cfg.fsync = false;
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let object = ObjectControl::open(store, Mode::Standalone, None)
+            .await
+            .unwrap();
+        let db = Db::connect_object().await.unwrap();
+        db.attach_object_control(object).unwrap();
         let id = db.create_account("acct", None).await.unwrap();
         validate_ap_endpoints(&db, &ap_toml(&id)).await.unwrap();
         validate_ap_endpoints(&db, &ApToml::default())

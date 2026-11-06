@@ -262,7 +262,7 @@ async fn create(
         }
         Ok(false) => (StatusCode::CONFLICT, "AP 已存在").into_response(),
         // 并发下唯一约束兜底。
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => {
+        Err(e) if crate::db::is_unique_violation(&e) => {
             (StatusCode::CONFLICT, "AP 已存在").into_response()
         }
         Err(e) => {

@@ -19,18 +19,25 @@ async fn ingest_enqueues_replication_for_versioned_bucket() {
     let st = state(dir.path()).await;
     st.store.create_bucket("files").await.unwrap();
     st.db.insert_bucket("files", None).await.unwrap();
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'files'")
-        .execute(st.db.pool())
+    st.db
+        .control_write("aether-versioning", |txn| {
+            Box::pin(async move { txn.bucket_set_versioning("files", "Enabled").await })
+        })
         .await
         .unwrap();
-    sqlx::query(
-        "INSERT INTO replication_rules (bucket, rules_json) VALUES ('files', ?) \
-         ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json",
-    )
-    .bind(r#"[{"id":"r","prefix":null,"remote_id":"r1","dest_bucket":"dst","delete_marker":false,"enabled":true}]"#)
-    .execute(st.db.pool())
-    .await
-    .unwrap();
+    st.db
+        .control_write("aether-repl-rules", |txn| {
+            Box::pin(async move {
+                txn.bucket_replication_rules_set(
+                    "files",
+                    r#"[{"id":"r","prefix":null,"remote_id":"r1","dest_bucket":"dst","delete_marker":false,"enabled":true}]"#,
+                    1,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
 
     let sub = "2026-10";
     let group_dir = st.cfg.staging_dir.join("file").join(sub);
@@ -53,14 +60,19 @@ async fn ingest_enqueues_replication_for_versioned_bucket() {
     );
 
     st.ingest.upload_complete(&resource);
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repl_outbox WHERE bucket='files' AND is_delete_marker=0 \
-         AND version_id != 'null'",
-    )
-    .fetch_one(st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(n, 1, "aether 摄取应入复制队列（版本化提交）");
+    let info = st
+        .store
+        .head_object("files", &format!("{sub}/{md5}.txt"))
+        .await
+        .unwrap();
+    let vid = info.version_id.expect("versioned ingest");
+    let counts = st
+        .db
+        .control_store()
+        .repl_version_counts("files", &format!("{sub}/{md5}.txt"), &vid)
+        .await
+        .unwrap();
+    assert_eq!(counts.pending, 1, "aether 摄取应入复制队列（版本化提交）");
 }
 
 #[tokio::test(flavor = "multi_thread")] // block_on 用了 block_in_place，单线程 runtime 会 panic
@@ -275,13 +287,19 @@ async fn ingest_emits_object_created_post() {
     let st = state(dir.path()).await;
     st.store.create_bucket("files").await.unwrap();
     // 桶通知配置：files 桶 → target t1，收 Post
-    sqlx::query(
-        "INSERT INTO event_configs (bucket, config_json) VALUES ('files', ?)",
-    )
-    .bind(r#"[{"id":"a","target":"t1","events":["s3:ObjectCreated:Post"],"prefix":null,"suffix":null}]"#)
-    .execute(st.db.pool())
-    .await
-    .unwrap();
+    st.db
+        .control_write("aether-notification", |txn| {
+            Box::pin(async move {
+                txn.bucket_notification_set(
+                    "files",
+                    r#"[{"id":"a","target":"t1","events":["s3:ObjectCreated:Post"],"prefix":null,"suffix":null}]"#,
+                    1,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
 
     let sub = "2026-10";
     let group_dir = st.cfg.staging_dir.join("file").join(sub);
@@ -298,13 +316,16 @@ async fn ingest_emits_object_created_post() {
     let resource = Resource::new(&st.cfg.staging_dir, "file", "file", sub, &name);
     st.ingest.upload_complete(&resource);
 
-    let (target, json): (String, String) =
-        sqlx::query_as("SELECT target_id, event_json FROM event_outbox WHERE bucket='files'")
-            .fetch_one(st.db.pool())
-            .await
-            .unwrap();
-    assert_eq!(target, "t1");
-    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let claims = st
+        .db
+        .control_write("aether-events-read", |txn| {
+            Box::pin(async move { txn.event_claim(1, 100).await })
+        })
+        .await
+        .unwrap();
+    let claim = claims.first().expect("object created event");
+    assert_eq!(claim.target_id, "t1");
+    let v: serde_json::Value = serde_json::from_str(&claim.event_json).unwrap();
     assert_eq!(v["eventName"], "s3:ObjectCreated:Post");
     assert_eq!(v["source"]["host"], "internal");
     assert_eq!(v["source"]["userAgent"], "oss-aether");

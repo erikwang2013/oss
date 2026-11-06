@@ -1,12 +1,8 @@
 use std::fs;
 
-use openraft::entry::{Entry, EntryPayload};
-use openraft::storage::{RaftSnapshotBuilder, RaftStateMachine};
 use openraft::{BasicNode, CommittedLeaderId, LogId, SnapshotMeta, StoredMembership};
 
 use super::*;
-use crate::raft::ControlCommand;
-use crate::raft::store::SqliteStateMachine;
 
 fn log_id(index: u64) -> LogId<u64> {
     LogId::new(CommittedLeaderId::new(1, 1), index)
@@ -58,59 +54,6 @@ async fn raft_file_snapshot_roundtrip_multiple_chunks() {
     assert!(store.list().await.unwrap().is_empty());
     assert!(store.read(&m.snapshot_id).await.unwrap().is_none());
     assert!(store.latest().await.unwrap().is_none());
-}
-
-#[tokio::test]
-async fn raft_file_snapshot_chunk_bytes_match_sqlite_fixture() {
-    let dir = tempfile::tempdir().unwrap();
-    let sm_path = dir.path().join("sqlite-sm.db");
-    let mut sm = SqliteStateMachine::open(&sm_path, 64 * 1024 * 1024)
-        .await
-        .unwrap();
-    for index in 1..=4u64 {
-        RaftStateMachine::<TypeConfig>::apply(
-            &mut sm,
-            [Entry {
-                log_id: log_id(index),
-                payload: EntryPayload::Normal(ControlCommand::Set {
-                    key: format!("k{index}"),
-                    value: "x".repeat(100 * 1024),
-                }),
-            }],
-        )
-        .await
-        .unwrap();
-    }
-    let snap = RaftSnapshotBuilder::<TypeConfig>::build_snapshot(&mut sm)
-        .await
-        .unwrap();
-    let sqlite_chunks = sm.snapshot_chunks_for_test().await;
-    assert!(sqlite_chunks.len() >= 2, "fixture must exercise chunking");
-
-    let store = FileSnapshotStore::open(&dir.path().join("raft.db")).unwrap();
-    store
-        .write(&snap.meta, snap.snapshot.get_ref())
-        .await
-        .unwrap();
-    let file_chunks: Vec<Vec<u8>> = sqlite_chunks
-        .iter()
-        .enumerate()
-        .map(|(seq, _)| {
-            fs::read(
-                dir.path()
-                    .join("raft.db.d/snapshot")
-                    .join(&snap.meta.snapshot_id)
-                    .join(chunk_name(seq)),
-            )
-            .unwrap()
-        })
-        .collect();
-    assert_eq!(
-        file_chunks, sqlite_chunks,
-        "file snapshot chunks must equal raft_snapshot_chunk.data bytes"
-    );
-    let read = store.read(&snap.meta.snapshot_id).await.unwrap().unwrap();
-    assert_eq!(read.snapshot.get_ref(), snap.snapshot.get_ref());
 }
 
 #[tokio::test]

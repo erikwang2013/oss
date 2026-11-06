@@ -5,6 +5,7 @@ mod common;
 
 use common::state;
 use oss_server::router::build_router;
+use xl_store::control_store::audit::AuditTxn as _;
 
 async fn admin_env(dir: &std::path::Path) -> (oss_server::state::AppState, String) {
     let st = state(dir).await;
@@ -158,26 +159,31 @@ async fn audit_filters_by_time_identity_resource_and_op() {
     let (st, base_tok) = admin_env(dir.path()).await;
     let (base, tok) = base_tok.split_once('|').unwrap();
     st.db.create_user("bob", "pw2", false).await.unwrap();
-    for (ts, uid, op, bucket, key, decision) in [
+    let rows: Vec<xl_store::control_store::audit::NewAuditRecord> = [
         (100i64, 1i64, "GetObject", "b1", "dir/a.txt", "allow"),
         (200, 2, "PutObject", "b1", "dir/b.txt", "deny"),
         (300, 1, "GetObject", "b2", "dir2/c.txt", "allow"),
         (400, 2, "GetObject", "b1", "other/d.txt", "allow"),
-    ] {
-        sqlx::query(
-            "INSERT INTO audit_log (ts, uid, op, bucket, object_key, decision) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(ts)
-        .bind(uid)
-        .bind(op)
-        .bind(bucket)
-        .bind(key)
-        .bind(decision)
-        .execute(st.db.pool())
+    ]
+    .into_iter()
+    .map(|(ts, uid, op, bucket, key, decision)| {
+        xl_store::control_store::audit::NewAuditRecord {
+            ts,
+            uid,
+            op: op.into(),
+            bucket: Some(bucket.into()),
+            object_key: Some(key.into()),
+            decision: decision.into(),
+            detail: None,
+        }
+    })
+    .collect();
+    st.db
+        .object_local_write("policy-audit-seed", move |txn| {
+            Box::pin(async move { txn.audit_insert_batch(&rows).await })
+        })
         .await
         .unwrap();
-    }
 
     // 行形状不变
     let all = audit_rows(base, tok, "").await;

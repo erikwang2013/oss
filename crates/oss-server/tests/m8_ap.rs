@@ -217,9 +217,12 @@ async fn set_bucket_policy(e: &Env, bucket: &str, policy: Option<&str>) {
     match policy {
         Some(p) => e.st.db.set_bucket_policy(bucket, p, 0).await.unwrap(),
         None => {
-            sqlx::query("DELETE FROM bucket_policies WHERE bucket = ?")
-                .bind(bucket)
-                .execute(e.st.db.pool())
+            let bucket = bucket.to_owned();
+            e.st.db
+                .control_write("ap-bucket-policy-delete", move |txn| {
+                    let bucket = bucket.clone();
+                    Box::pin(async move { txn.bucket_policy_delete(&bucket).await })
+                })
                 .await
                 .unwrap();
         }
@@ -426,11 +429,31 @@ async fn send_status(
         .as_u16()
 }
 
-async fn count(e: &Env, sql: &'static str) -> i64 {
-    sqlx::query_scalar::<_, i64>(sql)
-        .fetch_one(e.st.db.pool())
-        .await
+async fn audit_all(
+    e: &Env,
+    q: xl_store::control_store::audit::AuditQuery,
+) -> Vec<xl_store::control_store::audit::AuditRecord> {
+    e.st.db.control_store().audit_page(&q).await.unwrap()
+}
+
+fn clear_audit(e: &Env) {
+    let dir = oss_server::control_backend::local_state_dir(e.st.store.root())
+        .join("audit")
+        .join("audit_log");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn queue_count(e: &Env, name: &str) -> i64 {
+    e.st.db
+        .object_control()
         .unwrap()
+        .control
+        .local_store()
+        .unwrap()
+        .queue(name)
+        .unwrap()
+        .scan()
+        .len() as i64
 }
 
 /// 无凭据原始请求（匿名 AP 用例）。
@@ -517,14 +540,22 @@ async fn console_crud_permissions_and_cache() {
         201
     );
     assert!(e.st.ap_cache.get("owner-ap").is_some(), "创建后缓存未同步");
-    let (uid, decision, detail): (i64, String, Option<String>) = sqlx::query_as(
-        "SELECT uid, decision, detail FROM audit_log WHERE op = 'control:ap-create' AND object_key = 'owner-ap'",
+    let rows = audit_all(
+        &e,
+        xl_store::control_store::audit::AuditQuery {
+            limit: 10,
+            op: Some("control:ap-create".into()),
+            key_prefix: Some("owner-ap".into()),
+            ..Default::default()
+        },
     )
-    .fetch_one(e.st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!((uid, decision.as_str()), (owner_id, "allow"));
-    assert_eq!(detail.as_deref(), Some("policy=none"));
+    .await;
+    let rec = rows
+        .iter()
+        .find(|r| r.object_key.as_deref() == Some("owner-ap"))
+        .expect("ap-create audit");
+    assert_eq!((rec.uid, rec.decision.as_str()), (owner_id, "allow"));
+    assert_eq!(rec.detail.as_deref(), Some("policy=none"));
     let list: serde_json::Value = e
         .http
         .get(format!("{}/api/v1/access-points", e.base))
@@ -685,13 +716,21 @@ async fn console_crud_permissions_and_cache() {
             .status(),
         204
     );
-    let detail: Option<String> = sqlx::query_scalar(
-        "SELECT detail FROM audit_log WHERE op = 'control:ap-policy' AND object_key = 'owner-ap'",
+    let rows = audit_all(
+        &e,
+        xl_store::control_store::audit::AuditQuery {
+            limit: 10,
+            op: Some("control:ap-policy".into()),
+            key_prefix: Some("owner-ap".into()),
+            ..Default::default()
+        },
     )
-    .fetch_one(e.st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(detail.as_deref(), Some("policy=set"));
+    .await;
+    let rec = rows
+        .iter()
+        .find(|r| r.object_key.as_deref() == Some("owner-ap"))
+        .expect("ap-policy audit");
+    assert_eq!(rec.detail.as_deref(), Some("policy=set"));
     assert_eq!(
         send_status(
             &e,
@@ -758,22 +797,32 @@ async fn console_crud_permissions_and_cache() {
         .await,
         404
     );
-    let (decision, bucket): (String, Option<String>) = sqlx::query_as(
-        "SELECT decision, bucket FROM audit_log WHERE op = 'control:ap-delete' AND object_key = 'owner-ap'",
+    let rows = audit_all(
+        &e,
+        xl_store::control_store::audit::AuditQuery {
+            limit: 10,
+            op: Some("control:ap-delete".into()),
+            key_prefix: Some("owner-ap".into()),
+            ..Default::default()
+        },
     )
-    .fetch_one(e.st.db.pool())
-    .await
-    .unwrap();
+    .await;
+    let rec = rows
+        .iter()
+        .find(|r| r.object_key.as_deref() == Some("owner-ap"))
+        .expect("ap-delete audit");
     assert_eq!(
-        (decision.as_str(), bucket.as_deref()),
+        (rec.decision.as_str(), rec.bucket.as_deref()),
         ("allow", Some("crudb"))
     );
 
-    // I3：审计落行失败只 warn，不阻断动作
-    sqlx::query("DROP TABLE audit_log")
-        .execute(e.st.db.pool())
-        .await
-        .unwrap();
+    // I3：审计落行失败只 warn，不阻断动作（审计目录换成同名普通文件）
+    clear_audit(&e);
+    let audit = oss_server::control_backend::local_state_dir(e.st.store.root())
+        .join("audit")
+        .join("audit_log");
+    std::fs::create_dir_all(audit.parent().unwrap()).unwrap();
+    std::fs::write(&audit, b"not a directory").unwrap();
     assert_eq!(
         create(
             &owner_tok,
@@ -1557,13 +1606,18 @@ async fn restore_object_through_ap() {
             .tier
             .unwrap();
     assert_eq!(tier.phase, TierPhase::Restoring);
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_log WHERE op = 'RestoreObject' AND object_key = 'arch' AND decision = 'allow'",
+    let rows = audit_all(
+        &e,
+        xl_store::control_store::audit::AuditQuery {
+            limit: 10,
+            op: Some("RestoreObject".into()),
+            key_prefix: Some("arch".into()),
+            decision: Some("allow".into()),
+            ..Default::default()
+        },
     )
-    .fetch_one(e.st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(n, 1, "AP 路径的 RestoreObject 应留审计");
+    .await;
+    assert_eq!(rows.len(), 1, "AP 路径的 RestoreObject 应留审计");
 }
 
 /// Copy 源/目标双授权 + canonical key 只解码一次（策略/审计同一 key）+ 合并审计一行。
@@ -1744,10 +1798,7 @@ async fn copy_dual_auth_and_canonical_keys() {
         Some(&ap_policy("Allow", "s3:GetObject", ap_obj)),
     )
     .await;
-    sqlx::query("DELETE FROM audit_log")
-        .execute(e.st.db.pool())
-        .await
-        .unwrap();
+    clear_audit(&e);
     assert_eq!(
         send_status(
             &e,
@@ -1762,22 +1813,26 @@ async fn copy_dual_auth_and_canonical_keys() {
         .await,
         200
     );
+    let rows = audit_all(
+        &e,
+        xl_store::control_store::audit::AuditQuery {
+            limit: 100,
+            op: Some("GetObject".into()),
+            key_prefix: Some("a/b".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    let rows: Vec<_> = rows
+        .into_iter()
+        .filter(|r| r.object_key.as_deref() == Some("a/b"))
+        .collect();
     assert_eq!(
-        count(
-            &e,
-            "SELECT COUNT(*) FROM audit_log WHERE op='GetObject' AND object_key='a/b'"
-        )
-        .await,
+        rows.len(),
         1,
         "经 AP 的请求必须只写一条审计（内层不得二次审计）"
     );
-    let detail: Option<String> = sqlx::query_scalar(
-        "SELECT detail FROM audit_log WHERE op='GetObject' AND object_key='a/b'",
-    )
-    .fetch_one(e.st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(detail.as_deref(), Some("policy:allow;ap:allow"));
+    assert_eq!(rows[0].detail.as_deref(), Some("policy:allow;ap:allow"));
     // %252F 的审计 key 是字面量 a%2Fb
     assert_eq!(
         send_status(
@@ -1793,12 +1848,20 @@ async fn copy_dual_auth_and_canonical_keys() {
         .await,
         200
     );
+    let rows = audit_all(
+        &e,
+        xl_store::control_store::audit::AuditQuery {
+            limit: 100,
+            op: Some("GetObject".into()),
+            key_prefix: Some("a%2Fb".into()),
+            ..Default::default()
+        },
+    )
+    .await;
     assert_eq!(
-        count(
-            &e,
-            "SELECT COUNT(*) FROM audit_log WHERE op='GetObject' AND object_key='a%2Fb'"
-        )
-        .await,
+        rows.iter()
+            .filter(|r| r.object_key.as_deref() == Some("a%2Fb"))
+            .count(),
         1
     );
 
@@ -1811,10 +1874,7 @@ async fn copy_dual_auth_and_canonical_keys() {
         Some(&ap_policy("Deny", "s3:GetObject", ap_obj)),
     )
     .await;
-    sqlx::query("DELETE FROM audit_log")
-        .execute(e.st.db.pool())
-        .await
-        .unwrap();
+    clear_audit(&e);
     assert_eq!(
         send_status(
             &e,
@@ -1829,16 +1889,25 @@ async fn copy_dual_auth_and_canonical_keys() {
         .await,
         403
     );
-    let (decision, detail): (String, Option<String>) = sqlx::query_as(
-        "SELECT decision, detail FROM audit_log WHERE op='GetObject' AND object_key='a/b'",
+    let rows = audit_all(
+        &e,
+        xl_store::control_store::audit::AuditQuery {
+            limit: 100,
+            op: Some("GetObject".into()),
+            key_prefix: Some("a/b".into()),
+            ..Default::default()
+        },
     )
-    .fetch_one(e.st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(decision, "deny");
+    .await;
+    let rec = rows
+        .iter()
+        .find(|r| r.object_key.as_deref() == Some("a/b"))
+        .expect("GetObject deny audit");
+    assert_eq!(rec.decision, "deny");
     assert!(
-        detail.as_deref().unwrap_or("").contains("ap:deny"),
-        "deny 审计应含 ap:deny: {detail:?}"
+        rec.detail.as_deref().unwrap_or("").contains("ap:deny"),
+        "deny 审计应含 ap:deny: {:?}",
+        rec.detail
     );
 }
 
@@ -1858,10 +1927,11 @@ async fn put_emits_event_and_replication_once() {
         "prefix":null,"suffix":null
     }])
     .to_string();
-    sqlx::query("INSERT INTO event_configs (bucket, config_json) VALUES (?, ?)")
-        .bind("evb")
-        .bind(&cfg)
-        .execute(e.st.db.pool())
+    e.st.db
+        .control_write("ap-event-config", move |txn| {
+            let cfg = cfg.clone();
+            Box::pin(async move { txn.bucket_notification_set("evb", &cfg, 1).await })
+        })
         .await
         .unwrap();
     let rules = serde_json::json!([{
@@ -1877,15 +1947,15 @@ async fn put_emits_event_and_replication_once() {
         send_status(&e, Method::PUT, "/ap/ev-ap/k", &[], b"v", &ak, &sk, "s3").await,
         200
     );
-    assert_eq!(count(&e, "SELECT COUNT(*) FROM event_outbox").await, 1);
-    assert_eq!(count(&e, "SELECT COUNT(*) FROM repl_outbox").await, 1);
+    assert_eq!(queue_count(&e, "event_outbox"), 1);
+    assert_eq!(queue_count(&e, "repl_outbox"), 1);
     // 读不产生额外事件/复制
     assert_eq!(
         send_status(&e, Method::GET, "/ap/ev-ap/k", &[], b"", &ak, &sk, "s3").await,
         200
     );
-    assert_eq!(count(&e, "SELECT COUNT(*) FROM event_outbox").await, 1);
-    assert_eq!(count(&e, "SELECT COUNT(*) FROM repl_outbox").await, 1);
+    assert_eq!(queue_count(&e, "event_outbox"), 1);
+    assert_eq!(queue_count(&e, "repl_outbox"), 1);
 }
 
 /// fail-closed：未签名/坏签名/未知 AK 403；AP 缺失 404；坏策略 500；桶删除级联。
@@ -2145,13 +2215,24 @@ async fn delete_objects_through_ap_partial() {
         );
     }
     // 审计：AP 拒键带 ap:deny，与基线 policy:deny 可区分
+    let rows = audit_all(
+        &e,
+        xl_store::control_store::audit::AuditQuery {
+            limit: 100,
+            op: Some("DeleteObjects".into()),
+            key_prefix: Some("ap-denied/b".into()),
+            decision: Some("deny".into()),
+            ..Default::default()
+        },
+    )
+    .await;
     assert_eq!(
-        count(
-            &e,
-            "SELECT COUNT(*) FROM audit_log WHERE op='DeleteObjects' \
-             AND object_key='ap-denied/b' AND decision='deny' AND detail LIKE '%ap:deny%'"
-        )
-        .await,
+        rows.iter()
+            .filter(|r| {
+                r.object_key.as_deref() == Some("ap-denied/b")
+                    && r.detail.as_deref().unwrap_or("").contains("ap:deny")
+            })
+            .count(),
         1
     );
 }
@@ -2570,14 +2651,18 @@ async fn anonymous_through_access_point() {
     assert_eq!(anon_get(&e, "/ap/anon-ap/k").await.status(), 403);
 
     // 审计 uid=0（匿名哨兵）
-    assert!(
-        count(
-            &e,
-            "SELECT COUNT(*) FROM audit_log WHERE uid = 0 AND op = 'GetObject' AND decision = 'allow'"
-        )
-        .await
-            >= 1
-    );
+    let rows = audit_all(
+        &e,
+        xl_store::control_store::audit::AuditQuery {
+            limit: 100,
+            uid: Some(0),
+            op: Some("GetObject".into()),
+            decision: Some("allow".into()),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(!rows.is_empty(), "匿名请求必须留 uid=0 审计");
 }
 
 /// 4.2：Range 计入 SignedHeaders 的多区间请求不再签名失配（403），
@@ -3230,12 +3315,17 @@ async fn source_vpce_registry_binding() {
     let account = e.st.db.bucket_account("vpceb").await.unwrap();
     let get = || send_status(&e, Method::GET, "/ap/vpce-ap/k", &[], b"", &ak, &sk, "s3");
     let last_detail = || async {
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT detail FROM audit_log ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_one(e.st.db.pool())
-        .await
-        .unwrap()
+        e.st.db
+            .control_store()
+            .audit_page(&xl_store::control_store::audit::AuditQuery {
+                limit: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .and_then(|r| r.detail)
     };
 
     // 未登记：字符串匹配但 registry 无行 → 403。

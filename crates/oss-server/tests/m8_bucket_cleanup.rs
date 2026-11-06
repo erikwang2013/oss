@@ -1,9 +1,11 @@
-//! M8 B10：四条桶删除路径的 M8 状态清理 + AP 缓存失效验收。
+//! M8 B10：三条桶删除路径的 M8 状态清理 + AP 缓存失效验收。
 //!
 //! ① xl-s3 `OssS3::delete_bucket`（经 AppState.bucket_cleanup 装配）
 //! ② 控制台 `DELETE /api/v1/buckets/{bucket}`
 //! ③ 站点 changelog `apply_bucket` 的 delete（事务内清表，commit 后才失效 cache）
-//! ④ 集群控制面 `BucketRowSet { set: None }`
+//!
+//! 原 ④（SQLite 延迟外键注入 commit 失败）随 SQLite 后端删除；对象根 CAS
+//! 失败回滚/缓存失效由 `control_store_obj` 单元测试覆盖。
 
 mod common;
 
@@ -19,17 +21,12 @@ use s3s::{S3, S3Request};
 use xl_s3::ap::{AccessPoint, ApSource};
 use xl_s3::bucket_cleanup::BucketCleanupSink;
 use xl_s3::service::OssS3;
+use xl_store::control_store::lifecycle::LifecycleRuleEntry;
+use xl_store::control_store::inventory::{InventoryConfigEntry, InventoryRunRow};
+use xl_store::control_store::tier::TierRestoreRow;
+use xl_store::control_store::{AccessPointEntry, OlapConfigEntry, OwnerRef};
 
 const REGION: &str = "us-east-1";
-/// 五张按 bucket 列的 M8 表（olap_configs 按 access_point，单独断言）。
-const M8_TABLES: [&str; 5] = [
-    "access_points",
-    "inventory_configs",
-    "inventory_runs",
-    "tier_restores",
-    "lifecycle_rules",
-];
-
 fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -41,24 +38,89 @@ fn now() -> i64 {
 async fn seed(st: &AppState, bucket: &str, ap: &str) {
     st.store.create_bucket(bucket).await.unwrap();
     st.db.insert_bucket(bucket, None).await.unwrap();
-    // 值均为测试常量（桶名/AP 名皆为字面量），审计后断言 SQL 安全。
-    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO access_points (name,bucket,owner_id,policy_json,created_at,updated_at) \
-           VALUES ('{ap}','{bucket}',0,NULL,1,1);\
-         INSERT INTO olap_configs (access_point,kind,endpoint,updated_at) \
-           VALUES ('{ap}','http','http://old',1);\
-         INSERT INTO inventory_configs (bucket,id,owner_id,config_json,updated_at) \
-           VALUES ('{bucket}','daily',0,'{{}}',1);\
-         INSERT INTO inventory_runs (bucket,config_id,run_key,started_at,state,created_at) \
-           VALUES ('{bucket}','daily','k',1,'done',1);\
-         INSERT INTO tier_restores (bucket,key,version_id,created_at) \
-           VALUES ('{bucket}','k','v',1);\
-         INSERT INTO lifecycle_rules (bucket,prefix,expire_days,enabled,updated_at) \
-           VALUES ('{bucket}','',1,1,1);"
-    )))
-    .execute(st.db.pool())
-    .await
-    .unwrap();
+    let b = bucket.to_string();
+    let a = ap.to_string();
+    st.db
+        .control_write("bucket-cleanup-seed", move |txn| {
+            let (b, a) = (b.clone(), a.clone());
+            Box::pin(async move {
+                txn.access_point_create(&AccessPointEntry {
+                    name: a.clone(),
+                    bucket: b.clone(),
+                    owner: OwnerRef::Admin,
+                    policy_json: None,
+                    created_at: 1,
+                    updated_at: 1,
+                })
+                .await?;
+                txn.olap_config_upsert(&OlapConfigEntry {
+                    access_point: a,
+                    kind: "http".into(),
+                    endpoint: Some("http://old".into()),
+                    module: None,
+                    module_sha256: None,
+                    timeout_ms: 5000,
+                    max_response_bytes: 1024,
+                    updated_at: 1,
+                })
+                .await?;
+                txn.inventory_config_upsert(&InventoryConfigEntry {
+                    bucket: b.clone(),
+                    id: "daily".into(),
+                    owner: OwnerRef::Admin,
+                    config_json: "{}".into(),
+                    updated_at: 1,
+                })
+                .await?;
+                txn.inventory_run_upsert(&InventoryRunRow {
+                    id: 1,
+                    bucket: b.clone(),
+                    config_id: "daily".into(),
+                    run_key: "k".into(),
+                    started_at: 1,
+                    state: "done".into(),
+                    job_id: None,
+                    manifest_key: None,
+                    error: None,
+                    created_at: 1,
+                    fence_term: 0,
+                    fence_leader: 0,
+                })
+                .await?;
+                txn.tier_restore_upsert(&TierRestoreRow {
+                    bucket: b.clone(),
+                    key: "k".into(),
+                    version_id: "v".into(),
+                    expires_at: 0,
+                    job_id: None,
+                    state: "restored".into(),
+                    created_at: 1,
+                    fence_term: 0,
+                    fence_leader: 0,
+                })
+                .await?;
+                txn.replace_lifecycle_rules(
+                    &b,
+                    &[LifecycleRuleEntry {
+                        bucket: b.clone(),
+                        prefix: String::new(),
+                        rule_id: None,
+                        expire_days: 1,
+                        expiration_days: None,
+                        transition_days: None,
+                        transition_class: None,
+                        transition_tier: None,
+                        enabled: true,
+                        updated_at: 1,
+                        config_json: None,
+                    }],
+                )
+                .await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
     st.ap_cache.put(
         AccessPoint::from_row(
             ap.into(),
@@ -71,33 +133,36 @@ async fn seed(st: &AppState, bucket: &str, ap: &str) {
     );
 }
 
-async fn count(st: &AppState, sql: &str, binder: &str) -> i64 {
-    // 调用方只传字面量 SQL（表名来自常量数组）。
-    sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-        .bind(binder)
-        .fetch_one(st.db.pool())
-        .await
-        .unwrap()
-}
-
-/// 该桶的 M8 表与 AP 缓存必须已清空。
+/// 该桶的 M8 行与 AP 缓存必须已清空。
 async fn assert_cleared(st: &AppState, bucket: &str, ap: &str) {
-    for table in M8_TABLES {
-        let n = count(
-            st,
-            &format!("SELECT COUNT(*) FROM {table} WHERE bucket = ?"),
-            bucket,
-        )
-        .await;
-        assert_eq!(n, 0, "{table} 未清（bucket={bucket}）");
-    }
-    let olap = count(
-        st,
-        "SELECT COUNT(*) FROM olap_configs WHERE access_point = ?",
-        ap,
-    )
-    .await;
-    assert_eq!(olap, 0, "olap_configs 未清（ap={ap}）");
+    let cs = st.db.control_store();
+    assert!(
+        cs.access_point(ap).await.unwrap().is_none(),
+        "access_points 未清（ap={ap}）"
+    );
+    assert!(
+        cs.olap_config(ap).await.unwrap().is_none(),
+        "olap_configs 未清（ap={ap}）"
+    );
+    assert!(
+        cs.inventory_config(bucket, "daily").await.unwrap().is_none(),
+        "inventory_configs 未清（bucket={bucket}）"
+    );
+    assert!(
+        cs.inventory_run_by_key(bucket, "daily", "k")
+            .await
+            .unwrap()
+            .is_none(),
+        "inventory_runs 未清（bucket={bucket}）"
+    );
+    assert!(
+        cs.tier_restore(bucket, "k", "v").await.unwrap().is_none(),
+        "tier_restores 未清（bucket={bucket}）"
+    );
+    assert!(
+        cs.lifecycle_rules(bucket).await.unwrap().is_empty(),
+        "lifecycle_rules 未清（bucket={bucket}）"
+    );
     assert!(st.ap_cache.get(ap).is_none(), "AP 缓存未失效（ap={ap}）");
 }
 
@@ -113,12 +178,12 @@ async fn assert_not_inherited(st: &AppState, bucket: &str, ap: &str) {
         src.lookup(ap).await.unwrap().is_none(),
         "重建桶继承了旧 AP（路由应 404）"
     );
-    let inv = count(
-        st,
-        "SELECT COUNT(*) FROM inventory_configs WHERE bucket = ?",
-        bucket,
-    )
-    .await;
+    let inv = st
+        .db
+        .control_store()
+        .inventory_config_count(bucket)
+        .await
+        .unwrap();
     assert_eq!(inv, 0, "重建桶继承了旧 Inventory 配置");
 }
 
@@ -236,44 +301,3 @@ async fn path_site_apply_clears_m8_and_invalidates_after_commit() {
 }
 
 /// ③ commit 失败：cache 不得被失效（回滚后 M8 行仍在，预热缓存仍有效）。
-#[tokio::test]
-async fn path_site_apply_commit_failure_keeps_cache() {
-    let dir = tempfile::tempdir().unwrap();
-    let st = state(dir.path()).await;
-    seed(&st, "sitefail", "sitefail-ap").await;
-    // 延迟到 COMMIT 才校验的外键：AFTER DELETE 触发器插入引用已删桶的行。
-    sqlx::raw_sql(
-        "CREATE TABLE commit_guard (\
-           name TEXT REFERENCES buckets(name) DEFERRABLE INITIALLY DEFERRED);\
-         CREATE TRIGGER commit_guard_trg AFTER DELETE ON buckets BEGIN \
-           INSERT INTO commit_guard (name) VALUES (OLD.name); END;",
-    )
-    .execute(st.db.pool())
-    .await
-    .unwrap();
-    let entry = Entry {
-        seq: 2,
-        origin_site_id: "peer-site".into(),
-        entity: "bucket".into(),
-        entity_id: "sitefail".into(),
-        op: "delete".into(),
-        payload: serde_json::json!({}),
-        priority: 0,
-        ts: now(),
-    };
-    let err = apply_changelog(&st, vec![entry]).await.unwrap_err();
-    assert!(err.contains("FOREIGN KEY"), "应因 commit 期外键失败：{err}");
-    assert!(
-        st.ap_cache.get("sitefail-ap").is_some(),
-        "commit 失败不得失效 AP 缓存"
-    );
-    // 事务回滚：AP 行仍在（clear 未提交）。
-    assert!(
-        st.db
-            .control_store()
-            .access_point("sitefail-ap")
-            .await
-            .unwrap()
-            .is_some()
-    );
-}

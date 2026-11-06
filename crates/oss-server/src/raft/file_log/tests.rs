@@ -12,7 +12,7 @@ use super::segments::{
 };
 use super::{FileLogStore, LOG_DIR, raft_dir};
 use crate::raft::file_meta::RaftMetaFile;
-use crate::raft::store::SqliteLogStore;
+use crate::raft::store::encode_entry;
 use crate::raft::{ControlCommand, TypeConfig};
 
 mod crash;
@@ -161,35 +161,24 @@ async fn raft_file_log_accepts_initial_entry_at_index_zero() {
 }
 
 #[tokio::test]
-async fn raft_file_log_entry_bytes_match_sqlite_data_fixture() {
+async fn raft_file_log_entry_bytes_match_encoder() {
     let dir = tempfile::tempdir().unwrap();
-    let sqlite_path = dir.path().join("legacy.db");
-    let sqlite = SqliteLogStore::open(&sqlite_path).await.unwrap();
     let entries = vec![blank(1), set_value(2, &"x".repeat(4096))];
-    sqlite.append_entries(&entries).await.unwrap();
-    let sqlite_bytes: Vec<Vec<u8>> = {
-        let mut out = Vec::new();
-        for index in 1..=2 {
-            out.push(
-                sqlite
-                    .raw_entry_for_test(index)
-                    .await
-                    .expect("sqlite row")
-                    .into_bytes(),
-            );
-        }
-        out
-    };
-    assert!(sqlite_bytes[1].starts_with(b"z1:"));
+    let expected: Vec<Vec<u8>> = entries
+        .iter()
+        .map(|entry| encode_entry(entry).unwrap().into_bytes())
+        .collect();
+    // 大 entry 必须走压缩形态，且前缀无歧义。
+    assert!(expected[1].starts_with(b"z1:"));
 
     let path = dir.path().join("raft.db");
     let mut store = FileLogStore::open(&path).await.unwrap();
     append(&mut store, entries.clone());
-    for (i, expected) in sqlite_bytes.iter().enumerate() {
+    for (i, expected) in expected.iter().enumerate() {
         assert_eq!(
             &raw_payload(&store, (i + 1) as u64),
             expected,
-            "file log entry {} must keep the exact raft_log.data bytes",
+            "file log entry {} must keep the exact encoded bytes",
             i + 1
         );
     }

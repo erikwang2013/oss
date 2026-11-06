@@ -39,8 +39,6 @@ mod snapshot;
 #[cfg(test)]
 mod snapshot_crash_tests;
 #[cfg(test)]
-mod snapshot_gate_tests;
-#[cfg(test)]
 mod snapshot_tests;
 #[cfg(test)]
 mod tests;

@@ -30,6 +30,7 @@ use s3s_sigv4::{
     AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign,
 };
 use sha2::Sha256;
+use xl_store::control_store::sync_intents::{NewSyncDeleteIntent, NewSyncWriteIntent};
 use xl_store::store::{Store, StoreConfig};
 
 const REGION: &str = "us-east-1";
@@ -413,9 +414,7 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
     let remote = spawn_remote(mode).await;
     let dbdir = tempfile::tempdir().unwrap();
     let datadir = tempfile::tempdir().unwrap();
-    let db_url = format!("sqlite://{}?mode=rwc", dbdir.path().join("t.db").display());
-    let gate_db = Arc::new(Db::connect(&db_url).await.unwrap());
-    gate_db.insert_site(&peer(&remote.base)).await.unwrap();
+    let gate_db = Arc::new(Db::connect_object().await.unwrap());
     let tee_dir = datadir.path().join("tee");
     let metrics = Arc::new(SyncMetrics::default());
     let mut sc = StoreConfig::new(datadir.path());
@@ -439,7 +438,7 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
         maintenance: false,
         read_only: false,
         staging_dir: datadir.path().join("staging"),
-        database_url: db_url.clone(),
+        database_url: String::new(),
         jwt_secret: "0123456789abcdef0123456789abcdef".into(),
         jwt_previous_secrets: vec![],
         max_put_bytes: 1024 * 1024,
@@ -469,11 +468,22 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
     };
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();
-    let db = Db::connect(&db_url).await.unwrap();
-    let mut st = AppState::new(cfg, db, std::sync::Arc::new(store)).await;
+    let object = oss_server::control_backend::ObjectControl::open(
+        Arc::clone(&store),
+        oss_server::control_backend::expected_mode(false),
+        None,
+    )
+    .await
+    .unwrap();
+    gate_db.attach_object_control(Arc::clone(&object)).unwrap();
+    gate_db.insert_site(&peer(&remote.base)).await.unwrap();
+    let db = Db::connect_object().await.unwrap();
+    db.attach_object_control(object).unwrap();
+    let mut st = AppState::new(cfg, db, Arc::clone(&store)).await;
     // 与生产 `load` 同口径：/metrics 读的就是门里的同一份计数。
     st.sync_metrics = Arc::clone(&metrics);
-    let uid = st.db.create_user("alice", "pw", false).await.unwrap();
+    // sync 门测试走对象锁等未映射到权限词表的操作，用管理员账号验证到门边界。
+    let uid = st.db.create_user("alice", "pw", true).await.unwrap();
     st.db.create_access_key(AK, SK, uid).await.unwrap();
     st.db
         .set_permissions(
@@ -522,28 +532,104 @@ async fn make_bucket(st: &AppState, name: &str, uid: i64, mode: &str) {
 }
 
 async fn set_bucket(st: &AppState, name: &str, col: &str, val: &str) {
-    assert!(matches!(
-        col,
-        "replication_mode" | "versioning" | "deleting" | "object_lock"
-    ));
-    let sql = format!("UPDATE buckets SET {col} = ? WHERE name = ?");
-    sqlx::query(sqlx::AssertSqlSafe(sql))
-        .bind(val)
-        .bind(name)
-        .execute(st.db.pool())
-        .await
-        .unwrap();
+    let name = name.to_owned();
+    match col {
+        "replication_mode" => {
+            let view = st
+                .db
+                .control_store()
+                .bucket(&name)
+                .await
+                .unwrap()
+                .expect("bucket row");
+            st.db
+                .upsert_bucket_owner_set_mode(&name, view.owner_uid, 0, val)
+                .await
+                .unwrap();
+        }
+        "versioning" => {
+            let val = val.to_owned();
+            st.db
+                .control_write("sync-test-versioning", move |txn| {
+                    let name = name.clone();
+                    let val = val.clone();
+                    Box::pin(
+                        async move { txn.bucket_set_versioning(&name, &val).await.map(|_| ()) },
+                    )
+                })
+                .await
+                .unwrap();
+        }
+        "deleting" => {
+            st.db.set_bucket_deleting(&name, val == "1").await.unwrap();
+        }
+        "object_lock" => {
+            st.db
+                .control_write("sync-test-object-lock", move |txn| {
+                    let name = name.clone();
+                    Box::pin(async move {
+                        txn.bucket_set_object_lock(&name, true, None, None)
+                            .await
+                            .map(|_| ())
+                    })
+                })
+                .await
+                .unwrap();
+        }
+        other => panic!("unsupported bucket column {other}"),
+    }
+}
+
+struct ReplOutboxWire {
+    bucket: String,
+    key: String,
+    target_kind: String,
+}
+
+fn outbox_rows(st: &AppState) -> Vec<ReplOutboxWire> {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        bucket: String,
+        key: String,
+        target_kind: String,
+    }
+    st.db
+        .object_control()
+        .unwrap()
+        .control
+        .local_store()
+        .unwrap()
+        .queue("repl_outbox")
+        .unwrap()
+        .scan()
+        .into_iter()
+        .map(|e| rmp_serde::from_slice::<Row>(&e.payload).unwrap())
+        .map(|r| ReplOutboxWire {
+            bucket: r.bucket,
+            key: r.key,
+            target_kind: r.target_kind,
+        })
+        .collect()
 }
 
 async fn outbox(st: &AppState, bucket: &str, key: &str) -> i64 {
-    sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repl_outbox WHERE target_kind='site' AND bucket = ? AND key = ?",
-    )
-    .bind(bucket)
-    .bind(key)
-    .fetch_one(st.db.pool())
-    .await
-    .unwrap()
+    outbox_rows(st)
+        .iter()
+        .filter(|r| r.target_kind == "site" && r.bucket == bucket && r.key == key)
+        .count() as i64
+}
+
+async fn clear_sites(st: &AppState) {
+    for peer in st.db.list_sites().await.unwrap() {
+        st.db.delete_site(&peer.peer_id).await.unwrap();
+    }
+}
+
+async fn set_site_endpoint(st: &AppState, endpoint: &str) {
+    let mut peer = st.db.get_site("b").await.unwrap().expect("site b");
+    peer.endpoint = endpoint.into();
+    st.db.delete_site("b").await.unwrap();
+    st.db.insert_site(&peer).await.unwrap();
 }
 
 fn tee_entries(e: &Env) -> usize {
@@ -893,10 +979,6 @@ async fn sync_write_boundaries_reject_unsupported_combinations() {
     // 直接置桶锁位（enable_bucket_lock 的 upsert 会撞站点时钟触发器，测试不测该路径）；
     // 桶锁配置 op 未映射到权限词表（非 admin fail-closed 403），临时提权以验证到 sync 边界。
     set_bucket(&e.st, "syn", "object_lock", "1").await;
-    sqlx::query("UPDATE users SET is_admin = 1")
-        .execute(e.st.db.pool())
-        .await
-        .unwrap();
     // SSE-C → 400
     let key = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
     let ssec = [
@@ -1131,12 +1213,8 @@ async fn remote_timeout_is_503_and_invisible() {
 #[tokio::test]
 async fn gates_require_single_peer_and_ready_bucket() {
     let e = env(Mode::Ok, 1 << 20).await;
-    let pool = e.st.db.pool();
     // 0 peer
-    sqlx::query("DELETE FROM sites")
-        .execute(pool)
-        .await
-        .unwrap();
+    clear_sites(&e.st).await;
     assert_eq!(put(&e, "/syn/gate1.txt", b"x").await.status(), 503);
     // 2 peer（第二个换 peer_id，避免主键冲突）
     let mut p2 = peer(&e.remote.base);
@@ -1145,10 +1223,7 @@ async fn gates_require_single_peer_and_ready_bucket() {
     e.st.db.insert_site(&p2).await.unwrap();
     assert_eq!(put(&e, "/syn/gate2.txt", b"x").await.status(), 503);
     // 回到 1 peer
-    sqlx::query("DELETE FROM sites WHERE peer_id = 'c'")
-        .execute(pool)
-        .await
-        .unwrap();
+    e.st.db.delete_site("c").await.unwrap();
     assert_eq!(put(&e, "/syn/gate3.txt", b"x").await.status(), 200);
     // 删桶中
     set_bucket(&e.st, "syn", "deleting", "1").await;
@@ -1733,26 +1808,44 @@ async fn site_delete_route_is_local_only_and_token_authed() {
 }
 
 async fn intent_rows(st: &AppState) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM sync_write_intents")
-        .fetch_one(st.db.pool())
+    st.db
+        .control_write("sync-test-intent-count", |txn| {
+            Box::pin(async move { txn.sync_write_intent_count().await })
+        })
         .await
         .unwrap()
 }
 
 async fn insert_intent(st: &AppState, id: &str, key: &str, tee: &std::path::Path) {
-    sqlx::query(
-        "INSERT INTO sync_write_intents \
-         (id, bucket, key, local_version_id, remote_version_id, tee_path, commit_json, \
-          state, created_at, updated_at) VALUES (?, 'syn', ?, ?, ?, ?, '{}', 'remote_done', 0, 0)",
-    )
-    .bind(id)
-    .bind(key)
-    .bind(id)
-    .bind(id)
-    .bind(tee.to_string_lossy().into_owned())
-    .execute(st.db.pool())
-    .await
-    .unwrap();
+    insert_intent_state(st, id, key, tee, "remote_done", 0).await;
+}
+
+async fn insert_intent_state(
+    st: &AppState,
+    id: &str,
+    key: &str,
+    tee: &std::path::Path,
+    state: &str,
+    updated_at: i64,
+) {
+    let row = NewSyncWriteIntent {
+        id: id.into(),
+        bucket: "syn".into(),
+        key: key.into(),
+        local_version_id: id.into(),
+        remote_version_id: id.into(),
+        tee_path: tee.to_string_lossy().into_owned(),
+        commit_json: "{}".into(),
+        state: state.into(),
+        created_at: 0,
+        updated_at,
+    };
+    st.db
+        .object_local_write("sync-test-intent", move |txn| {
+            Box::pin(async move { txn.sync_write_intent_insert(&row).await })
+        })
+        .await
+        .unwrap();
 }
 
 /// I1：恢复三态——本地已提交只清行；远端孤儿删远端；不可达保留重试。
@@ -1815,10 +1908,7 @@ async fn recovery_cleans_committed_and_orphan_intents() {
     );
 
     // C) 远端不可达：保留；恢复可达后清掉。
-    sqlx::query("UPDATE sites SET endpoint = 'http://127.0.0.1:1'")
-        .execute(e.st.db.pool())
-        .await
-        .unwrap();
+    set_site_endpoint(&e.st, "http://127.0.0.1:1").await;
     let pending = uuid::Uuid::new_v4().to_string();
     let tee3 = e.tee_dir.join(format!("{pending}.plain"));
     std::fs::write(&tee3, b"z").unwrap();
@@ -1826,11 +1916,7 @@ async fn recovery_cleans_committed_and_orphan_intents() {
     recover_write_intents(&e.st).await;
     assert_eq!(intent_rows(&e.st).await, 1, "远端不可达必须保留 intent");
     assert!(tee3.exists(), "保留时不得删 tee");
-    sqlx::query("UPDATE sites SET endpoint = ?")
-        .bind(&e.remote.base)
-        .execute(e.st.db.pool())
-        .await
-        .unwrap();
+    set_site_endpoint(&e.st, &e.remote.base).await;
     recover_write_intents(&e.st).await;
     assert_eq!(intent_rows(&e.st).await, 0);
     assert!(!tee3.exists());
@@ -1843,20 +1929,15 @@ async fn recovery_cleans_committed_and_orphan_intents() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    sqlx::query(
-        "INSERT INTO sync_write_intents \
-         (id, bucket, key, local_version_id, remote_version_id, tee_path, commit_json, \
-          state, created_at, updated_at) VALUES (?, 'syn', 'inflight.txt', ?, ?, ?, '{}', \
-          'remote_pending', 0, ?)",
+    insert_intent_state(
+        &e.st,
+        &inflight,
+        "inflight.txt",
+        &tee4,
+        "remote_pending",
+        now,
     )
-    .bind(&inflight)
-    .bind(&inflight)
-    .bind(&inflight)
-    .bind(tee4.to_string_lossy().into_owned())
-    .bind(now)
-    .execute(e.st.db.pool())
-    .await
-    .unwrap();
+    .await;
     let deletes_before = e.remote.site_deletes().len();
     recover_write_intents(&e.st).await;
     assert_eq!(intent_rows(&e.st).await, 1, "在途 intent 必须保留");
@@ -1869,13 +1950,14 @@ async fn recovery_cleans_committed_and_orphan_intents() {
 }
 
 async fn delete_intent_rows(st: &AppState) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM sync_delete_intents")
-        .fetch_one(st.db.pool())
+    st.db
+        .control_write("sync-test-delete-intent-count", |txn| {
+            Box::pin(async move { txn.sync_delete_intent_count().await })
+        })
         .await
         .unwrap()
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn insert_delete_intent(
     st: &AppState,
     op: &str,
@@ -1884,20 +1966,24 @@ async fn insert_delete_intent(
     remote_vid: &str,
     marker_vid: &str,
 ) {
-    sqlx::query(
-        "INSERT INTO sync_delete_intents \
-         (id, bucket, key, op, local_version_id, remote_version_id, marker_version_id, \
-          state, created_at, updated_at) VALUES (?, 'syn', ?, ?, ?, ?, ?, 'remote_pending', 0, 0)",
-    )
-    .bind(uuid::Uuid::new_v4().to_string())
-    .bind(key)
-    .bind(op)
-    .bind(local_vid)
-    .bind(remote_vid)
-    .bind(marker_vid)
-    .execute(st.db.pool())
-    .await
-    .unwrap();
+    let row = NewSyncDeleteIntent {
+        id: uuid::Uuid::new_v4().to_string(),
+        bucket: "syn".into(),
+        key: key.into(),
+        op: op.into(),
+        local_version_id: local_vid.into(),
+        remote_version_id: remote_vid.into(),
+        marker_version_id: marker_vid.into(),
+        state: "remote_pending".into(),
+        created_at: 0,
+        updated_at: 0,
+    };
+    st.db
+        .object_local_write("sync-test-delete-intent", move |txn| {
+            Box::pin(async move { txn.sync_delete_intent_insert(&row).await })
+        })
+        .await
+        .unwrap();
 }
 
 fn hdr(r: &reqwest::Response, name: &str) -> String {
@@ -2151,13 +2237,26 @@ async fn delete_objects_sync_is_remote_first_and_partial_failure_is_503() {
 async fn lifecycle_expiration_on_sync_bucket_is_remote_first() {
     let e = env(Mode::Ok, 1 << 20).await;
     assert_eq!(put(&e, "/syn/exp.txt", b"expire me").await.status(), 200);
-    sqlx::query(
-        "INSERT INTO lifecycle_rules (bucket, prefix, expire_days, enabled, updated_at) \
-         VALUES ('syn', '', 0, 1, 0)",
-    )
-    .execute(e.st.db.pool())
-    .await
-    .unwrap();
+    e.st.db
+        .set_lifecycle_rules(
+            "syn",
+            &[oss_server::db::LifecycleRuleRow {
+                bucket: "syn".into(),
+                rule_id: None,
+                prefix: String::new(),
+                expire_days: 0,
+                expiration_days: None,
+                transition_days: None,
+                transition_class: None,
+                transition_tier: None,
+                enabled: true,
+                updated_at: 0,
+                config_json: None,
+            }],
+            0,
+        )
+        .await
+        .unwrap();
     assert_eq!(sweep_once(&e.st).await, 1);
     let dels = e.remote.site_deletes();
     assert_eq!(dels.len(), 1, "生命周期删除必须先到远端");
@@ -2408,10 +2507,7 @@ async fn recovery_stale_delete_bucket_intent_spares_recreated_bucket() {
     );
     // 模拟 intent_clean 未落盘（崩溃/SQLite busy）：旧行 updated_at=0 必被扫描。
     insert_delete_intent(&e.st, "delete_bucket", "", "", "", "").await;
-    let uid: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'alice'")
-        .fetch_one(e.st.db.pool())
-        .await
-        .unwrap();
+    let uid = e.st.db.verify_user("alice", "pw").await.unwrap().unwrap();
     make_bucket(&e.st, "syn", uid, "sync").await;
     // 删桶已清授权行：同名重建需重新授权（否则 S3 面 403）。
     e.st.db

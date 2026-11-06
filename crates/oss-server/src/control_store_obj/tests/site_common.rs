@@ -21,28 +21,6 @@ pub(super) fn now() -> i64 {
         .as_secs() as i64
 }
 
-/// SQLite side: one seeded config (priority 7) and one paired site.
-pub(super) async fn sqlite_site() -> (crate::db::Db, String) {
-    let db = crate::db::Db::connect("sqlite::memory:").await.unwrap();
-    db.apply_site_config(Some("a"), Some("us-east-1"), Some(7), Some(&"t".repeat(32)))
-        .await
-        .unwrap();
-    let id: String = sqlx::query_scalar("SELECT id FROM site_config LIMIT 1")
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-    sqlx::query(
-        "INSERT INTO sites (peer_id, remote_site_id, name, endpoint, region, priority, \
-         s3_access_key, s3_secret_key, peer_site_token, created_at) \
-         VALUES ('peer-b', 'remote-b', 'b', 'http://127.0.0.1:9', 'us-east-1', 0, \
-                 'ak', 'sk', 'tok', 0)",
-    )
-    .execute(db.pool())
-    .await
-    .unwrap();
-    (db, id)
-}
-
 /// Object side: matching config (priority 7) and paired site.
 pub(super) async fn object_site(id: &str) -> Real {
     let real = real_store().await;
@@ -121,63 +99,6 @@ where
     run_origin(real, WriteOrigin::local("test"), f).await
 }
 
-pub(super) async fn sql_rows(db: &crate::db::Db) -> Vec<(String, String, String, String)> {
-    sqlx::query_as("SELECT entity, entity_id, op, payload FROM site_changelog ORDER BY seq")
-        .fetch_all(db.pool())
-        .await
-        .unwrap()
-}
-
 pub(super) async fn obj_rows(real: &Real) -> Vec<SiteChangelogRow> {
     real.control.site_changelog_after(0).await.unwrap()
-}
-
-pub(super) fn assert_rows(sql: &[(String, String, String, String)], obj: &[SiteChangelogRow]) {
-    // SQLite side may contain seed-trigger rows that the object side did not
-    // produce; require every object row to appear, in order, as a SQLite row.
-    let mut at = 0;
-    for (i, row) in obj.iter().enumerate() {
-        let found = sql[at..].iter().position(|(entity, id, op, payload)| {
-            row.entity == *entity
-                && row.entity_id == *id
-                && row.op == *op
-                && row.payload == *payload
-        });
-        match found {
-            Some(offset) => at += offset + 1,
-            None => panic!("object row {i} absent from SQLite changelog: sql={sql:?} obj={obj:?}"),
-        }
-    }
-}
-
-/// Install the same future clock on both backends so the next hook gate rejects.
-pub(super) async fn block(db: &crate::db::Db, real: &Real, entity: &str, id: &str) {
-    let ts = now() + 3600;
-    sqlx::query(
-        "INSERT OR REPLACE INTO site_entity_clock \
-         (entity, entity_id, ts, priority, origin_site_id, seq) \
-         VALUES (?, ?, ?, 7, 'remote-z', 99)",
-    )
-    .bind(entity)
-    .bind(id)
-    .bind(ts)
-    .execute(db.pool())
-    .await
-    .unwrap();
-    let entity = entity.to_string();
-    let id = id.to_string();
-    run_hook(real, |txn| {
-        let entity = entity.clone();
-        let id = id.clone();
-        Box::pin(async move {
-            txn.site_put_clock(&entity, &id, ts, 7, "remote-z", 99)
-                .await
-        })
-    })
-    .await
-    .unwrap();
-}
-
-pub(super) fn nasty() -> String {
-    "q\"b\\c\u{1}\u{8}\t\n\r\u{1f}é".into()
 }

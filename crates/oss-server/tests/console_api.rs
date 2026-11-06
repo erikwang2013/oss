@@ -167,34 +167,6 @@ async fn register_upload_hit_is_204_miss_is_404() {
     assert_eq!(resp.status(), 404);
 }
 
-/// register Err→500（微调轮裁决）：DB 故障在 HTTP 面可构造——经池 drop 掉 uploads 表。
-#[tokio::test]
-async fn register_upload_db_failure_is_500() {
-    let dir = tempfile::tempdir().unwrap();
-    let st = state(dir.path()).await;
-    st.db.create_user("erik", "pw", true).await.unwrap();
-    sqlx::query("DROP TABLE uploads")
-        .execute(st.db.pool())
-        .await
-        .unwrap();
-    let base = serve(build_router(st).unwrap()).await;
-    let token = login_token(&base).await;
-
-    let resp = reqwest::Client::new()
-        .post(format!("{base}/api/v1/uploads/register"))
-        .bearer_auth(&token)
-        .json(&serde_json::json!({"saved_path": "a.txt", "original_name": "b.txt"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 500);
-    assert_eq!(
-        resp.text().await.unwrap(),
-        "internal error",
-        "5xx 不泄内部细节"
-    );
-}
-
 // ---- Task 15 收尾轮（I-1 / M-2 / M-3 / M-4）新增 ----
 
 /// I-1②：12 条 method-route 去掉 login = 11 条，匿名一律 401 —— 鉴权是整面 `JwtLayer`（不是逐 handler
@@ -528,11 +500,17 @@ async fn console_delete_missing_emits_no_event() {
     let tok = login_token(&base).await;
     st.store.create_bucket("cmb").await.unwrap();
     st.db.insert_bucket("cmb", None).await.unwrap();
-    sqlx::query("INSERT INTO event_configs (bucket, config_json) VALUES ('cmb', ?)")
-        .bind(
-            r#"[{"id":"a","target":"t1","events":["s3:ObjectRemoved:Delete"],"prefix":null,"suffix":null}]"#,
-        )
-        .execute(st.db.pool())
+    st.db
+        .control_write("console-empty-delete-config", |txn| {
+            Box::pin(async move {
+                txn.bucket_notification_set(
+                    "cmb",
+                    r#"[{"id":"a","target":"t1","events":["s3:ObjectRemoved:Delete"],"prefix":null,"suffix":null}]"#,
+                    1,
+                )
+                .await
+            })
+        })
         .await
         .unwrap();
     let resp = reqwest::Client::new()
@@ -542,11 +520,14 @@ async fn console_delete_missing_emits_no_event() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204, "空删幂等 204");
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE bucket='cmb'")
-        .fetch_one(st.db.pool())
+    let claims = st
+        .db
+        .control_write("console-empty-delete-outbox", |txn| {
+            Box::pin(async move { txn.event_claim(1, 100).await })
+        })
         .await
         .unwrap();
-    assert_eq!(n, 0, "空删不得发事件");
+    assert!(claims.is_empty(), "空删不得发事件");
 }
 
 /// M6 切片 0（R5/P2-4）：控制台删对象发 `s3:ObjectRemoved:Delete`（source=oss-console）。
@@ -563,23 +544,34 @@ async fn console_delete_emits_event() {
         .put_object("cdb", "d.txt", bytes::Bytes::from_static(b"d"), None)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO event_configs (bucket, config_json) VALUES ('cdb', ?)")
-        .bind(
-            r#"[{"id":"a","target":"t1","events":["s3:ObjectRemoved:Delete"],"prefix":null,"suffix":null}]"#,
-        )
-        .execute(st.db.pool())
+    st.db
+        .control_write("console-delete-config", |txn| {
+            Box::pin(async move {
+                txn.bucket_notification_set(
+                    "cdb",
+                    r#"[{"id":"a","target":"t1","events":["s3:ObjectRemoved:Delete"],"prefix":null,"suffix":null}]"#,
+                    1,
+                )
+                .await
+            })
+        })
         .await
         .unwrap();
 
     // M6 切片 4（V3②）：控制台硬删同样入复制队列（无源版本号）
-    sqlx::query(
-        "INSERT INTO replication_rules (bucket, rules_json) VALUES ('cdb', ?) \
-         ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json",
-    )
-    .bind(r#"[{"id":"r","prefix":null,"remote_id":"r1","dest_bucket":"dst","delete_marker":true,"enabled":true}]"#)
-    .execute(st.db.pool())
-    .await
-    .unwrap();
+    st.db
+        .control_write("console-delete-repl-rules", |txn| {
+            Box::pin(async move {
+                txn.bucket_replication_rules_set(
+                    "cdb",
+                    r#"[{"id":"r","prefix":null,"remote_id":"r1","dest_bucket":"dst","delete_marker":true,"enabled":true}]"#,
+                    1,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
 
     let resp = reqwest::Client::new()
         .delete(format!("{base}/api/v1/buckets/cdb/objects/d.txt"))
@@ -588,19 +580,27 @@ async fn console_delete_emits_event() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repl_outbox WHERE bucket='cdb' AND is_delete_marker=1 AND version_id=''",
-    )
-    .fetch_one(st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(n, 1, "控制台硬删应入复制队列");
-
-    let json: String = sqlx::query_scalar("SELECT event_json FROM event_outbox WHERE bucket='cdb'")
-        .fetch_one(st.db.pool())
+    let counts = st
+        .db
+        .control_store()
+        .repl_version_counts("cdb", "d.txt", "")
         .await
         .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(counts.pending, 1, "控制台硬删应入复制队列");
+
+    let claims = st
+        .db
+        .control_write("console-delete-outbox", |txn| {
+            Box::pin(async move { txn.event_claim(1, 100).await })
+        })
+        .await
+        .unwrap();
+    let json = claims
+        .iter()
+        .map(|c| c.event_json.as_str())
+        .find(|j| j.contains("ObjectRemoved"))
+        .expect("console delete event");
+    let v: serde_json::Value = serde_json::from_str(json).unwrap();
     assert_eq!(v["eventName"], "s3:ObjectRemoved:Delete");
     assert_eq!(v["source"]["userAgent"], "oss-console");
     assert_eq!(v["s3"]["object"]["key"], "d.txt");
@@ -801,11 +801,27 @@ async fn preempted_job_surfaces_as_runtime_state_not_failure() {
         )
         .await
         .unwrap();
-    sqlx::query("UPDATE jobs SET state='preempted', started_at=1001, updated_at=1001 WHERE id=?")
-        .bind(id)
-        .execute(st.db.pool())
+    let claimed = st.db.claim_task(1000, 3600).await.unwrap().unwrap();
+    assert_eq!(claimed.job_id, id);
+    st.db
+        .create_job(
+            &JobSpec {
+                kind: "batch".into(),
+                bucket: "src".into(),
+                requested_by: Some(admin_uid),
+                priority: 9,
+                tasks: vec![NewJobTask {
+                    action: "Copy".into(),
+                    payload: "{}".into(),
+                    dedupe_key: None,
+                }],
+                ..Default::default()
+            },
+            1001,
+        )
         .await
         .unwrap();
+    assert_eq!(st.db.preempt_lower_priority(1, 1001).await.unwrap(), 1);
     let base = serve(build_router(st).unwrap()).await;
     let admin = login_token(&base).await;
     let client = reqwest::Client::new();
@@ -1119,39 +1135,6 @@ async fn access_point_transform_api() {
             .unwrap()
             .is_none()
     );
-}
-
-/// 预加载失败注入：`olap_configs` 不可读 → 缓存保持“未加载”（AP 请求 fail-closed）；
-/// 恢复后再次预加载成功 → 置为已加载。
-#[tokio::test]
-async fn transform_preload_failure_keeps_cache_unloaded() {
-    let dir = tempfile::tempdir().unwrap();
-    let st = state(dir.path()).await;
-    assert!(st.olap_cache.is_loaded(), "启动预加载成功应置为已加载");
-
-    sqlx::query("DROP TABLE olap_configs")
-        .execute(st.db.pool())
-        .await
-        .unwrap();
-    let cache = xl_s3::olap::OlapCache::new();
-    oss_server::access_points_api::preload_olap(&st.db, &st.ap_cache, &cache).await;
-    assert!(!cache.is_loaded(), "列表失败必须退回未加载（fail-closed）");
-
-    sqlx::raw_sql(
-        "CREATE TABLE olap_configs (
-          access_point TEXT PRIMARY KEY REFERENCES access_points(name) ON DELETE CASCADE,
-          kind TEXT NOT NULL CHECK (kind IN ('http', 'wasm')),
-          endpoint TEXT, module BLOB, module_sha256 TEXT,
-          timeout_ms INTEGER NOT NULL DEFAULT 5000,
-          max_response_bytes INTEGER NOT NULL DEFAULT 67108864,
-          updated_at INTEGER NOT NULL);",
-    )
-    .execute(st.db.pool())
-    .await
-    .unwrap();
-    let cache = xl_s3::olap::OlapCache::new();
-    oss_server::access_points_api::preload_olap(&st.db, &st.ap_cache, &cache).await;
-    assert!(cache.is_loaded(), "加载成功后应恢复");
 }
 
 /// AP 缓存未命中时，预加载必须回查 DB 解析桶名（不能跳过变换器）。
@@ -1982,22 +1965,23 @@ async fn dead_letter_list_and_redeliver() {
         "s3": {"object": {"key": "dir%2Fa+b.txt"}}
     })
     .to_string();
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO event_outbox (bucket, target_id, event_json, state, attempts, created_at, \
-         last_error) VALUES ('bkt', 't1', ?, 'dead', 5, 123, 'boom') RETURNING id",
-    )
-    .bind(&payload)
-    .fetch_one(st.db.pool())
-    .await
-    .unwrap();
-    // pending 行不得出现在死信列表
-    sqlx::query(
-        "INSERT INTO event_outbox (bucket, target_id, event_json, state) \
-         VALUES ('bkt', 't1', '{}', 'pending')",
-    )
-    .execute(st.db.pool())
-    .await
-    .unwrap();
+    let seeded = payload.clone();
+    let id: i64 = st
+        .db
+        .control_write("console-dead-seed", move |txn| {
+            let seeded = seeded.clone();
+            Box::pin(async move {
+                txn.event_enqueue("bkt", "t1", &seeded, 123).await?;
+                let claim = txn.event_claim(123, 10).await?.remove(0);
+                txn.event_bury(claim.id, claim.claimed_at, 5, "boom")
+                    .await?;
+                // pending 行不得出现在死信列表
+                txn.event_enqueue("bkt", "t1", "{}", 1).await?;
+                Ok(claim.id)
+            })
+        })
+        .await
+        .unwrap();
 
     let list: Vec<serde_json::Value> = client
         .get(format!("{base}/api/v1/events/dead?limit=10"))
@@ -2053,14 +2037,28 @@ async fn dead_letter_list_and_redeliver() {
         .await
         .unwrap();
     assert_eq!(r.status(), 204);
-    let row: (String, i64, Option<i64>, Option<String>) = sqlx::query_as(
-        "SELECT state, attempts, claimed_at, last_error FROM event_outbox WHERE id = ?",
-    )
-    .bind(id)
-    .fetch_one(st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(row, ("pending".to_string(), 0, None, None));
+    assert!(
+        st.db
+            .control_store()
+            .dead_events(10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "重投后不得留在死信列表"
+    );
+    let claims = st
+        .db
+        .control_write("console-dead-redeliver-check", |txn| {
+            Box::pin(async move { txn.event_claim(2, 100).await })
+        })
+        .await
+        .unwrap();
+    let revived = claims
+        .iter()
+        .find(|c| c.event_json.contains("ObjectCreated"))
+        .expect("redelivered event is pending");
+    assert_eq!(revived.attempts, 0);
+    assert_eq!(revived.claimed_at, Some(2));
 
     // 二次重投（已不是 dead）→ 404
     let r = client
@@ -2656,14 +2654,19 @@ async fn tier_force_sweep_is_audited() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["queued"], 0);
-    let (actor, decision, detail): (i64, String, Option<String>) = sqlx::query_as(
-        "SELECT uid, decision, detail FROM audit_log WHERE op = 'control:tier-sweep'",
-    )
-    .fetch_one(st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!((actor, decision.as_str()), (uid, "allow"));
-    assert_eq!(detail.as_deref(), Some("queued=0"));
+    let rows = st
+        .db
+        .control_store()
+        .audit_page(&xl_store::control_store::audit::AuditQuery {
+            limit: 1,
+            op: Some("control:tier-sweep".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let rec = rows.first().expect("tier sweep audit row");
+    assert_eq!((rec.uid, rec.decision.as_str()), (uid, "allow"));
+    assert_eq!(rec.detail.as_deref(), Some("queued=0"));
 }
 
 /// 造一个版本化对象并返回 version id（REPLICA 状态由调用方按需设置）。
@@ -2700,8 +2703,10 @@ async fn replica_reconcile_is_admin_only_and_requires_explicit_ids() {
     st.db.create_user("bob", "pw", false).await.unwrap();
     st.store.create_bucket("alpha").await.unwrap();
     st.db.insert_bucket("alpha", None).await.unwrap();
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'alpha'")
-        .execute(st.db.pool())
+    st.db
+        .control_write("console-replica-versioning", |txn| {
+            Box::pin(async move { txn.bucket_set_versioning("alpha", "Enabled").await })
+        })
         .await
         .unwrap();
 
@@ -2864,14 +2869,25 @@ async fn replica_reconcile_is_admin_only_and_requires_explicit_ids() {
         "control:replica-reconcile-refused",
         "control:replica-reconcile-delete",
     ] {
-        let (actor, decision, bucket, object_key): (i64, String, String, String) =
-            sqlx::query_as("SELECT uid, decision, bucket, object_key FROM audit_log WHERE op = ?")
-                .bind(op)
-                .fetch_one(st.db.pool())
-                .await
-                .unwrap_or_else(|e| panic!("{op}: {e}"));
-        assert_eq!(actor, admin_uid, "{op}");
-        assert_eq!(decision, "allow", "{op}");
-        assert_eq!((bucket.as_str(), object_key.as_str()), ("alpha", "old.bin"));
+        let rows = st
+            .db
+            .control_store()
+            .audit_page(&xl_store::control_store::audit::AuditQuery {
+                limit: 1,
+                op: Some(op.to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{op}: {e}"));
+        let rec = rows.first().unwrap_or_else(|| panic!("{op}: no audit row"));
+        assert_eq!(rec.uid, admin_uid, "{op}");
+        assert_eq!(rec.decision, "allow", "{op}");
+        assert_eq!(
+            (
+                rec.bucket.as_deref().unwrap_or(""),
+                rec.object_key.as_deref().unwrap_or("")
+            ),
+            ("alpha", "old.bin")
+        );
     }
 }

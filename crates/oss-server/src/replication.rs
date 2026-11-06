@@ -10,7 +10,6 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use sqlx::SqlitePool;
 use xl_s3::replication::{ReplRule, ReplicationSink, ReplicationStore, WriteInfo};
 use xl_store::control_store::ControlError;
 use xl_store::control_store::bucket::BucketStore;
@@ -20,7 +19,6 @@ use xl_store::control_store::sites::SiteStore;
 use xl_store::meta::ObjectTag;
 use xl_store::store::Store;
 
-use crate::control_store::{SqliteControlStore, SqliteControlTxn};
 use crate::events::{backoff_secs, now};
 use crate::repl_client::{ErrClass, ReplClient, ReplError};
 
@@ -32,30 +30,19 @@ const MAX_ATTEMPTS: i64 = 10;
 // ---------- 规则存储（Put/Get/DeleteBucketReplication 背后） ----------
 
 pub struct SqlReplStore {
-    pool: SqlitePool,
+    db: Arc<crate::db::Db>,
     remote_ids: Vec<String>,
-    /// object 后端：规则读写走控制 seam；`None` = SQLite 后端。
-    db: Option<Arc<crate::db::Db>>,
     /// M9 S6c：仅 Raft 模式路由控制写（None/Local = M7 直写）。
     control: Option<Arc<crate::raft::control::ControlPlane>>,
 }
 
 impl SqlReplStore {
-    pub fn new(pool: SqlitePool, remote_ids: Vec<String>) -> Self {
+    pub fn new(db: Arc<crate::db::Db>, remote_ids: Vec<String>) -> Self {
         Self {
-            pool,
+            db,
             remote_ids,
-            db: None,
             control: None,
         }
-    }
-
-    /// 仅对象后端生效：SQLite 模式保持原 SQL 路径（`None`）。
-    pub fn with_db(mut self, db: Arc<crate::db::Db>) -> Self {
-        if db.object_control().is_some() {
-            self.db = Some(db);
-        }
-        self
     }
 
     pub fn with_control(mut self, control: Arc<crate::raft::control::ControlPlane>) -> Self {
@@ -78,29 +65,19 @@ fn control_result(
     }
 }
 
-/// 桶复制规则原文：object 走 seam，SQLite 走原 SQL。
-async fn rules_json(
-    db: Option<&Arc<crate::db::Db>>,
-    pool: &SqlitePool,
-    bucket: &str,
-) -> Result<Option<String>, ControlError> {
-    match db {
-        Some(db) => Ok(db
-            .control_store()
-            .bucket_replication_rules(bucket)
-            .await?
-            .map(|e| e.rules_json)),
-        None => Ok(SqliteControlStore::new(pool.clone())
-            .bucket_replication_rules(bucket)
-            .await?
-            .map(|e| e.rules_json)),
-    }
+/// 桶复制规则原文：走对象控制面 seam。
+async fn rules_json(db: &crate::db::Db, bucket: &str) -> Result<Option<String>, ControlError> {
+    Ok(db
+        .control_store()
+        .bucket_replication_rules(bucket)
+        .await?
+        .map(|e| e.rules_json))
 }
 
 #[async_trait]
 impl ReplicationStore for SqlReplStore {
     async fn load_rules(&self, bucket: &str) -> Result<Option<String>, String> {
-        rules_json(self.db.as_ref(), &self.pool, bucket)
+        rules_json(&self.db, bucket)
             .await
             .map_err(|e| e.to_string())
     }
@@ -118,28 +95,19 @@ impl ReplicationStore for SqlReplStore {
             );
         }
         let ts = now();
-        if let Some(db) = &self.db {
-            let bucket = bucket.to_string();
-            let rules_json = rules_json.to_string();
-            return db
-                .control_write("console", move |txn| {
-                    let bucket = bucket.clone();
-                    let rules_json = rules_json.clone();
-                    Box::pin(async move {
-                        txn.bucket_replication_rules_set(&bucket, &rules_json, ts)
-                            .await
-                    })
+        let bucket = bucket.to_string();
+        let rules_json = rules_json.to_string();
+        self.db
+            .control_write("console", move |txn| {
+                let bucket = bucket.clone();
+                let rules_json = rules_json.clone();
+                Box::pin(async move {
+                    txn.bucket_replication_rules_set(&bucket, &rules_json, ts)
+                        .await
                 })
-                .await
-                .map_err(|e| e.to_string());
-        }
-        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
-        crate::control_store::SqliteControlTxn::new(&mut tx)
-            .bucket_replication_rules_set(bucket, rules_json, ts)
+            })
             .await
-            .map_err(|e| e.to_string())?;
-        tx.commit().await.map_err(|e| e.to_string())?;
-        Ok(())
+            .map_err(|e| e.to_string())
     }
 
     async fn remove_rules(&self, bucket: &str) -> Result<(), String> {
@@ -152,23 +120,14 @@ impl ReplicationStore for SqlReplStore {
                     .await,
             );
         }
-        if let Some(db) = &self.db {
-            let bucket = bucket.to_string();
-            return db
-                .control_write("console", move |txn| {
-                    let bucket = bucket.clone();
-                    Box::pin(async move { txn.bucket_replication_rules_delete(&bucket).await })
-                })
-                .await
-                .map_err(|e| e.to_string());
-        }
-        let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
-        crate::control_store::SqliteControlTxn::new(&mut tx)
-            .bucket_replication_rules_delete(bucket)
+        let bucket = bucket.to_string();
+        self.db
+            .control_write("console", move |txn| {
+                let bucket = bucket.clone();
+                Box::pin(async move { txn.bucket_replication_rules_delete(&bucket).await })
+            })
             .await
-            .map_err(|e| e.to_string())?;
-        tx.commit().await.map_err(|e| e.to_string())?;
-        Ok(())
+            .map_err(|e| e.to_string())
     }
 
     async fn remote_ids(&self) -> Vec<String> {
@@ -179,10 +138,8 @@ impl ReplicationStore for SqlReplStore {
 // ---------- 写入钩子：规则匹配 → repl_outbox + PENDING ----------
 
 pub struct SqlReplSink {
-    pool: SqlitePool,
+    db: Arc<crate::db::Db>,
     store: Arc<Store>,
-    /// object 后端：规则/versioning 读与出站入队走 seam；`None` = SQLite 后端。
-    db: Option<Arc<crate::db::Db>>,
     /// M9 S4：stretch 站点关闭 M7 异步**站点**对象复制（数据面已由 EC 双站点承担，
     /// 再复制一份是浪费且单站点本就写不成功）；M6 规则复制不受影响。
     site_data_replication: bool,
@@ -191,22 +148,13 @@ pub struct SqlReplSink {
 }
 
 impl SqlReplSink {
-    pub fn new(pool: SqlitePool, store: Arc<Store>) -> Self {
+    pub fn new(db: Arc<crate::db::Db>, store: Arc<Store>) -> Self {
         Self {
-            pool,
+            db,
             store,
-            db: None,
             site_data_replication: true,
             versioned_remotes: Vec::new(),
         }
-    }
-
-    /// 仅对象后端生效：SQLite 模式保持原事务路径（`None`）。
-    pub fn with_db(mut self, db: Arc<crate::db::Db>) -> Self {
-        if db.object_control().is_some() {
-            self.db = Some(db);
-        }
-        self
     }
 
     /// M9 S4：`[stretch]` 传 false——`enqueue_sites` 整体短路（不写 `target_kind='site'` 行）。
@@ -222,17 +170,12 @@ impl SqlReplSink {
     }
 
     async fn bucket_versioning(&self, bucket: &str) -> Result<Option<String>, ControlError> {
-        match &self.db {
-            Some(db) => Ok(db
-                .control_store()
-                .bucket(bucket)
-                .await?
-                .map(|b| b.versioning)),
-            None => Ok(SqliteControlStore::new(self.pool.clone())
-                .bucket(bucket)
-                .await?
-                .map(|b| b.versioning)),
-        }
+        Ok(self
+            .db
+            .control_store()
+            .bucket(bucket)
+            .await?
+            .map(|b| b.versioning))
     }
 
     /// 源桶当前是否 versioning=Enabled（版本删除/同源 id 的前提）。
@@ -248,31 +191,18 @@ impl SqlReplSink {
     }
 
     async fn site_peer_ids(&self) -> Result<Vec<String>, ControlError> {
-        match &self.db {
-            Some(db) => db.control_store().site_peer_ids().await,
-            None => {
-                SqliteControlStore::new(self.pool.clone())
-                    .site_peer_ids()
-                    .await
-            }
-        }
+        self.db.control_store().site_peer_ids().await
     }
 
-    /// 入队一行：object 落本地队列（经 seam），SQLite 保持原事务。
+    /// 入队一行：落对象控制面的本地队列（经 seam）。
     async fn enqueue_repl(&self, new: &NewReplOutbox) -> Result<(), ControlError> {
-        if let Some(db) = &self.db {
-            let new = new.clone();
-            return db
-                .object_local_write("replication", move |txn| {
-                    Box::pin(async move { txn.repl_enqueue(&new).await })
-                })
-                .await
-                .map_err(|e| ControlError::Backend(e.to_string()));
-        }
-        match self.pool.acquire().await {
-            Ok(mut conn) => SqliteControlTxn::new(&mut conn).repl_enqueue(new).await,
-            Err(e) => Err(ControlError::Backend(e.to_string())),
-        }
+        let new = new.clone();
+        self.db
+            .object_local_write("replication", move |txn| {
+                Box::pin(async move { txn.repl_enqueue(&new).await })
+            })
+            .await
+            .map_err(|e| ControlError::Backend(e.to_string()))
     }
 }
 
@@ -323,7 +253,7 @@ impl ReplicationSink for SqlReplSink {
                 || (!self.versioned_remotes.is_empty()
                     && self.versioning_enabled(info.bucket).await));
         if m6_delivery {
-            match rules_json(self.db.as_ref(), &self.pool, info.bucket).await {
+            match rules_json(&self.db, info.bucket).await {
                 Ok(Some(json)) => match xl_s3::replication::rules_from_json(&json) {
                     Ok(rules) => {
                         // 标签条件需要对象标签快照；删除事件没有（marker 无标签、版本已删），
@@ -534,86 +464,48 @@ fn site_404_retry(e: ReplError, cache_key: &str, op: &str) -> ReplError {
     }
 }
 
-/// 复制 worker 的 per-backend 派发：SQLite 原路径逐字节保留；object 走本地队列
-/// （`ObjectControlTxn` 的 `ReplOutboxTxn` 适配器）。
+/// 复制 worker 走对象控制面的本地队列（`ObjectControlTxn` 的 `ReplOutboxTxn` 适配器）。
 #[derive(Clone, Copy)]
-enum ReplBackend<'a> {
-    Sqlite(&'a SqlitePool),
-    Object(&'a crate::db::Db),
+struct ReplBackend<'a> {
+    db: &'a crate::db::Db,
 }
 
 impl<'a> ReplBackend<'a> {
     fn new(db: &'a crate::db::Db) -> Self {
-        if db.object_control().is_some() {
-            Self::Object(db)
-        } else {
-            Self::Sqlite(db.pool())
-        }
+        Self { db }
     }
 
     fn control(self) -> Arc<dyn xl_store::control_store::ControlStore> {
-        match self {
-            Self::Sqlite(pool) => Arc::new(SqliteControlStore::new((*pool).clone())),
-            Self::Object(db) => db.control_store(),
-        }
+        self.db.control_store()
     }
 
     async fn reclaim_expired(self, now_s: i64) -> Result<u64, ControlError> {
-        match self {
-            Self::Sqlite(pool) => match pool.acquire().await {
-                Ok(mut conn) => {
-                    SqliteControlTxn::new(&mut conn)
-                        .repl_reclaim_expired(now_s, REPL_LEASE_SECS)
-                        .await
-                }
-                Err(e) => Err(ControlError::Backend(e.to_string())),
-            },
-            Self::Object(db) => db
-                .object_local_write("replication", move |txn| {
-                    Box::pin(async move { txn.repl_reclaim_expired(now_s, REPL_LEASE_SECS).await })
-                })
-                .await
-                .map_err(|e| ControlError::Backend(e.to_string())),
-        }
+        self.db
+            .object_local_write("replication", move |txn| {
+                Box::pin(async move { txn.repl_reclaim_expired(now_s, REPL_LEASE_SECS).await })
+            })
+            .await
+            .map_err(|e| ControlError::Backend(e.to_string()))
     }
 
     async fn claim(self, now_s: i64) -> Result<Vec<ReplOutboxRow>, ControlError> {
-        match self {
-            Self::Sqlite(pool) => match pool.acquire().await {
-                Ok(mut conn) => {
-                    SqliteControlTxn::new(&mut conn)
-                        .repl_claim(now_s, CLAIM_BATCH)
-                        .await
-                }
-                Err(e) => Err(ControlError::Backend(e.to_string())),
-            },
-            Self::Object(db) => db
-                .object_local_write("replication", move |txn| {
-                    Box::pin(async move { txn.repl_claim(now_s, CLAIM_BATCH).await })
-                })
-                .await
-                .map_err(|e| ControlError::Backend(e.to_string())),
-        }
+        self.db
+            .object_local_write("replication", move |txn| {
+                Box::pin(async move { txn.repl_claim(now_s, CLAIM_BATCH).await })
+            })
+            .await
+            .map_err(|e| ControlError::Backend(e.to_string()))
     }
 
     async fn renew(self, seq: i64, old: Option<i64>) -> Option<i64> {
         let now_s = now();
-        let res = match self {
-            Self::Sqlite(pool) => match pool.acquire().await {
-                Ok(mut conn) => {
-                    SqliteControlTxn::new(&mut conn)
-                        .repl_renew(seq, old, now_s)
-                        .await
-                }
-                Err(e) => Err(ControlError::Backend(e.to_string())),
-            },
-            Self::Object(db) => db
-                .object_local_write("replication", move |txn| {
-                    Box::pin(async move { txn.repl_renew(seq, old, now_s).await })
-                })
-                .await
-                .map_err(|e| ControlError::Backend(e.to_string())),
-        };
+        let res = self
+            .db
+            .object_local_write("replication", move |txn| {
+                Box::pin(async move { txn.repl_renew(seq, old, now_s).await })
+            })
+            .await
+            .map_err(|e| ControlError::Backend(e.to_string()));
         match res {
             Ok(true) => Some(now_s),
             Ok(false) => None,
@@ -625,22 +517,13 @@ impl<'a> ReplBackend<'a> {
     }
 
     async fn finish_ok(self, seq: i64, token: Option<i64>) -> bool {
-        let res = match self {
-            Self::Sqlite(pool) => match pool.acquire().await {
-                Ok(mut conn) => {
-                    SqliteControlTxn::new(&mut conn)
-                        .repl_finish_ok(seq, token)
-                        .await
-                }
-                Err(e) => Err(ControlError::Backend(e.to_string())),
-            },
-            Self::Object(db) => db
-                .object_local_write("replication", move |txn| {
-                    Box::pin(async move { txn.repl_finish_ok(seq, token).await })
-                })
-                .await
-                .map_err(|e| ControlError::Backend(e.to_string())),
-        };
+        let res = self
+            .db
+            .object_local_write("replication", move |txn| {
+                Box::pin(async move { txn.repl_finish_ok(seq, token).await })
+            })
+            .await
+            .map_err(|e| ControlError::Backend(e.to_string()));
         match res {
             Ok(ok) => ok,
             Err(e) => {
@@ -661,33 +544,20 @@ impl<'a> ReplBackend<'a> {
         let bury = failure.class == ErrClass::Permanent && attempts > MAX_ATTEMPTS;
         let message = failure.message.clone();
         let retry_at = now_s + backoff_secs(attempts);
-        let res = match self {
-            Self::Sqlite(pool) => match pool.acquire().await {
-                Ok(mut conn) => {
-                    let mut txn = SqliteControlTxn::new(&mut conn);
+        let res = self
+            .db
+            .object_local_write("replication", move |txn| {
+                Box::pin(async move {
                     if bury {
                         txn.repl_bury(seq, token, attempts, &message).await
                     } else {
                         txn.repl_retry(seq, token, attempts, retry_at, &message)
                             .await
                     }
-                }
-                Err(e) => Err(ControlError::Backend(e.to_string())),
-            },
-            Self::Object(db) => db
-                .object_local_write("replication", move |txn| {
-                    Box::pin(async move {
-                        if bury {
-                            txn.repl_bury(seq, token, attempts, &message).await
-                        } else {
-                            txn.repl_retry(seq, token, attempts, retry_at, &message)
-                                .await
-                        }
-                    })
                 })
-                .await
-                .map_err(|e| ControlError::Backend(e.to_string())),
-        };
+            })
+            .await
+            .map_err(|e| ControlError::Backend(e.to_string()));
         match res {
             Ok(ok) => ok,
             Err(e) => {
@@ -1069,13 +939,13 @@ async fn process_repl_once_backend(
     (sent, failed)
 }
 
-/// SQLite 后端入口（集成测试与既有调用方保持原签名）。
+/// 单轮处理入口（集成测试与既有调用方共用）。
 pub async fn process_repl_once(
-    pool: &SqlitePool,
+    db: &crate::db::Db,
     store: &Store,
     client: &ReplClient,
 ) -> (usize, usize) {
-    process_repl_once_backend(ReplBackend::Sqlite(pool), store, client).await
+    process_repl_once_backend(ReplBackend::new(db), store, client).await
 }
 
 // ---------- M7 遗留未映射 REPLICA 的人工对账 ----------
@@ -1471,22 +1341,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_db_is_ignored_without_object_backend() {
-        let f = object_db().await;
-        let plain = Arc::new(crate::db::Db::connect_object().await.unwrap());
-        let rs = SqlReplStore::new(plain.pool().clone(), Vec::new()).with_db(Arc::clone(&plain));
-        assert!(rs.db.is_none(), "SQLite 模式必须保持原 SQL 路径");
-        let sink = SqlReplSink::new(plain.pool().clone(), Arc::clone(&f.store)).with_db(plain);
-        assert!(sink.db.is_none());
-    }
-
-    #[tokio::test]
     async fn object_rules_crud_and_enqueue_on_matching_put() {
         use bytes::Bytes;
         use xl_store::store::VersioningMode;
         let f = object_db().await;
-        let rs =
-            SqlReplStore::new(f.db.pool().clone(), vec!["r1".into()]).with_db(Arc::clone(&f.db));
+        let rs = SqlReplStore::new(Arc::clone(&f.db), vec!["r1".into()]);
         let rule = ReplRule {
             id: "r".into(),
             prefix: Some("logs/".into()),
@@ -1536,8 +1395,7 @@ mod tests {
             .await
             .unwrap();
         let vid = info.version_id.clone().unwrap();
-        let sink =
-            SqlReplSink::new(f.db.pool().clone(), Arc::clone(&f.store)).with_db(Arc::clone(&f.db));
+        let sink = SqlReplSink::new(Arc::clone(&f.db), Arc::clone(&f.store));
         sink.on_write(WriteInfo {
             bucket: "rbk",
             key: "logs/a",

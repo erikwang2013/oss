@@ -425,34 +425,8 @@ impl ControlPlane {
                 }
                 Ok(applied.response)
             }
-            Inner::Local(db) => {
-                // AC-2：BucketCreate 的配额 count+insert 必须原子——先取写锁再读计数，
-                // 并发 Local 写只有一个能越过（Raft 路径的闸在 leader append 前）。
-                let mut tx = db
-                    .pool()
-                    .begin_with("BEGIN IMMEDIATE")
-                    .await
-                    .map_err(internal)?;
-                if let ControlCommand::BucketCreate { name, owner, .. } = &cmd
-                    && Db::bucket_create_quota_reached_conn(&mut tx, name, owner.as_deref())
-                        .await
-                        .map_err(internal)?
-                {
-                    return Err(ControlError::QuotaExceeded);
-                }
-                let applied = {
-                    let mut cw = apply::control_tx(&mut tx);
-                    apply::apply_command(&mut cw, &cmd)
-                        .await
-                        .map_err(internal)?
-                };
-                tx.commit().await.map_err(internal)?;
-                // 业务拒绝不得触发副作用（如 Invalid 的 BucketCreate 不能建目录）。
-                if applied.response == ControlResponse::Ok {
-                    self.post.run(applied.effects).await;
-                }
-                Ok(applied.response)
-            }
+            // 对象控制根未装配即无法处理控制写（启动顺序错误，不静默降级）。
+            Inner::Local(_) => Err(ControlError::Internal("对象控制面未装配".into())),
             Inner::Raft(handle) => {
                 cmd.check_size().map_err(|e| match e {
                     SizeError::TooLarge(bytes) => ControlError::TooLarge {
@@ -885,14 +859,7 @@ mod tests {
     /// 盘恢复后再次执行即修复（启动对账走同一入口）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn post_commit_effects_idempotent_and_retryable() {
-        let dir = tempfile::tempdir().unwrap();
-        let url = format!("sqlite://{}?mode=rwc", dir.path().join("m9.db").display());
-        let db = Arc::new(Db::connect_raft(&url).await.unwrap());
-        let store = Arc::new(
-            Store::open(xl_store::store::StoreConfig::new(dir.path().join("data")))
-                .await
-                .unwrap(),
-        );
+        let (dir, db, store, _plane) = object_local_plane().await;
         let post = PostCommit::new(
             db,
             Arc::clone(&store),
@@ -1083,9 +1050,8 @@ mod tests {
     /// 快照安装后 AP/OLAP 缓存按新控制表重建（seam 读路径）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn after_snapshot_install_rebuilds_ap_and_olap_caches() {
-        let dir = tempfile::tempdir().unwrap();
-        // 普通 connect：after_snapshot_install 只读控制表并重建缓存，不依赖 apply ctx。
-        let db = Arc::new(Db::connect("sqlite::memory:").await.unwrap());
+        // after_snapshot_install 只读控制表并重建缓存，不依赖 apply ctx。
+        let (_dir, db, store, _plane) = object_local_plane().await;
         let alice = db.create_user("alice", "pw", false).await.unwrap();
         db.create_access_point("ap1", "b1", alice, None, 1)
             .await
@@ -1093,13 +1059,6 @@ mod tests {
         db.set_olap_config("ap1", "http", Some("https://x"), None, None, 5000, 1024, 2)
             .await
             .unwrap();
-        let store = Arc::new(
-            xl_store::store::Store::open(xl_store::store::StoreConfig::new(
-                dir.path().join("data"),
-            ))
-            .await
-            .unwrap(),
-        );
         let ap_cache = Arc::new(xl_s3::ap::ApCache::new());
         let olap_cache = Arc::new(xl_s3::olap::OlapCache::new());
         let post = PostCommit::new(

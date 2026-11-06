@@ -12,12 +12,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 mod object;
-mod sql;
 #[cfg(test)]
 mod tests;
 
 pub use object::guard_object_startup;
-pub use sql::*;
 
 /// 本二进制能解码的协议代次；v1.13.1 = 1。
 pub const WIRE_VERSION: u32 = 2;

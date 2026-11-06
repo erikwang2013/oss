@@ -34,7 +34,7 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
 /// 8 与 Argon2 闸同量级：足够喂满磁盘队列，又给普通请求留出执行线程。
 pub const INGEST_CONCURRENCY: usize = 8;
 
-/// 秒传索引落在已有的 SQLite 上 —— 少一个 Redis 依赖，TTL 语义与 SETEX 一致。
+/// 秒传索引落在对象控制面的本地 KV —— 少一个 Redis 依赖，TTL 语义与 SETEX 一致。
 #[derive(Clone)]
 pub struct SqlInstantStore {
     db: Arc<Db>,
@@ -46,9 +46,9 @@ impl SqlInstantStore {
     }
 }
 
-/// SQL 错误 → aetherupload 错误。这里有且只有这一处观测点：内核把索引访问的失败
+/// 控制面错误 → aetherupload 错误。这里有且只有这一处观测点：内核把索引访问的失败
 /// 一概当作「未命中」（`instant_lookup` 吞掉 Err），不 warn 就完全不可见。变体保持 Io 不换。
-fn store_err(e: sqlx::Error) -> aetherupload::Error {
+fn store_err(e: crate::db::DbError) -> aetherupload::Error {
     tracing::warn!(error = %e, "秒传索引访问失败");
     aetherupload::Error::Io(std::io::Error::other(e.to_string()))
 }

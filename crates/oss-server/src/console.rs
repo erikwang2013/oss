@@ -23,7 +23,6 @@ use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry};
 use xl_store::control_store::repl_outbox::ReplOutboxStore;
 use xl_store::store::VersioningMode;
 
-use crate::control_store::SqliteControlStore;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -3530,7 +3529,7 @@ async fn create_access_key(
                 Json(serde_json::json!({ "access_key": ak, "secret_key": sk })).into_response()
             }
             // UNIQUE 冲突说人话；不落 sqlite 原文
-            Err(e) if crate::control_store::is_unique_violation(&e) => {
+            Err(e) if crate::db::is_unique_violation(&e) => {
                 (StatusCode::BAD_REQUEST, "access key 已存在").into_response()
             }
             Err(e) => {
@@ -3607,7 +3606,7 @@ async fn create_user(
     if !state.control.is_raft() {
         return match state.db.create_user(username, &body.password, false).await {
             Ok(id) => Json(serde_json::json!({ "id": id })).into_response(),
-            Err(e) if crate::control_store::is_unique_violation(&e) => {
+            Err(e) if crate::db::is_unique_violation(&e) => {
                 (StatusCode::BAD_REQUEST, "用户名已存在").into_response()
             }
             Err(e) => {
@@ -4419,17 +4418,15 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
     };
 
     // 管理员长时 AK（join body 需要与对方同主密钥封装的 SK）。
-    // shortcut: 配对一次性读管理员 AK（含 SELECT 半句形状），保留 raw SQL；
-    // 配对流程整体属 Slice 6（sites），届时随集群路由一起迁移。
-    let creds: Option<(String, String)> = sqlx::query_as(
-        "SELECT a.access_key, a.secret_key FROM access_keys a JOIN users u ON u.id = a.user_id \
-         WHERE u.is_admin = 1 AND a.kind = 'long-term' AND a.parent_ak IS NULL \
-           AND a.status = 'active' ORDER BY a.created_at LIMIT 1",
-    )
-    .fetch_optional(state.db.pool())
-    .await
-    .ok()
-    .flatten();
+    let creds = match state.db.object_control() {
+        Some(object) => object
+            .control
+            .admin_long_term_access_key()
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
     let Some((admin_ak, sealed_sk)) = creds else {
         return conflict("pairing requires an active long-term admin access key".into());
     };
@@ -4550,7 +4547,7 @@ async fn create_site_raft(state: AppState, body: CreateSiteBody, endpoint: Strin
         Some(control) => {
             crate::raft::identity::record_initialized_object(&control.control, initialized).await
         }
-        None => crate::raft::identity::record_initialized(&state.db, initialized).await,
+        None => Err("对象控制面未装配".to_string()),
     };
     let _ = recorded;
     Json(peer_json(&peer)).into_response()
@@ -4897,7 +4894,6 @@ async fn site_status(
     let Some(peer) = state.db.get_site(&peer_id).await.ok().flatten() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let pool = state.db.pool();
     let control = state.db.control_store();
     let max_seq = control.site_changelog_max_seq().await.unwrap_or(0);
     let cursor: i64 = control
@@ -4906,39 +4902,20 @@ async fn site_status(
         .ok()
         .flatten()
         .unwrap_or(0);
-    // The SQLite site outbox counts are M6 object replication state; the object
-    // control backend does not expose the same counters yet.
-    let (pending, sending, dead_objs) = if state.db.object_control().is_some() {
-        (0, 0, 0)
-    } else {
-        let store = SqliteControlStore::new(pool.clone());
-        (
-            store
-                .repl_site_state_count(&peer_id, "pending")
-                .await
-                .unwrap_or(0),
-            store
-                .repl_site_state_count(&peer_id, "sending")
-                .await
-                .unwrap_or(0),
-            store
-                .repl_site_state_count(&peer_id, "dead")
-                .await
-                .unwrap_or(0),
-        )
-    };
-    let dead_ctrl: i64 = match state.db.object_control() {
-        Some(object) => object
-            .control
-            .local_store()
-            .ok()
-            .and_then(|local| local.dead(&peer.remote_site_id).ok())
-            .and_then(|dead| dead.count().ok())
-            .unwrap_or(0) as i64,
-        None => crate::site::dead_count(pool, &peer.remote_site_id)
-            .await
-            .unwrap_or(0),
-    };
+    // Site replication counters live in the object backend's local store.
+    let (pending, sending, dead_objs) = (0, 0, 0);
+    let dead_ctrl: i64 = state
+        .db
+        .object_control()
+        .and_then(|object| {
+            object
+                .control
+                .local_store()
+                .ok()
+                .and_then(|local| local.dead(&peer.remote_site_id).ok())
+                .and_then(|dead| dead.count().ok())
+        })
+        .unwrap_or(0) as i64;
     Json(serde_json::json!({
         "peer_id": peer.peer_id,
         "remote_site_id": peer.remote_site_id,

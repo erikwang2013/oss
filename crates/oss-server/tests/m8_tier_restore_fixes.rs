@@ -331,11 +331,11 @@ async fn mpu_source_transition_keeps_multipart_etag() {
 #[tokio::test]
 async fn tier_events_reach_outbox() {
     let (st, _mock, _d) = setup().await;
-    sqlx::query("INSERT INTO event_configs (bucket, config_json) VALUES ('bkt', ?)")
-        .bind(
-            r#"[{"id":"t","target":"tier","events":["s3:LifecycleTransition","s3:ObjectRestore:Post","s3:ObjectRestore:Completed"],"prefix":null,"suffix":null}]"#,
-        )
-        .execute(st.db.pool())
+    let config = r#"[{"id":"t","target":"tier","events":["s3:LifecycleTransition","s3:ObjectRestore:Post","s3:ObjectRestore:Completed"],"prefix":null,"suffix":null}]"#;
+    st.db
+        .control_write("event-config-test", move |txn| {
+            Box::pin(async move { txn.bucket_notification_set("bkt", config, 1).await })
+        })
         .await
         .unwrap();
     let vid = archive(&st, "ev.txt", b"event-data").await;
@@ -364,22 +364,25 @@ async fn tier_events_reach_outbox() {
     );
 
     // Transition/Completed 由 spawn 异步写库：轮询至三条事件齐（高负载下放宽到 ~15s）。
+    // 事件队列是节点本地队列；claim 即读取并改为 sending，测试不再投递。
     let mut names: Vec<String> = Vec::new();
     for _ in 0..600 {
-        let rows: Vec<String> = sqlx::query_scalar(
-            "SELECT event_json FROM event_outbox WHERE bucket='bkt' ORDER BY id",
-        )
-        .fetch_all(st.db.pool())
-        .await
-        .unwrap();
-        names = rows
-            .iter()
-            .filter_map(|j| {
-                serde_json::from_str::<serde_json::Value>(j)
-                    .ok()
-                    .and_then(|v| v["eventName"].as_str().map(str::to_string))
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let claims = st
+            .db
+            .control_write("event-outbox-test", move |txn| {
+                Box::pin(async move { txn.event_claim(now, 100).await })
             })
-            .collect();
+            .await
+            .unwrap();
+        names.extend(claims.iter().filter_map(|c| {
+            serde_json::from_str::<serde_json::Value>(&c.event_json)
+                .ok()
+                .and_then(|v| v["eventName"].as_str().map(str::to_string))
+        }));
         if names.len() >= 3 {
             break;
         }
@@ -407,13 +410,17 @@ async fn head_on_expired_restore_drops_row() {
         .enqueue_restore("bkt", "exp.txt", &vid, 0)
         .await
         .unwrap();
-    let task: String = sqlx::query_scalar(
-        "SELECT payload_json FROM job_tasks WHERE action = 'RestoreObject' \
-         ORDER BY job_id DESC LIMIT 1",
-    )
-    .fetch_one(st.db.pool())
-    .await
-    .unwrap();
+    let latest = st.db.control_store().recent_jobs(1).await.unwrap();
+    let task = st
+        .db
+        .control_store()
+        .job_tasks(latest[0].id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.action == "RestoreObject")
+        .expect("RestoreObject task row")
+        .payload_json;
     assert_eq!(
         executor(&st).execute("RestoreObject", &task).await.unwrap(),
         "restored"

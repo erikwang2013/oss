@@ -20,6 +20,7 @@ use xl_s3::olap::OlapTransform;
 use xl_s3::replication::{ReplicationSink, WriteInfo};
 use xl_s3::restore::RestoreSink;
 use xl_s3::tier_gc::TierGcSink;
+use xl_store::control_store::event_outbox::EventOutboxTxn as _;
 use xl_store::crypto::{EncSpec, SseCKey};
 use xl_store::meta::{ObjectTag, TierPhase};
 use xl_store::store::{ArchiveSpec, Store, TierRef};
@@ -127,6 +128,17 @@ impl Fx {
         &self.st.db
     }
 
+    async fn set_versioning(&self, bucket: &str) {
+        let bucket = bucket.to_owned();
+        self.db()
+            .control_write("batch-versioning", move |txn| {
+                let bucket = bucket.clone();
+                Box::pin(async move { txn.bucket_set_versioning(&bucket, "Enabled").await })
+            })
+            .await
+            .unwrap();
+    }
+
     fn store(&self) -> &Store {
         &self.st.store
     }
@@ -178,26 +190,48 @@ impl Fx {
     }
 
     async fn clear_outbox(&self) {
-        sqlx::query("DELETE FROM event_outbox")
-            .execute(self.db().pool())
+        self.st
+            .db
+            .object_local_write("batch-clear-outbox", |txn| {
+                Box::pin(async move {
+                    for claim in txn.event_claim(1, 100_000).await? {
+                        txn.event_finish_ok(claim.id, claim.claimed_at).await?;
+                    }
+                    Ok(())
+                })
+            })
             .await
             .unwrap();
     }
 
     /// outbox 行：(bucket, target, event JSON)，按写入序（worker 未启动，行不会被消费）。
     async fn outbox(&self) -> Vec<(String, String, serde_json::Value)> {
-        use sqlx::Row as _;
-        let rows =
-            sqlx::query("SELECT bucket, target_id, event_json FROM event_outbox ORDER BY id")
-                .fetch_all(self.db().pool())
-                .await
-                .unwrap();
-        rows.iter()
-            .map(|r| {
+        #[derive(serde::Deserialize)]
+        struct StoredEvent {
+            bucket: String,
+            target_id: String,
+            event_json: String,
+            #[allow(dead_code)]
+            created_at: i64,
+        }
+        self.st
+            .db
+            .object_control()
+            .unwrap()
+            .control
+            .local_store()
+            .unwrap()
+            .queue("event_outbox")
+            .unwrap()
+            .scan()
+            .into_iter()
+            .filter(|e| e.status != oss_server::local_store::QueueStatus::Dead)
+            .map(|e| {
+                let ev: StoredEvent = rmp_serde::from_slice(&e.payload).unwrap();
                 (
-                    r.get::<String, _>("bucket"),
-                    r.get::<String, _>("target_id"),
-                    serde_json::from_str(r.get("event_json")).unwrap(),
+                    ev.bucket,
+                    ev.target_id,
+                    serde_json::from_str(&ev.event_json).unwrap(),
                 )
             })
             .collect()
@@ -353,29 +387,30 @@ async fn batch_1000_replace_tags_failure_retry_and_report() {
     let created = create_batch(&f.st, f.admin, true, r).await.unwrap();
     assert_eq!(created.total, 1001);
     // I3：Batch 创建落控制面审计（allow；目标是清单对象）
-    let (op, bucket, key, decision, detail): (
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-        Option<String>,
-    ) = sqlx::query_as(
-        "SELECT op, bucket, object_key, decision, detail FROM audit_log \
-         WHERE op='control:job-create'",
-    )
-    .fetch_one(f.db().pool())
-    .await
-    .unwrap();
-    assert_eq!(op, "control:job-create");
-    assert_eq!(bucket.as_deref(), Some("src"));
-    assert_eq!(key.as_deref(), Some("manifest.csv"));
-    assert_eq!(decision, "allow");
+    let rows = f
+        .db()
+        .control_store()
+        .audit_page(&xl_store::control_store::audit::AuditQuery {
+            limit: 1,
+            op: Some("control:job-create".into()),
+            bucket: Some("src".into()),
+            key_prefix: Some("manifest.csv".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let rec = rows.first().expect("job-create audit row");
+    assert_eq!(rec.op, "control:job-create");
+    assert_eq!(rec.bucket.as_deref(), Some("src"));
+    assert_eq!(rec.object_key.as_deref(), Some("manifest.csv"));
+    assert_eq!(rec.decision, "allow");
     assert!(
-        detail
+        rec.detail
             .as_deref()
             .unwrap_or("")
             .contains(&format!("job={}", created.job_id)),
-        "detail={detail:?}"
+        "detail={:?}",
+        rec.detail
     );
     // 快照：改清单不影响已建任务
     f.put("src", "manifest.csv", b"src,only\r\n").await;
@@ -956,10 +991,7 @@ mod batch_wasm_disabled {
 #[tokio::test]
 async fn delete_marker_is_enqueued_for_replication() {
     let f = fx().await;
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'src'")
-        .execute(f.db().pool())
-        .await
-        .unwrap();
+    f.set_versioning("src").await;
 
     // 无版本删除 → marker 入队（is_delete_marker=true，带 marker 版本号）
     f.put("src", "marker", b"x").await;
@@ -1001,10 +1033,13 @@ async fn delete_marker_is_enqueued_for_replication() {
 async fn audit_failure_does_not_block_batch_create() {
     let f = fx().await;
     f.put("src", "m.csv", b"src,a\n").await;
-    sqlx::query("DROP TABLE audit_log")
-        .execute(f.db().pool())
-        .await
-        .unwrap();
+    // 对象后端没有表可删：把审计目录换成同名普通文件，写入必然失败。
+    let audit = oss_server::control_backend::local_state_dir(f.store().root())
+        .join("audit")
+        .join("audit_log");
+    let _ = std::fs::remove_dir_all(&audit);
+    std::fs::create_dir_all(audit.parent().unwrap()).unwrap();
+    std::fs::write(&audit, b"not a directory").unwrap();
     let mut r = req("ReplaceTags", "m.csv");
     r.tags = tags(&[("k", "v")]);
     let created = create_batch(&f.st, f.admin, true, r)
@@ -1696,12 +1731,9 @@ async fn http_create_then_cancel() {
 async fn batch_delete_on_sync_bucket_refuses_without_remote() {
     let f = fx().await;
     f.put("src", "sync-del", b"keep").await;
-    sqlx::query(
-        "UPDATE buckets SET replication_mode = 'sync', versioning = 'Enabled' WHERE name = 'src'",
-    )
-    .execute(f.db().pool())
-    .await
-    .unwrap();
+    f.db().upsert_bucket_owner_set_mode("src", Some(f.admin), 0, "sync")
+        .await
+        .unwrap();
     let d = payload("src", "sync-del", f.admin);
     let err = f.run(BATCH_DELETE, &d).await.unwrap_err();
     assert!(
@@ -1820,10 +1852,7 @@ async fn batch_delete_events_are_version_aware() {
         ],
     )
     .await;
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'src'")
-        .execute(f.db().pool())
-        .await
-        .unwrap();
+    f.set_versioning("src").await;
 
     // 无版本号删除 → marker 事件（versionId 非 "null"）。
     f.put("src", "marker", b"x").await;

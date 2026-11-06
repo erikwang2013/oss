@@ -192,8 +192,6 @@ async fn object_db() -> DbFx {
         .unwrap();
     let db = Arc::new(Db::connect_object().await.unwrap());
     db.attach_object_control(object).unwrap();
-    // The placeholder pool has no schema; closing it makes any stray SQL fail.
-    db.pool().close().await;
     DbFx { _dir: dir, db }
 }
 

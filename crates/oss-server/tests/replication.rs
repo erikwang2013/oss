@@ -9,40 +9,30 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use oss_server::config::RemoteTarget;
+use oss_server::control_backend::ObjectControl;
+use oss_server::db::{Db, SitePeer};
 use oss_server::repl_client::ReplClient;
 use oss_server::replication::{SqlReplSink, SqlReplStore, process_repl_once};
-use sqlx::SqlitePool;
 use xl_s3::replication::{ReplicationSink, ReplicationStore, WriteInfo};
+use xl_store::control_state::root::Mode;
 use xl_store::store::{Store, StoreConfig};
 
-async fn fixture() -> (SqlitePool, Arc<Store>, tempfile::TempDir, tempfile::TempDir) {
+async fn fixture() -> (Arc<Db>, Arc<Store>, tempfile::TempDir, tempfile::TempDir) {
     let dbdir = tempfile::tempdir().unwrap();
-    let path = dbdir.path().join("repl.db");
-    let pool = SqlitePool::connect(&format!("sqlite://{}?mode=rwc", path.display()))
+    let datadir = tempfile::tempdir().unwrap();
+    let store = Arc::new(
+        Store::open(StoreConfig::new(datadir.path()))
+            .await
+            .unwrap(),
+    );
+    store.create_bucket("rbk").await.unwrap();
+    let object = ObjectControl::open(Arc::clone(&store), Mode::Standalone, None)
         .await
         .unwrap();
-    sqlx::raw_sql(
-        "CREATE TABLE replication_rules (bucket TEXT PRIMARY KEY, rules_json TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0);\
-         CREATE TABLE repl_outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, key TEXT NOT NULL, \
-          version_id TEXT NOT NULL, etag TEXT NOT NULL, size INTEGER NOT NULL, remote_id TEXT NOT NULL, \
-          dest_bucket TEXT NOT NULL, is_delete_marker INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending', \
-          attempts INTEGER NOT NULL DEFAULT 0, claimed_at INTEGER, next_retry_at INTEGER NOT NULL DEFAULT 0, \
-          created_at INTEGER NOT NULL DEFAULT 0, last_error TEXT, \
-          target_kind TEXT NOT NULL DEFAULT 'remote', \
-          is_version_delete INTEGER NOT NULL DEFAULT 0);\
-         CREATE TABLE buckets (name TEXT PRIMARY KEY, versioning TEXT NOT NULL DEFAULT 'Off');\
-         CREATE TABLE sites (peer_id TEXT PRIMARY KEY, endpoint TEXT NOT NULL DEFAULT '', \
-          s3_access_key TEXT NOT NULL DEFAULT '', s3_secret_key TEXT NOT NULL DEFAULT '', \
-          region TEXT NOT NULL DEFAULT 'us-east-1', peer_site_token TEXT NOT NULL DEFAULT '', \
-          last_error TEXT);",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    let datadir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(StoreConfig::new(datadir.path())).await.unwrap());
-    store.create_bucket("rbk").await.unwrap();
-    (pool, store, dbdir, datadir)
+    let db = Arc::new(Db::connect_object().await.unwrap());
+    db.attach_object_control(object).unwrap();
+    db.insert_bucket("rbk", None).await.unwrap();
+    (db, store, dbdir, datadir)
 }
 
 async fn put_versioned(store: &Store, key: &str, body: &'static [u8]) -> (String, String) {
@@ -108,35 +98,201 @@ fn rules_json(prefix: Option<&str>, dm: bool) -> String {
     serde_json::to_string(&vec![r]).unwrap()
 }
 
-async fn outbox_rows(pool: &SqlitePool) -> Vec<(String, i64, i64, Option<String>)> {
-    use sqlx::Row as _;
-    sqlx::query(
-        "SELECT state, attempts, is_delete_marker, last_error FROM repl_outbox ORDER BY seq",
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap()
-    .into_iter()
-    .map(|r| {
-        (
-            r.get::<String, _>("state"),
-            r.get::<i64, _>("attempts"),
-            r.get::<i64, _>("is_delete_marker"),
-            r.get::<Option<String>, _>("last_error"),
-        )
+#[derive(Clone, serde::Deserialize)]
+struct Wire {
+    bucket: String,
+    key: String,
+    version_id: String,
+    etag: String,
+    remote_id: String,
+    dest_bucket: String,
+    is_delete_marker: bool,
+    is_version_delete: bool,
+    target_kind: String,
+}
+
+fn outbox_wires(db: &Db) -> Vec<(oss_server::local_store::QueueEntry, Wire)> {
+    db.object_control()
+        .unwrap()
+        .control
+        .local_store()
+        .unwrap()
+        .queue("repl_outbox")
+        .unwrap()
+        .scan()
+        .into_iter()
+        .map(|e| {
+            let w = rmp_serde::from_slice::<Wire>(&e.payload).unwrap();
+            (e, w)
+        })
+        .collect()
+}
+
+async fn outbox_rows(db: &Db) -> Vec<(String, i64, i64, Option<String>)> {
+    outbox_wires(db)
+        .into_iter()
+        .map(|(e, w)| {
+            let state = match e.status {
+                oss_server::local_store::QueueStatus::Pending => "pending",
+                oss_server::local_store::QueueStatus::Claimed => "sending",
+                oss_server::local_store::QueueStatus::Dead => "dead",
+            };
+            (
+                state.to_string(),
+                e.attempts as i64,
+                w.is_delete_marker as i64,
+                e.reason.clone(),
+            )
+        })
+        .collect()
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+async fn save_rules(db: &Arc<Db>, rules: &str) {
+    SqlReplStore::new(Arc::clone(db), vec![])
+        .save_rules("rbk", rules)
+        .await
+        .unwrap();
+}
+
+async fn force_attempts(db: &Arc<Db>) {
+    db.control_write("test-force-attempts", |txn| {
+        Box::pin(async move {
+            for row in txn.repl_claim(now(), 10_000).await? {
+                txn.repl_retry(row.seq, row.claimed_at, 10, 0, "").await?;
+            }
+            Ok(())
+        })
     })
-    .collect()
+    .await
+    .unwrap();
+}
+
+async fn clear_retry(db: &Arc<Db>) {
+    db.control_write("test-clear-retry", |txn| {
+        Box::pin(async move {
+            for row in txn.repl_claim(now(), 10_000).await? {
+                txn.repl_retry(row.seq, row.claimed_at, row.attempts, 0, "")
+                    .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+async fn claim_as_sending(db: &Arc<Db>, at: i64) {
+    db.control_write("test-claim-sending", move |txn| {
+        Box::pin(async move { txn.repl_claim(at, 1).await.map(|_| ()) })
+    })
+    .await
+    .unwrap();
+}
+
+async fn clear_outbox(db: &Arc<Db>) {
+    db.control_write("test-clear-outbox", |txn| {
+        Box::pin(async move {
+            for row in txn.repl_claim(now(), 10_000).await? {
+                txn.repl_finish_ok(row.seq, row.claimed_at).await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+async fn ack_puts(db: &Arc<Db>) {
+    db.control_write("test-ack-puts", |txn| {
+        Box::pin(async move {
+            for row in txn.repl_claim(now(), 10_000).await? {
+                if row.is_version_delete {
+                    txn.repl_retry(row.seq, row.claimed_at, row.attempts, 0, "")
+                        .await?;
+                } else {
+                    txn.repl_finish_ok(row.seq, row.claimed_at).await?;
+                }
+            }
+            Ok(())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+async fn set_versioning(db: &Arc<Db>, versioning: &str) {
+    let versioning = versioning.to_owned();
+    db.control_write("test-versioning", move |txn| {
+        let versioning = versioning.clone();
+        Box::pin(async move {
+            txn.bucket_set_versioning("rbk", &versioning)
+                .await
+                .map(|_| ())
+        })
+    })
+    .await
+    .unwrap();
+}
+
+async fn update_site(db: &Arc<Db>, endpoint: &str, ak: &str, sk: &str) {
+    let mut peer = db.get_site("p1").await.unwrap().expect("site p1");
+    peer.endpoint = endpoint.into();
+    peer.s3_access_key = ak.into();
+    peer.s3_secret_key = sk.into();
+    db.delete_site("p1").await.unwrap();
+    db.insert_site(&peer).await.unwrap();
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enqueue_manual(
+    db: &Arc<Db>,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    etag: &str,
+    size: i64,
+    remote_id: &str,
+    dest_bucket: &str,
+    is_delete_marker: bool,
+    is_version_delete: bool,
+    target_kind: &str,
+) {
+    let row = xl_store::control_store::repl_outbox::NewReplOutbox {
+        bucket: bucket.into(),
+        key: key.into(),
+        version_id: version_id.into(),
+        etag: etag.into(),
+        size,
+        remote_id: remote_id.into(),
+        dest_bucket: dest_bucket.into(),
+        is_delete_marker,
+        is_version_delete,
+        target_kind: target_kind.into(),
+        created_at: 0,
+    };
+    db.object_local_write("test-enqueue", move |txn| {
+        Box::pin(async move { txn.repl_enqueue(&row).await })
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
 async fn enqueue_matrix_and_pending() {
-    let (pool, store, _a, _b) = fixture().await;
+    let (db, store, _a, _b) = fixture().await;
     let (vid, etag) = put_versioned(&store, "logs/a", b"hello").await;
-    let rs = Arc::new(SqlReplStore::new(pool.clone(), vec!["r1".into()]));
+    let rs = Arc::new(SqlReplStore::new(Arc::clone(&db), vec!["r1".into()]));
     rs.save_rules("rbk", &rules_json(Some("logs/"), true))
         .await
         .unwrap();
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
 
     // 命中前缀 → 入队 + PENDING
     sink.on_write(WriteInfo {
@@ -150,7 +306,7 @@ async fn enqueue_matrix_and_pending() {
         is_replica: false,
     })
     .await;
-    assert_eq!(outbox_rows(&pool).await.len(), 1);
+    assert_eq!(outbox_rows(&db).await.len(), 1);
     let h = store
         .head_object_version("rbk", "logs/a", &vid)
         .await
@@ -191,7 +347,7 @@ async fn enqueue_matrix_and_pending() {
         is_replica: false,
     })
     .await;
-    assert_eq!(outbox_rows(&pool).await.len(), 1);
+    assert_eq!(outbox_rows(&db).await.len(), 1);
 
     // marker：规则 delete_marker=false → 不入队；true → 入队
     rs.save_rules("rbk", &rules_json(None, false))
@@ -208,7 +364,7 @@ async fn enqueue_matrix_and_pending() {
         is_replica: false,
     })
     .await;
-    assert_eq!(outbox_rows(&pool).await.len(), 1);
+    assert_eq!(outbox_rows(&db).await.len(), 1);
     rs.save_rules("rbk", &rules_json(None, true)).await.unwrap();
     sink.on_write(WriteInfo {
         bucket: "rbk",
@@ -221,14 +377,14 @@ async fn enqueue_matrix_and_pending() {
         is_replica: false,
     })
     .await;
-    assert_eq!(outbox_rows(&pool).await.len(), 2);
+    assert_eq!(outbox_rows(&db).await.len(), 2);
 }
 
 /// 标签过滤器参与选择：And { Prefix, Tag } 只复制同时命中的对象。
 #[tokio::test]
 async fn tag_filter_selects_objects() {
     use xl_store::meta::ObjectTag;
-    let (pool, store, _a, _b) = fixture().await;
+    let (db, store, _a, _b) = fixture().await;
     let rule = xl_s3::replication::ReplRule {
         id: "r".into(),
         prefix: Some("logs/".into()),
@@ -241,12 +397,8 @@ async fn tag_filter_selects_objects() {
         delete_marker: false,
         enabled: true,
     };
-    sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
-        .bind(serde_json::to_string(&vec![rule]).unwrap())
-        .execute(&pool)
-        .await
-        .unwrap();
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    save_rules(&db, &serde_json::to_string(&vec![rule]).unwrap()).await;
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
     fn write<'a>(key: &'a str, vid: &'a str, etag: &'a str) -> WriteInfo<'a> {
         WriteInfo {
             bucket: "rbk",
@@ -271,12 +423,12 @@ async fn tag_filter_selects_objects() {
     )
     .await;
     sink.on_write(write("logs/a", &vid, &etag)).await;
-    assert_eq!(outbox_rows(&pool).await.len(), 1);
+    assert_eq!(outbox_rows(&db).await.len(), 1);
 
     // 前缀命中但无标签 → 不入队
     let (vid, etag) = put_versioned(&store, "logs/b", b"plain").await;
     sink.on_write(write("logs/b", &vid, &etag)).await;
-    assert_eq!(outbox_rows(&pool).await.len(), 1);
+    assert_eq!(outbox_rows(&db).await.len(), 1);
 
     // 标签命中但前缀不命中 → 不入队
     let (vid, etag) = put_versioned_tagged(
@@ -289,7 +441,7 @@ async fn tag_filter_selects_objects() {
     )
     .await;
     sink.on_write(write("data/c", &vid, &etag)).await;
-    assert_eq!(outbox_rows(&pool).await.len(), 1);
+    assert_eq!(outbox_rows(&db).await.len(), 1);
 }
 
 #[derive(Debug, Clone)]
@@ -389,17 +541,10 @@ fn client(endpoint: &str) -> ReplClient {
     ReplClient::new(&[target("r1", endpoint, None)])
 }
 
-async fn enqueue_one(pool: &SqlitePool, store: Arc<Store>, key: &str) -> String {
+async fn enqueue_one(db: &Arc<Db>, store: Arc<Store>, key: &str) -> String {
     let (vid, etag) = put_versioned(&store, key, b"payload").await;
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
-    sqlx::query(
-        "INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?) \
-         ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json",
-    )
-    .bind(rules_json(None, true))
-    .execute(pool)
-    .await
-    .unwrap();
+    let sink = SqlReplSink::new(Arc::clone(db), Arc::clone(&store));
+    save_rules(db, &rules_json(None, true)).await;
     sink.on_write(WriteInfo {
         bucket: "rbk",
         key,
@@ -416,13 +561,13 @@ async fn enqueue_one(pool: &SqlitePool, store: Arc<Store>, key: &str) -> String 
 
 #[tokio::test]
 async fn worker_put_success_signs_replica_header() {
-    let (pool, store, _a, _b) = fixture().await;
-    let vid = enqueue_one(&pool, Arc::clone(&store), "k").await;
+    let (db, store, _a, _b) = fixture().await;
+    let vid = enqueue_one(&db, Arc::clone(&store), "k").await;
     let etag = store.head_object("rbk", "k").await.unwrap().etag;
     let (endpoint, seen, _h) = mock_server(StatusCode::OK, Some(etag)).await;
     let c = client(&endpoint);
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (1, 0));
-    assert!(outbox_rows(&pool).await.is_empty());
+    assert_eq!(process_repl_once(&db, &store, &c).await, (1, 0));
+    assert!(outbox_rows(&db).await.is_empty());
     let h = store.head_object_version("rbk", "k", &vid).await.unwrap();
     assert_eq!(h.replication_status.as_deref(), Some("COMPLETED"));
     let seen = seen.lock().unwrap().clone();
@@ -442,18 +587,11 @@ async fn worker_put_success_signs_replica_header() {
 /// 2 MiB @ 1 MiB/s：初始桶 1 MiB，再等 ~1s；下界取宽松的 700ms（高负载只增不减）。
 #[tokio::test]
 async fn bandwidth_limit_paces_large_put() {
-    let (pool, store, _a, _b) = fixture().await;
+    let (db, store, _a, _b) = fixture().await;
     let body = Bytes::from(vec![7u8; 2 * 1024 * 1024]);
     let (vid, etag) = put_versioned_owned(&store, "big", body.clone()).await;
-    sqlx::query(
-        "INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?) \
-         ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json",
-    )
-    .bind(rules_json(None, false))
-    .execute(&pool)
-    .await
-    .unwrap();
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    save_rules(&db, &rules_json(None, false)).await;
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
     sink.on_write(WriteInfo {
         bucket: "rbk",
         key: "big",
@@ -468,7 +606,7 @@ async fn bandwidth_limit_paces_large_put() {
     let (endpoint, seen, _h) = mock_server(StatusCode::OK, Some(etag)).await;
     let c = ReplClient::new(&[target("r1", &endpoint, Some(1024 * 1024))]);
     let start = std::time::Instant::now();
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (1, 0));
+    assert_eq!(process_repl_once(&db, &store, &c).await, (1, 0));
     let elapsed = start.elapsed();
     assert!(
         elapsed >= std::time::Duration::from_millis(700),
@@ -480,8 +618,8 @@ async fn bandwidth_limit_paces_large_put() {
 /// 行内 version_id 必须被尊重：对象已覆写时复制的是旧版本内容（不是 latest）。
 #[tokio::test]
 async fn worker_reads_recorded_version_not_latest() {
-    let (pool, store, _a, _b) = fixture().await;
-    let vid = enqueue_one(&pool, Arc::clone(&store), "k").await;
+    let (db, store, _a, _b) = fixture().await;
+    let vid = enqueue_one(&db, Arc::clone(&store), "k").await;
     let old_etag = store
         .head_object_version("rbk", "k", &vid)
         .await
@@ -491,7 +629,7 @@ async fn worker_reads_recorded_version_not_latest() {
     let _ = put_versioned(&store, "k", b"NEWER").await;
     let (endpoint, seen, _h) = mock_server(StatusCode::OK, Some(old_etag)).await;
     let c = client(&endpoint);
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (1, 0));
+    assert_eq!(process_repl_once(&db, &store, &c).await, (1, 0));
     let seen = seen.lock().unwrap().clone();
     assert_eq!(
         seen[0].body,
@@ -503,7 +641,7 @@ async fn worker_reads_recorded_version_not_latest() {
 /// P2-1：多规则聚合——一个目的地成功不得提前 COMPLETED；任一永久错 bury 后 FAILED。
 #[tokio::test]
 async fn multi_rule_status_aggregates_and_fails_on_any_dead() {
-    let (pool, store, _a, _b) = fixture().await;
+    let (db, store, _a, _b) = fixture().await;
     let (vid, etag) = put_versioned(&store, "k", b"payload").await;
     let rules = vec![
         xl_s3::replication::ReplRule {
@@ -525,12 +663,8 @@ async fn multi_rule_status_aggregates_and_fails_on_any_dead() {
             enabled: true,
         },
     ];
-    sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
-        .bind(serde_json::to_string(&rules).unwrap())
-        .execute(&pool)
-        .await
-        .unwrap();
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    save_rules(&db, &serde_json::to_string(&rules).unwrap()).await;
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
     sink.on_write(WriteInfo {
         bucket: "rbk",
         key: "k",
@@ -542,7 +676,7 @@ async fn multi_rule_status_aggregates_and_fails_on_any_dead() {
         is_replica: false,
     })
     .await;
-    assert_eq!(outbox_rows(&pool).await.len(), 2);
+    assert_eq!(outbox_rows(&db).await.len(), 2);
 
     let etag2 = etag.clone();
     let script = Arc::new(move |p: &str| {
@@ -554,16 +688,13 @@ async fn multi_rule_status_aggregates_and_fails_on_any_dead() {
     });
     let (endpoint, _seen, _h) = mock_server_scripted(script).await;
     let c = client(&endpoint);
-    let _ = process_repl_once(&pool, &store, &c).await;
+    let _ = process_repl_once(&db, &store, &c).await;
     // dst 成功、bad 仍待重试 → 状态必须保持 PENDING（不得提前 COMPLETED）
     let h = store.head_object_version("rbk", "k", &vid).await.unwrap();
     assert_eq!(h.replication_status.as_deref(), Some("PENDING"));
 
     // 把 bad 推到超限 → bury → FAILED
-    sqlx::query("UPDATE repl_outbox SET attempts=10, next_retry_at=0 WHERE state='pending'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    force_attempts(&db).await;
     let etag3 = store
         .head_object_version("rbk", "k", &vid)
         .await
@@ -578,7 +709,7 @@ async fn multi_rule_status_aggregates_and_fails_on_any_dead() {
     });
     let (endpoint, _seen, _h) = mock_server_scripted(script).await;
     let c = client(&endpoint);
-    let _ = process_repl_once(&pool, &store, &c).await;
+    let _ = process_repl_once(&db, &store, &c).await;
     let h = store.head_object_version("rbk", "k", &vid).await.unwrap();
     assert_eq!(h.replication_status.as_deref(), Some("FAILED"));
 }
@@ -586,23 +717,19 @@ async fn multi_rule_status_aggregates_and_fails_on_any_dead() {
 /// R2 租约回收：过期 sending 行被置回 pending 并成功投递。
 #[tokio::test]
 async fn worker_recovers_expired_lease() {
-    let (pool, store, _a, _b) = fixture().await;
-    let vid = enqueue_one(&pool, Arc::clone(&store), "k").await;
+    let (db, store, _a, _b) = fixture().await;
+    let vid = enqueue_one(&db, Arc::clone(&store), "k").await;
     let old = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64
         - 400;
-    sqlx::query("UPDATE repl_outbox SET state='sending', claimed_at=?")
-        .bind(old)
-        .execute(&pool)
-        .await
-        .unwrap();
+    claim_as_sending(&db, old).await;
     let etag = store.head_object("rbk", "k").await.unwrap().etag;
     let (endpoint, _seen, _h) = mock_server(StatusCode::OK, Some(etag)).await;
     let c = client(&endpoint);
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (1, 0));
-    assert!(outbox_rows(&pool).await.is_empty());
+    assert_eq!(process_repl_once(&db, &store, &c).await, (1, 0));
+    assert!(outbox_rows(&db).await.is_empty());
     let h = store.head_object_version("rbk", "k", &vid).await.unwrap();
     assert_eq!(h.replication_status.as_deref(), Some("COMPLETED"));
 }
@@ -610,56 +737,56 @@ async fn worker_recovers_expired_lease() {
 /// MPU 源（ETag 含 "-N"）跳过目标 ETag 断言。
 #[tokio::test]
 async fn worker_skips_etag_assertion_for_multipart_source() {
-    let (pool, store, _a, _b) = fixture().await;
-    let _vid = enqueue_one(&pool, Arc::clone(&store), "k").await;
-    sqlx::query("UPDATE repl_outbox SET etag='deadbeef-2'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    let (db, store, _a, _b) = fixture().await;
+    let vid = enqueue_one(&db, Arc::clone(&store), "k").await;
+    clear_outbox(&db).await;
+    enqueue_manual(
+        &db,
+        "rbk",
+        "k",
+        &vid,
+        "deadbeef-2",
+        7,
+        "r1",
+        "dst",
+        false,
+        false,
+        "remote",
+    )
+    .await;
     let (endpoint, _seen, _h) = mock_server(StatusCode::OK, Some("different-etag".into())).await;
     let c = client(&endpoint);
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (1, 0));
+    assert_eq!(process_repl_once(&db, &store, &c).await, (1, 0));
 }
 
 #[tokio::test]
 async fn worker_retry_then_dead_and_marker_delete() {
-    let (pool, store, _a, _b) = fixture().await;
-    let vid = enqueue_one(&pool, Arc::clone(&store), "k").await;
+    let (db, store, _a, _b) = fixture().await;
+    let vid = enqueue_one(&db, Arc::clone(&store), "k").await;
     let etag = store.head_object("rbk", "k").await.unwrap().etag;
     // 500 → 可重试：pending + attempts=1，状态仍 PENDING
     let (endpoint, _seen, _h) = mock_server(StatusCode::INTERNAL_SERVER_ERROR, Some(etag)).await;
     let c = client(&endpoint);
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (0, 1));
-    let rows = outbox_rows(&pool).await;
+    assert_eq!(process_repl_once(&db, &store, &c).await, (0, 1));
+    let rows = outbox_rows(&db).await;
     assert_eq!(rows[0].0, "pending");
     assert_eq!(rows[0].1, 1);
     // 403 → 永久错；把 attempts 推到 10 再失败 → dead + FAILED
-    sqlx::query("UPDATE repl_outbox SET next_retry_at=0, attempts=10")
-        .execute(&pool)
-        .await
-        .unwrap();
+    force_attempts(&db).await;
     let (endpoint, _seen, _h) = mock_server(StatusCode::FORBIDDEN, None).await;
     let c = client(&endpoint);
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (0, 1));
-    let rows = outbox_rows(&pool).await;
+    assert_eq!(process_repl_once(&db, &store, &c).await, (0, 1));
+    let rows = outbox_rows(&db).await;
     assert_eq!(rows[0].0, "dead");
     assert_eq!(rows[0].1, 11);
     let h = store.head_object_version("rbk", "k", &vid).await.unwrap();
     assert_eq!(h.replication_status.as_deref(), Some("FAILED"));
 
     // marker 行 → DELETE 请求
-    sqlx::query(
-        "INSERT INTO repl_outbox (bucket, key, version_id, etag, size, remote_id, dest_bucket, \
-         is_delete_marker, state, attempts, next_retry_at, created_at) \
-         VALUES ('rbk','k',?, '', 0, 'r1', 'dst', 1, 'pending', 0, 0, 0)",
-    )
-    .bind(&vid)
-    .execute(&pool)
-    .await
-    .unwrap();
+    enqueue_manual(&db, "rbk", "k", &vid, "", 0, "r1", "dst", true, false, "remote").await;
     let (endpoint, seen, _h) = mock_server(StatusCode::OK, None).await;
     let c = client(&endpoint);
-    let _ = process_repl_once(&pool, &store, &c).await;
+    let _ = process_repl_once(&db, &store, &c).await;
     let seen = seen.lock().unwrap().clone();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].method, "DELETE");
@@ -673,56 +800,64 @@ async fn worker_retry_then_dead_and_marker_delete() {
 
 #[tokio::test]
 async fn worker_backlog_unreachable_then_recovers() {
-    let (pool, store, _a, _b) = fixture().await;
-    let _vid = enqueue_one(&pool, Arc::clone(&store), "k").await;
+    let (db, store, _a, _b) = fixture().await;
+    let _vid = enqueue_one(&db, Arc::clone(&store), "k").await;
     // 不可达端点：连接错误 = 可重试，永不 dead
     let dead_port = {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         l.local_addr().unwrap().port()
     };
     let c = client(&format!("http://127.0.0.1:{dead_port}"));
-    let _ = process_repl_once(&pool, &store, &c).await;
-    let rows = outbox_rows(&pool).await;
+    let _ = process_repl_once(&db, &store, &c).await;
+    let rows = outbox_rows(&db).await;
     assert_eq!(rows[0].0, "pending");
     assert_eq!(rows[0].1, 1);
     // 恢复：真实 mock → 追平
     let etag = store.head_object("rbk", "k").await.unwrap().etag;
     let (endpoint, _seen, _h) = mock_server(StatusCode::OK, Some(etag)).await;
-    sqlx::query("UPDATE repl_outbox SET next_retry_at=0")
-        .execute(&pool)
-        .await
-        .unwrap();
+    clear_retry(&db).await;
     let c = client(&endpoint);
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (1, 0));
-    assert!(outbox_rows(&pool).await.is_empty());
+    assert_eq!(process_repl_once(&db, &store, &c).await, (1, 0));
+    assert!(outbox_rows(&db).await.is_empty());
 }
 
 // ---------------- M7 切片 2a/2b：站点入队矩阵 + 动态 peer 出站 ----------------
 
-async fn site_fixture() -> (SqlitePool, Arc<Store>, tempfile::TempDir, tempfile::TempDir) {
-    let (pool, store, a, b) = fixture().await;
-    sqlx::query("INSERT INTO sites (peer_id, peer_site_token) VALUES ('p1', 'tok-p1')")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO buckets (name, versioning) VALUES ('rbk', 'Enabled')")
-        .execute(&pool)
-        .await
-        .unwrap();
-    (pool, store, a, b)
+async fn site_fixture() -> (Arc<Db>, Arc<Store>, tempfile::TempDir, tempfile::TempDir) {
+    let (db, store, a, b) = fixture().await;
+    db.insert_site(&SitePeer {
+        peer_id: "p1".into(),
+        remote_site_id: "site-p1".into(),
+        name: "p1".into(),
+        endpoint: String::new(),
+        region: "us-east-1".into(),
+        priority: 0,
+        s3_access_key: String::new(),
+        s3_secret_key: String::new(),
+        peer_site_token: "tok-p1".into(),
+        created_at: 0,
+        last_seen: None,
+        last_error: None,
+        raft_node_id: None,
+        reconcile_required: false,
+    })
+    .await
+    .unwrap();
+    set_versioning(&db, "Enabled").await;
+    (db, store, a, b)
 }
 
-async fn site_count(pool: &SqlitePool) -> i64 {
-    sqlx::query_scalar("SELECT COUNT(*) FROM repl_outbox WHERE target_kind='site'")
-        .fetch_one(pool)
-        .await
-        .unwrap()
+async fn site_count(db: &Db) -> i64 {
+    outbox_wires(db)
+        .iter()
+        .filter(|(_, w)| w.target_kind == "site")
+        .count() as i64
 }
 
 #[tokio::test]
 async fn site_enqueue_matrix() {
-    let (pool, store, _a, _b) = site_fixture().await;
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    let (db, store, _a, _b) = site_fixture().await;
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
     let (vid, etag) = put_versioned(&store, "k", b"x").await;
     macro_rules! info {
         ($v:expr, $marker:expr, $replica:expr) => {
@@ -740,44 +875,36 @@ async fn site_enqueue_matrix() {
     }
     // 数据写 → 每个 peer 一行（无 replication_rules 也入队）。
     sink.on_write(info!(Some(&vid), false, false)).await;
-    assert_eq!(site_count(&pool).await, 1);
-    let row = sqlx::query(
-        "SELECT target_kind, remote_id, dest_bucket, is_delete_marker, version_id \
-         FROM repl_outbox WHERE target_kind='site'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    use sqlx::Row as _;
-    assert_eq!(row.get::<String, _>("target_kind"), "site");
-    assert_eq!(row.get::<String, _>("remote_id"), "p1");
-    assert_eq!(row.get::<String, _>("dest_bucket"), "rbk");
-    assert_eq!(row.get::<i64, _>("is_delete_marker"), 0);
-    assert_eq!(row.get::<String, _>("version_id"), vid);
+    assert_eq!(site_count(&db).await, 1);
+    let wires = outbox_wires(&db);
+    let row = &wires
+        .iter()
+        .find(|(_, w)| w.target_kind == "site")
+        .expect("site row")
+        .1;
+    assert_eq!(row.target_kind, "site");
+    assert_eq!(row.remote_id, "p1");
+    assert_eq!(row.dest_bucket, "rbk");
+    assert!(!row.is_delete_marker);
+    assert_eq!(row.version_id, vid);
 
     // marker → 入队（版本桶 Enabled）。
     sink.on_write(info!(Some("dm-1"), true, false)).await;
-    assert_eq!(site_count(&pool).await, 2);
+    assert_eq!(site_count(&db).await, 2);
     // REPLICA / null 版本 → 不入队。
     sink.on_write(info!(Some("v-other"), false, true)).await;
     sink.on_write(info!(Some("null"), false, false)).await;
-    assert_eq!(site_count(&pool).await, 2);
+    assert_eq!(site_count(&db).await, 2);
     // 硬删（无版本）在 Enabled 桶 → 入队且版本列为空。
     sink.on_write(info!(None, false, false)).await;
-    assert_eq!(site_count(&pool).await, 3);
-    let empty: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repl_outbox WHERE version_id='' AND target_kind='site'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    assert_eq!(site_count(&db).await, 3);
+    let empty = outbox_wires(&db)
+        .iter()
+        .filter(|(_, w)| w.target_kind == "site" && w.version_id.is_empty())
+        .count();
     assert_eq!(empty, 1);
     // 4.16：版本定向删除 → 站点一行（is_version_delete=1），M6 远端规则不入队。
-    sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
-        .bind(rules_json(None, true))
-        .execute(&pool)
-        .await
-        .unwrap();
+    save_rules(&db, &rules_json(None, true)).await;
     sink.on_write(WriteInfo {
         bucket: "rbk",
         key: "k",
@@ -789,22 +916,19 @@ async fn site_enqueue_matrix() {
         is_replica: false,
     })
     .await;
-    assert_eq!(site_count(&pool).await, 4);
-    let row = sqlx::query(
-        "SELECT is_delete_marker, is_version_delete FROM repl_outbox \
-         WHERE target_kind='site' AND version_id='v-del'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(row.get::<i64, _>("is_delete_marker"), 0);
-    assert_eq!(row.get::<i64, _>("is_version_delete"), 1);
-    let remote: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repl_outbox WHERE target_kind='remote' AND version_id='v-del'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    assert_eq!(site_count(&db).await, 4);
+    let wires = outbox_wires(&db);
+    let row = &wires
+        .iter()
+        .find(|(_, w)| w.target_kind == "site" && w.version_id == "v-del")
+        .expect("site v-del row")
+        .1;
+    assert!(!row.is_delete_marker);
+    assert!(row.is_version_delete);
+    let remote = wires
+        .iter()
+        .filter(|(_, w)| w.target_kind == "remote" && w.version_id == "v-del")
+        .count();
     assert_eq!(remote, 0, "版本定向删除无 M6 远端 id 映射，不得入远端队列");
     // null 版本删除不跨界（站点 PUT 用真实 UUID 同源 id）。
     sink.on_write(WriteInfo {
@@ -818,14 +942,11 @@ async fn site_enqueue_matrix() {
         is_replica: false,
     })
     .await;
-    assert_eq!(site_count(&pool).await, 4);
+    assert_eq!(site_count(&db).await, 4);
     // Suspended → 删除不入队。
-    sqlx::query("UPDATE buckets SET versioning='Suspended' WHERE name='rbk'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    set_versioning(&db, "Suspended").await;
     sink.on_write(info!(Some("dm-2"), true, false)).await;
-    assert_eq!(site_count(&pool).await, 4);
+    assert_eq!(site_count(&db).await, 4);
 }
 
 #[derive(Clone, Debug)]
@@ -972,7 +1093,7 @@ async fn site_mock(
 #[tokio::test]
 async fn site_worker_preflight_metadata_retry_and_null_version() {
     use std::collections::BTreeMap;
-    let (pool, store, _a, _b) = site_fixture().await;
+    let (db, store, _a, _b) = site_fixture().await;
     let info = store
         .put_object_stream_with_meta_ext(
             "rbk",
@@ -998,14 +1119,8 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
     let vid = info.version_id.clone().unwrap();
     let etag = info.etag.clone();
     // 站点行：白名单凭据写入 sites。
-    sqlx::query(
-        "UPDATE sites SET endpoint='http://127.0.0.1:1', s3_access_key='ak', \
-         s3_secret_key='sk', region='us-east-1' WHERE peer_id='p1'",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    update_site(&db, "http://127.0.0.1:1", "ak", "sk").await;
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
     sink.on_write(WriteInfo {
         bucket: "rbk",
         key: "k",
@@ -1017,27 +1132,20 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
         is_replica: false,
     })
     .await;
-    assert_eq!(site_count(&pool).await, 1);
+    assert_eq!(site_count(&db).await, 1);
 
     // 1) 目标 versioning 404 → 可重试（不 PUT）。
     let state = Arc::new(Mutex::new("404".to_string()));
     let (endpoint, seen) = site_mock(Arc::clone(&state), etag.clone()).await;
-    sqlx::query("UPDATE sites SET endpoint=? WHERE peer_id='p1'")
-        .bind(&endpoint)
-        .execute(&pool)
-        .await
-        .unwrap();
+    update_site(&db, &endpoint, "ak", "sk").await;
     let outer = ReplClient::new(&[]);
-    assert_eq!(process_repl_once(&pool, &store, &outer).await, (0, 1));
+    assert_eq!(process_repl_once(&db, &store, &outer).await, (0, 1));
     assert!(seen.lock().unwrap().iter().all(|s| s.method == "GET"));
-    assert_eq!(outbox_rows(&pool).await[0].0, "pending");
+    assert_eq!(outbox_rows(&db).await[0].0, "pending");
     // P3-7：把 attempts 推到 bury 阈值——仍 pending 才证明 404 被归为可重试（而非 11 轮后 dead）。
-    sqlx::query("UPDATE repl_outbox SET attempts=10, next_retry_at=0 WHERE target_kind='site'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(process_repl_once(&pool, &store, &outer).await, (0, 1));
-    let rows = outbox_rows(&pool).await;
+    force_attempts(&db).await;
+    assert_eq!(process_repl_once(&db, &store, &outer).await, (0, 1));
+    let rows = outbox_rows(&db).await;
     assert_eq!(rows[0].0, "pending", "404 预检必须是可重试：{rows:?}");
     assert_eq!(rows[0].1, 11);
     assert!(
@@ -1048,11 +1156,8 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
 
     // 2) 就绪 → PUT 带 REPLICA/content-type/metadata，且要求真实 version-id。
     *state.lock().unwrap() = "Enabled".into();
-    sqlx::query("UPDATE repl_outbox SET next_retry_at=0")
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    clear_retry(&db).await;
+    assert_eq!(process_repl_once(&db, &store, &outer).await, (1, 0));
     let seen_snapshot = seen.lock().unwrap().clone();
     let puts: Vec<&SiteSeen> = seen_snapshot.iter().filter(|s| s.method == "PUT").collect();
     assert_eq!(puts.len(), 1);
@@ -1093,11 +1198,8 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
         is_replica: false,
     })
     .await;
-    sqlx::query("UPDATE repl_outbox SET next_retry_at=0 WHERE target_kind='site'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert_eq!(process_repl_once(&pool, &store, &outer).await, (2, 0));
+    clear_retry(&db).await;
+    assert_eq!(process_repl_once(&db, &store, &outer).await, (2, 0));
     let seen = seen.lock().unwrap().clone();
     let dels: Vec<&SiteSeen> = seen.iter().filter(|s| s.method == "DELETE").collect();
     assert_eq!(dels.len(), 2, "marker 与硬删都走 DELETE");
@@ -1116,7 +1218,7 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
     assert!(!dm_del.uri.contains("versionId="));
 
     // 3) PUT 响应 version-id 为 null/缺失 → 可重试，不静默成功。
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
     // 与 "k" 同内容 → ETag 与 mock 返回值一致，确保失败原因是 version-id 缺失而非 ETag 断言。
     let (vid2, etag2) = put_versioned(&store, "nullver", b"payload").await;
     sink.on_write(WriteInfo {
@@ -1131,24 +1233,18 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
     })
     .await;
     // 等预检缓存过期不必要：同名桶缓存 Enabled（10s）。PUT 缺 version-id → pending。
-    sqlx::query("UPDATE repl_outbox SET next_retry_at=0 WHERE key='nullver'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let (sent, failed) = process_repl_once(&pool, &store, &outer).await;
+    clear_retry(&db).await;
+    let (sent, failed) = process_repl_once(&db, &store, &outer).await;
     assert_eq!((sent, failed), (0, 1));
-    sqlx::query("UPDATE repl_outbox SET attempts=10, next_retry_at=0 WHERE key='nullver'")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let (sent, failed) = process_repl_once(&pool, &store, &outer).await;
+    force_attempts(&db).await;
+    let (sent, failed) = process_repl_once(&db, &store, &outer).await;
     assert_eq!((sent, failed), (0, 1));
-    let (st, err): (String, Option<String>) = sqlx::query_as(
-        "SELECT state, last_error FROM repl_outbox WHERE key='nullver' AND target_kind='site'",
-    )
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let rows = outbox_rows(&db).await;
+    let (st, err) = rows
+        .iter()
+        .find(|_| true)
+        .map(|r| (r.0.clone(), r.3.clone()))
+        .expect("nullver row");
     assert_eq!(
         st, "pending",
         "null version-id 必须可重试（11 轮也不 dead）"
@@ -1162,7 +1258,7 @@ async fn site_worker_preflight_metadata_retry_and_null_version() {
 /// 4.16：站点版本定向删除走标准 `DELETE ?versionId=`（带 REPLICA），绝不 PUT/造 marker。
 #[tokio::test]
 async fn site_version_delete_is_replicated_as_versioned_delete() {
-    let (pool, store, _a, _b) = site_fixture().await;
+    let (db, store, _a, _b) = site_fixture().await;
     let state = Arc::new(Mutex::new("Enabled".to_string()));
     let (endpoint, seen) = site_mock(Arc::clone(&state), "e".into()).await;
     sqlx::query(
@@ -1170,11 +1266,11 @@ async fn site_version_delete_is_replicated_as_versioned_delete() {
          WHERE peer_id='p1'",
     )
     .bind(&endpoint)
-    .execute(&pool)
+    .execute(&db)
     .await
     .unwrap();
     let vid = "11111111-1111-4111-8111-111111111111";
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
     sink.on_write(WriteInfo {
         bucket: "rbk",
         key: "gone",
@@ -1187,7 +1283,7 @@ async fn site_version_delete_is_replicated_as_versioned_delete() {
     })
     .await;
     let outer = ReplClient::new(&[]);
-    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    assert_eq!(process_repl_once(&db, &store, &outer).await, (1, 0));
     let seen = seen.lock().unwrap().clone();
     assert!(
         seen.iter().all(|s| s.method != "PUT"),
@@ -1206,22 +1302,22 @@ async fn site_version_delete_is_replicated_as_versioned_delete() {
         Some("true"),
         "源端已授权，目标按同值复核"
     );
-    assert_eq!(site_count(&pool).await, 0, "成功行应删除");
+    assert_eq!(site_count(&db).await, 0, "成功行应删除");
 }
 
 /// 4.16：目标版本已不存在（404）视为已删——幂等成功，不重试、不造 marker。
 #[tokio::test]
 async fn site_version_delete_treats_target_404_as_already_deleted() {
-    let (pool, store, _a, _b) = site_fixture().await;
+    let (db, store, _a, _b) = site_fixture().await;
     let state = Arc::new(Mutex::new("Enabled".to_string()));
     let (endpoint, seen) = site_mock(Arc::clone(&state), "e".into()).await;
     sqlx::query("UPDATE sites SET endpoint=? WHERE peer_id='p1'")
         .bind(&endpoint)
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     let vid = "33333333-3333-4333-8333-333333333333";
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
     sink.on_write(WriteInfo {
         bucket: "rbk",
         key: "already-gone",
@@ -1234,8 +1330,8 @@ async fn site_version_delete_treats_target_404_as_already_deleted() {
     })
     .await;
     let outer = ReplClient::new(&[]);
-    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
-    assert_eq!(site_count(&pool).await, 0, "404 应按已删结算");
+    assert_eq!(process_repl_once(&db, &store, &outer).await, (1, 0));
+    assert_eq!(site_count(&db).await, 0, "404 应按已删结算");
     assert!(
         seen.lock().unwrap().iter().all(|s| s.method != "PUT"),
         "删除不得退化成 PUT"
@@ -1245,12 +1341,12 @@ async fn site_version_delete_treats_target_404_as_already_deleted() {
 /// 4.16：同版本更早的 PUT 行仍未完成时，版本删除必须等待（防目标复活）。
 #[tokio::test]
 async fn site_version_delete_waits_for_same_version_put() {
-    let (pool, store, _a, _b) = site_fixture().await;
+    let (db, store, _a, _b) = site_fixture().await;
     let state = Arc::new(Mutex::new("Enabled".to_string()));
     let (endpoint, seen) = site_mock(Arc::clone(&state), "e".into()).await;
     sqlx::query("UPDATE sites SET endpoint=? WHERE peer_id='p1'")
         .bind(&endpoint)
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     let vid = "22222222-2222-4222-8222-222222222222";
@@ -1263,25 +1359,25 @@ async fn site_version_delete_waits_for_same_version_put() {
         .bind(vid)
         .bind(0_i64)
         .bind(9_999_999_999_i64)
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     sqlx::query(ins)
         .bind(vid)
         .bind(1_i64)
         .bind(0_i64)
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     let outer = ReplClient::new(&[]);
-    assert_eq!(process_repl_once(&pool, &store, &outer).await, (0, 1));
+    assert_eq!(process_repl_once(&db, &store, &outer).await, (0, 1));
     assert!(
         seen.lock().unwrap().iter().all(|s| s.method == "GET"),
         "等待期间不得发送删除"
     );
     let (st, err): (String, Option<String>) =
         sqlx::query_as("SELECT state, last_error FROM repl_outbox WHERE is_version_delete=1")
-            .fetch_one(&pool)
+            .fetch_one(&db)
             .await
             .unwrap();
     assert_eq!(st, "pending");
@@ -1289,14 +1385,14 @@ async fn site_version_delete_waits_for_same_version_put() {
     assert!(err.contains("保序"), "{err}");
     // 更早行完成（删除）后放行。
     sqlx::query("DELETE FROM repl_outbox WHERE is_version_delete=0")
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     sqlx::query("UPDATE repl_outbox SET next_retry_at=0 WHERE is_version_delete=1")
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
-    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    assert_eq!(process_repl_once(&db, &store, &outer).await, (1, 0));
     let seen = seen.lock().unwrap().clone();
     assert!(
         seen.iter()
@@ -1309,7 +1405,7 @@ async fn site_version_delete_waits_for_same_version_put() {
 async fn site_put_replicates_tags_storage_class_and_lock() {
     use std::collections::BTreeMap;
     use xl_store::meta::{ObjectLockRecord, ObjectTag};
-    let (pool, store, _a, _b) = site_fixture().await;
+    let (db, store, _a, _b) = site_fixture().await;
     let until = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 + 3_600_000_000_000;
     let info = store
         .put_object_stream_with_meta_ext(
@@ -1345,10 +1441,10 @@ async fn site_put_replicates_tags_storage_class_and_lock() {
          WHERE peer_id='p1'",
     )
     .bind(&endpoint)
-    .execute(&pool)
+    .execute(&db)
     .await
     .unwrap();
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
     sink.on_write(WriteInfo {
         bucket: "rbk",
         key: "meta",
@@ -1361,7 +1457,7 @@ async fn site_put_replicates_tags_storage_class_and_lock() {
     })
     .await;
     let outer = ReplClient::new(&[]);
-    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    assert_eq!(process_repl_once(&db, &store, &outer).await, (1, 0));
     let seen_put = seen.lock().unwrap().clone();
     let puts: Vec<&SiteSeen> = seen_put.iter().filter(|s| s.method == "PUT").collect();
     assert_eq!(puts.len(), 1);
@@ -1392,7 +1488,7 @@ async fn site_put_replicates_tags_storage_class_and_lock() {
         is_replica: false,
     })
     .await;
-    assert_eq!(process_repl_once(&pool, &store, &outer).await, (1, 0));
+    assert_eq!(process_repl_once(&db, &store, &outer).await, (1, 0));
     let seen = seen.lock().unwrap().clone();
     assert_eq!(
         seen.iter().filter(|s| s.method == "PUT").count(),
@@ -1511,9 +1607,9 @@ fn token_target(id: &str, endpoint: &str) -> RemoteTarget {
     }
 }
 
-async fn remote_rows(pool: &SqlitePool) -> i64 {
+async fn remote_rows(db: &SqlitePool) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM repl_outbox WHERE target_kind='remote'")
-        .fetch_one(pool)
+        .fetch_one(db)
         .await
         .unwrap()
 }
@@ -1523,7 +1619,7 @@ async fn remote_rows(pool: &SqlitePool) -> i64 {
 async fn m6_token_remote_replicates_metadata_and_same_origin_id() {
     use std::collections::BTreeMap;
     use xl_store::meta::{ObjectLockRecord, ObjectTag};
-    let (pool, store, _a, _b) = fixture().await;
+    let (db, store, _a, _b) = fixture().await;
     let until = time::OffsetDateTime::now_utc().unix_timestamp_nanos() as i64 + 3_600_000_000_000;
     let info = store
         .put_object_stream_with_meta_ext(
@@ -1556,10 +1652,10 @@ async fn m6_token_remote_replicates_metadata_and_same_origin_id() {
     let (endpoint, seen) = site_mock(Arc::clone(&state), info.etag.clone()).await;
     sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
         .bind(rules_json(None, true))
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store))
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store))
         .with_versioned_remotes(vec!["r1".into()]);
     sink.on_write(WriteInfo {
         bucket: "rbk",
@@ -1573,7 +1669,7 @@ async fn m6_token_remote_replicates_metadata_and_same_origin_id() {
     })
     .await;
     let c = ReplClient::new(&[token_target("r1", &endpoint)]);
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (1, 0));
+    assert_eq!(process_repl_once(&db, &store, &c).await, (1, 0));
     let seen = seen.lock().unwrap().clone();
     let puts: Vec<&SiteSeen> = seen.iter().filter(|s| s.method == "PUT").collect();
     assert_eq!(puts.len(), 1);
@@ -1604,14 +1700,14 @@ async fn m6_token_remote_replicates_metadata_and_same_origin_id() {
 /// 旧 M6 远端（无 token）保持「版本删除不入队」原语义。
 #[tokio::test]
 async fn m6_token_remote_replicates_version_delete_without_content_fingerprint() {
-    let (pool, store, _a, _b) = fixture().await;
+    let (db, store, _a, _b) = fixture().await;
     sqlx::query("INSERT INTO buckets (name, versioning) VALUES ('rbk', 'Enabled')")
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
         .bind(rules_json(None, true))
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     let (vid, _etag) = put_versioned(&store, "gone", b"payload").await;
@@ -1630,35 +1726,35 @@ async fn m6_token_remote_replicates_version_delete_without_content_fingerprint()
         is_replica: false,
     };
     // 旧 M6 sink（未配置 versioned remotes）→ 不入队。
-    SqlReplSink::new(pool.clone(), Arc::clone(&store))
+    SqlReplSink::new(Arc::clone(&db), Arc::clone(&store))
         .on_write(wi("gone", "v-old"))
         .await;
-    assert_eq!(remote_rows(&pool).await, 0, "无 token 远端不得入队版本删除");
+    assert_eq!(remote_rows(&db).await, 0, "无 token 远端不得入队版本删除");
 
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store))
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store))
         .with_versioned_remotes(vec!["r1".into()]);
     sink.on_write(wi("gone", "v-del")).await;
-    assert_eq!(remote_rows(&pool).await, 1);
+    assert_eq!(remote_rows(&db).await, 1);
     // 源桶 Suspended → 不入队（与站点路径同口径）。
     sqlx::query("UPDATE buckets SET versioning='Suspended' WHERE name='rbk'")
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     sink.on_write(wi("gone", "v-del2")).await;
-    assert_eq!(remote_rows(&pool).await, 1);
+    assert_eq!(remote_rows(&db).await, 1);
     sqlx::query("UPDATE buckets SET versioning='Enabled' WHERE name='rbk'")
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     // 目标已无该版本（404）→ 幂等成功。
     sink.on_write(wi("already-gone", "v-del3")).await;
-    assert_eq!(remote_rows(&pool).await, 2);
+    assert_eq!(remote_rows(&db).await, 2);
 
     let state = Arc::new(Mutex::new("Enabled".to_string()));
     let (endpoint, seen) = site_mock(Arc::clone(&state), "e".into()).await;
     let c = ReplClient::new(&[token_target("r1", &endpoint)]);
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (2, 0));
-    assert_eq!(remote_rows(&pool).await, 0, "成功行应删除");
+    assert_eq!(process_repl_once(&db, &store, &c).await, (2, 0));
+    assert_eq!(remote_rows(&db).await, 0, "成功行应删除");
     let seen = seen.lock().unwrap().clone();
     assert!(
         seen.iter().all(|s| s.method != "PUT"),
@@ -1681,7 +1777,7 @@ async fn m6_token_remote_replicates_version_delete_without_content_fingerprint()
 /// 4.19：SSE-KMS 源不得以明文/换钥复制——永久错、不发任何目标请求。
 #[tokio::test]
 async fn m6_worker_dead_letters_sse_kms_without_request() {
-    let (pool, store, _a, datadir) = fixture().await;
+    let (db, store, _a, datadir) = fixture().await;
     let sys = xl_store::layout::sys_dir(datadir.path(), "");
     store
         .init_encryption(None, Some(sys.join("kms")))
@@ -1708,10 +1804,10 @@ async fn m6_worker_dead_letters_sse_kms_without_request() {
         .unwrap();
     let vid = info.version_id.clone().unwrap();
     let (endpoint, seen, _h) = mock_server(StatusCode::OK, Some(info.etag.clone())).await;
-    let sink = SqlReplSink::new(pool.clone(), Arc::clone(&store));
+    let sink = SqlReplSink::new(Arc::clone(&db), Arc::clone(&store));
     sqlx::query("INSERT INTO replication_rules (bucket, rules_json) VALUES ('rbk', ?)")
         .bind(rules_json(None, true))
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     sink.on_write(WriteInfo {
@@ -1726,12 +1822,12 @@ async fn m6_worker_dead_letters_sse_kms_without_request() {
     })
     .await;
     sqlx::query("UPDATE repl_outbox SET attempts=10")
-        .execute(&pool)
+        .execute(&db)
         .await
         .unwrap();
     let c = client(&endpoint);
-    assert_eq!(process_repl_once(&pool, &store, &c).await, (0, 1));
-    let rows = outbox_rows(&pool).await;
+    assert_eq!(process_repl_once(&db, &store, &c).await, (0, 1));
+    let rows = outbox_rows(&db).await;
     assert_eq!(rows[0].0, "dead", "SSE-KMS 必须是永久死信：{rows:?}");
     assert!(rows[0].3.as_deref().unwrap_or("").contains("SSE-KMS"));
     assert!(seen.lock().unwrap().is_empty(), "不得向目标发任何请求");

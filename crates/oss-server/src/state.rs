@@ -295,17 +295,7 @@ impl AppState {
             .map_err(|e| format!("创建暂存目录 {} 失败: {e}", cfg.staging_dir.display()))?;
 
         // witness 由 `witness` 子命令承载（config 已拒绝 serve + role=witness）。
-        let db = Arc::new(if object_backend {
-            // B4：对象后端不打开/创建 oss.db，也不跑 SQLite 迁移。
-            Db::connect_object().await?
-        } else {
-            Db::connect_site(
-                &cfg.database_url,
-                cfg.raft.is_some(),
-                cfg.site.as_ref().and_then(|s| s.id.as_deref()),
-            )
-            .await?
-        });
+        let db = Arc::new(Db::connect_object().await?);
         let raft_settings = match cfg.raft.as_ref() {
             Some(t) => Some(
                 crate::raft::RaftSettings::from_toml(t)
@@ -313,49 +303,7 @@ impl AppState {
             ),
             None => None,
         };
-        // SQLite 专属启动序列（身份种子、模式守卫、AP 账户校验）。对象后端的
-        // 对应事实在对象根里，由 `ObjectControl::open` 断言；E/F 收口其余门面。
-        if !object_backend {
-            // M9 S7.1：身份必须在任何控制面写之前种子/校验（首次启动也写 schema_meta）。
-            if let Some(settings) = &raft_settings {
-                crate::raft::identity::verify_and_seed(&db, settings).await?;
-            }
-            // M7（R2）：`[site]` 覆盖必须早于任何控制面写（桶对账/管理员引导）；测试路径
-            // 经 `AppState::new` 同样会再应用一次（幂等）。
-            if let Some(site) = cfg.site.as_ref() {
-                db.apply_site_config(
-                    site.name.as_deref(),
-                    Some(site.region.as_str()),
-                    Some(site.priority),
-                    site.token.as_deref(),
-                )
-                .await?;
-            }
-            // M9：无条件模式守卫（connect_* 已执行一次；这里按计划顺序在 site 配置后复验）。
-            db.prepare_raft_mode(cfg.raft.is_some()).await?;
-            // S6d：模式与库内触发器/站点状态一致才放行。
-            db.assert_mode_guards().await?;
-            // M8-2 P1-A：本地运行态（含 level-3 快照拷贝）不是日志事实；feature-4 启动前
-            // 必须四表为空/无悬空引用，或已有 level-4 命令/快照/cutover 留下的激活标记。
-            // 守卫在 Raft 启动前，拒绝时不会进入 apply。
-            if let Some(settings) = &raft_settings {
-                crate::raft::compat::guard_runstate_activation(db.pool(), settings.feature_level)
-                    .await
-                    .map_err(|e| format!("[raft] 运行态激活守卫：{e}"))?;
-                // v1.23.0 的 feature-4 inventory 行是节点本地行，且有独立的 level-5 marker。
-                crate::raft::compat::guard_inventory_activation(db.pool(), settings.feature_level)
-                    .await
-                    .map_err(|e| format!("[raft] inventory 激活守卫：{e}"))?;
-            }
-            // AP Slice A：静态端点 registry 的账户存在性/状态（DB 就绪后）。
-            // Raft 新节点在快照安装前本地账户表可能为空 → 只 hard-fail standalone；
-            // 请求级账户绑定在两种模式下都 fail-closed。
-            if cfg.raft.is_none() {
-                validate_ap_endpoints(&db, &cfg.ap)
-                    .await
-                    .map_err(|e| format!("[ap] 配置校验失败：{e}"))?;
-            }
-        }
+        // 身份/模式状态在对象根里，由 `ObjectControl::open` 断言。
         let mut store_cfg = StoreConfig::new(&drives[0]);
         // M9 S1：sync 写提交门（必须在 Store::open 前注入——open 克隆配置）。
         let sync_metrics = Arc::new(crate::sync::SyncMetrics::default());
@@ -388,8 +336,6 @@ impl AppState {
                 Arc::clone(&ap_cache),
                 Arc::clone(&olap_cache),
             ));
-        // M9 S4：stretch 首次启用标记（检查在 Store::open 前做，marker 在 open 成功后写）。
-        let mut stretch_first_init = false;
         // M3 集群（配了 [cluster] 才走）：静态拓扑 + 节点间传输注入存储内核。
         // 单节点（None）行为与 v1.4.0 逐字节一致；拓扑与盘数的硬校验在
         // ClusterTopology::new 与 Store::open（self 一致性）。
@@ -495,7 +441,6 @@ impl AppState {
                 resolver: None,
                 stretch: true,
             }));
-            stretch_first_init = stretch_startup_check(&db, &store_cfg.drives).await?;
         }
         let store = Arc::new(Store::open(store_cfg).await?);
         // B4：对象后端的控制根必须在任何控制面读（new_with 的 site/AP/OLAP 预加载）
@@ -524,12 +469,6 @@ impl AppState {
                 ),
             }
         }
-        if stretch_first_init && !object_backend {
-            db.schema_meta_set_if_absent("stretch_initialized", "1")
-                .await
-                .map_err(|e| format!("写入 stretch_initialized 失败: {e}"))?;
-        }
-
         // M5 切片 2：密钥库接线（**前提块**：须在 open 成功后——掉盘首启不得生成新主密钥；
         // 未在册时 init_encryption 内部门闩会拒启）。env 一个不设 = 不启用加密（零行为变化）：
         // - OSS_MASTER_KEY_FILE：SSE-S3 单钥文件路径（provider file/"file"）
@@ -550,72 +489,6 @@ impl AppState {
         // M9 H3/H5：Raft 模式下桶/行以日志为事实源，不得做本地对账回填。
         let raft_enabled = cfg.raft.is_some();
 
-        // M7（P3）：两轮启动对账期间抑制站点触发器——维护写（set_id 收敛/补行）不得
-        // 产生 changelog；结束后复位 0。进程若中途退出，下次 connect 的 site_bootstrap 复位。
-        if !raft_enabled && !object_backend {
-            if let Err(e) = db.set_apply_ctx(true).await {
-                tracing::warn!(error = %e, "启动对账抑制开关失败（继续）");
-            }
-            // 历史桶回填（权限体系）：盘上有、buckets 表里没有的桶补一行（owner NULL ⇒
-            // 仅管理员可见/可管）。INSERT OR IGNORE 幂等，已存在（含已有 owner）不覆盖。
-            match store.list_buckets().await {
-                Ok(buckets) => {
-                    for b in buckets {
-                        // M4 切片 8：INSERT OR IGNORE 不覆盖已有行（新桶在创建时已带 owner/set）；
-                        // 无行者先扇出问 set：有答按答插；「全部可达且全无」→ set0+warn（存量语义）；
-                        // **任一传输错 → 不插行**（下次启动重试；「不可达」不得写死 set0——
-                        // verifier 终审洞 2：升级后 set=1 桶的行在不可达窗口被写死 0 即分片错组）
-                        match store.resolve_bucket_set_authoritative(&b.name).await {
-                            // P3-3：权威 set **对账**（不止补缺）——陈旧行（删桶重建后别节点残留）在此收敛；
-                            // M5 切片 0：改走**权威**解析（跳过本地短路——原实现把本地陈旧值原样写回，收敛不成立）
-                            Ok(Some(s)) => {
-                                if let Err(e) = db.upsert_bucket_set(&b.name, s).await {
-                                    tracing::warn!(error = %e, bucket = %b.name, "回填对账失败");
-                                }
-                            }
-                            Ok(None) => {
-                                // 全可达且确无行：仅缺行时插 set=0（**不覆盖**已有行——None 无权威值）
-                                tracing::warn!(bucket = %b.name, "回填：全集群确无该桶行，按 set=0（存量语义）");
-                                if let Err(e) = db.insert_bucket(&b.name, None).await {
-                                    tracing::warn!(error = %e, bucket = %b.name, "历史桶回填失败");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, bucket = %b.name, "回填：set 解析不可达，本轮跳过（下次启动重试）");
-                            }
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "启动回填：列举桶失败"),
-            }
-
-            // M5 切片 0（P4-1）第二对账面：表行全量——上面的磁盘循环看不见「行在而目录不在」的
-            // 陈旧行（删桶广播未达该节点 + 目录删除已生效）。对端有行 → 权威值收敛；对端全无行
-            // → 保守不动（可能是本节点建的桶而对端漏收广播——删行会把本节点的活桶 404 掉；
-            // 该残窗随重建广播/下轮重启收敛，彻底强一致归 M9）。
-            match db.list_bucket_rows().await {
-                Ok(names) => {
-                    for name in names {
-                        match store.resolve_bucket_set_authoritative(&name).await {
-                            Ok(Some(s)) => {
-                                if let Err(e) = db.upsert_bucket_set(&name, s).await {
-                                    tracing::warn!(error = %e, bucket = %name, "行对账收敛失败");
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(error = %e, bucket = %name, "行对账：权威解析不可达，本轮跳过");
-                            }
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!(error = %e, "启动对账：列举桶行失败"),
-            }
-            if let Err(e) = db.set_apply_ctx(false).await {
-                tracing::warn!(error = %e, "启动对账抑制复位失败");
-            }
-        }
-
         // M1 还没有注册界面：用环境变量引导出第一个管理员（幂等，已存在则跳过）。
         // 口令来源：OSS_ADMIN_PASSWORD 非空优先；空/缺时用密钥文件解析值（配了
         // OSS_SECRETS_FILE 才可能有——docker 栈即此路径，口令随文件落盘）。
@@ -631,7 +504,7 @@ impl AppState {
                 .filter(|p| !p.is_empty())
                 .or_else(|| secrets.admin_password.clone()),
         ) {
-            (Some(user), Some(pass)) if object_backend => {
+            (Some(user), Some(pass)) => {
                 if ensure_object_admin(&db, &user, &pass).await? {
                     tracing::info!(
                         user = %user,
@@ -639,20 +512,6 @@ impl AppState {
                         "创建管理员账号（口令取自环境变量或密钥文件）"
                     );
                 }
-            }
-            (Some(user), Some(pass)) => {
-                // 已存在的同名账号一律不覆盖（含口令不同的情况）
-                if !db.user_exists(&user).await? {
-                    db.create_user(&user, &pass, true).await?;
-                    tracing::info!(
-                        user = %user,
-                        secrets_file = ?secrets.secrets_file,
-                        "创建管理员账号（口令取自环境变量或密钥文件）"
-                    );
-                }
-                // M9 N8：identity/配对使用首个管理员名；已写入不覆盖。
-                db.schema_meta_set_if_absent("admin_username", &user)
-                    .await?;
             }
             (Some(_), None) => {
                 tracing::warn!(
@@ -666,38 +525,6 @@ impl AppState {
         // 集群：滚动启动时对端可能尚未就绪——**本地确保 + 广播尽力**（严格 fail-closed
         // 留给运行时的用户请求；缺口由写路径懒自愈与 fsck 差集补齐兜底）。
         // 实弹教训：docker 集群栈里 n1 先于对端启动，严格扇出会让启动即退。
-        // M7（L2）：groups 桶的记账写也属于启动维护，必须抑制站点触发器（否则时钟领先时
-        // INSERT OR IGNORE 仍会触发 BEFORE 门控 ABORT，进程起不来）。
-        // M9 H3/H5：Raft 模式下 groups 桶行/目录由日志 apply 产生，跳过本地回填。
-        if !raft_enabled && !object_backend {
-            if let Err(e) = db.set_apply_ctx(true).await {
-                tracing::warn!(error = %e, "groups 回填抑制开关失败（继续）");
-            }
-            for g in &cfg.groups {
-                if cfg.cluster.is_some() {
-                    store.mesh_ensure_bucket(&g.bucket).await?;
-                    if let Some(cl) = store.cluster() {
-                        let self_id = cl.sets.flat.self_node().id.clone();
-                        for n in &cl.sets.flat.nodes {
-                            if n.id == self_id {
-                                continue;
-                            }
-                            if let Err(e) = cl.transport.ensure_bucket(&n.id, &g.bucket).await {
-                                tracing::warn!(node = %n.id, bucket = %g.bucket, error = %e, "启动建桶广播未达（滚动启动正常；懒自愈/fsck 兜底）");
-                            }
-                        }
-                    }
-                } else if !store.bucket_exists(&g.bucket).await? {
-                    store.create_bucket(&g.bucket).await?;
-                }
-                // M4 切片 8：groups 桶钉 set 0（多 set 下不参与新组——目录/行按 set0 口径收口，C3）
-                db.insert_bucket(&g.bucket, None).await?;
-            }
-            if let Err(e) = db.set_apply_ctx(false).await {
-                tracing::warn!(error = %e, "groups 回填抑制复位失败");
-            }
-        }
-
         // Raft 启动必须晚于本地管理员引导：日志重放里的管理员属主需解析到本地 id。
         // 首启 bootstrap 成功的节点即已初始化（metrics 的成员可能滞后一拍）。
         let bootstrapped = raft_settings.as_ref().is_some_and(|s| s.bootstrap);
@@ -708,7 +535,7 @@ impl AppState {
             (None, None)
         };
         let raft = match raft_settings {
-            Some(settings) if object_backend => {
+            Some(settings) => {
                 let control = db
                     .object_control()
                     .ok_or("对象控制根未装配，无法启动 [raft]")?
@@ -724,35 +551,18 @@ impl AppState {
                     .await?,
                 ))
             }
-            Some(settings) => Some(Arc::new(
-                crate::raft::spawn_with_control_tls(
-                    settings,
-                    Some(db.pool().clone()),
-                    install_tx,
-                    tls.peer_tls().then(|| Arc::clone(&tls)),
-                )
-                .await?,
-            )),
             None => None,
         };
         // S7.1：初始化标志以 live 成员为准（首启 bootstrap 后写 1；witness/等 join 写 0）。
-        // 对象后端把它写在对象根 markers；standalone 对象根不写 Raft 身份。
-        if object_backend {
-            if raft.is_some() {
-                let control = db
-                    .object_control()
-                    .ok_or("对象控制根未装配")?
-                    .control
-                    .clone();
-                crate::raft::identity::record_initialized_object(
-                    &control,
-                    bootstrapped || raft.as_ref().is_some_and(|h| h.membership_nonempty()),
-                )
-                .await?;
-            }
-        } else {
-            crate::raft::identity::record_initialized(
-                &db,
+        // 写在对象根 markers；standalone 对象根不写 Raft 身份。
+        if raft.is_some() {
+            let control = db
+                .object_control()
+                .ok_or("对象控制根未装配")?
+                .control
+                .clone();
+            crate::raft::identity::record_initialized_object(
+                &control,
                 bootstrapped || raft.as_ref().is_some_and(|h| h.membership_nonempty()),
             )
             .await?;
@@ -1004,10 +814,10 @@ impl AppState {
         // M6 切片 0/1：事件接收方（worker 在 serve 路径挂载；Kafka 目标优先，否则 env 文件 sink）
         let notifier =
             crate::events::notifier_from_config_tls(&cfg.kafka.targets, Arc::clone(&tls));
-        let events = Arc::new(match db.object_control() {
-            Some(_) => crate::events::SqlEventSink::with_db(Arc::clone(&db), notifier),
-            None => crate::events::SqlEventSink::new(db.pool().clone(), notifier),
-        });
+        let events = Arc::new(crate::events::SqlEventSink::new(
+            Arc::clone(&db),
+            notifier,
+        ));
         // M9 S6：门面与副作用执行器共享同一批 Arc；Raft 句柄来自 load。
         // 先于共享存储构造——S6c 起它们的控制写要经同一门面。
         let control = Arc::new(match &raft {
@@ -1031,8 +841,7 @@ impl AppState {
         // M6 切片 4：复制（规则存储 + 写入钩子 + 出站客户端；worker 在 serve 路径挂载）
         let remote_ids: Vec<String> = cfg.remotes.iter().map(|r| r.id.clone()).collect();
         let repl_store = Arc::new(
-            crate::replication::SqlReplStore::new(db.pool().clone(), remote_ids)
-                .with_db(Arc::clone(&db))
+            crate::replication::SqlReplStore::new(Arc::clone(&db), remote_ids)
                 .with_control(Arc::clone(&control)),
         );
         // M9 S3：共享删除服务（sync 桶 remote-first；非 sync 委托 store）。
@@ -1047,8 +856,7 @@ impl AppState {
             .with_tls(Arc::clone(&tls)),
         );
         let repl_sink = Arc::new(
-            crate::replication::SqlReplSink::new(db.pool().clone(), Arc::clone(&store))
-                .with_db(Arc::clone(&db))
+            crate::replication::SqlReplSink::new(Arc::clone(&db), Arc::clone(&store))
                 // M9 S4：stretch 关闭 M7 异步站点对象复制（EC 双站点数据面已承担）。
                 .with_site_data_replication(cfg.stretch.is_none())
                 // 4.19：仅配置 site_token 的远端具备同源 id（版本删除可定点）。
@@ -1189,72 +997,12 @@ pub async fn validate_ap_endpoints(db: &Db, ap: &crate::config::ApToml) -> Resul
     Ok(())
 }
 
-/// M9 S4（P1-7）：`[stretch]` 只允许全新部署——首次启用要求库内无桶/无 sync 桶、
-/// 各 data_dir 只有 `.oss.sys`；返回是否首次（调用方在 `Store::open` 成功后写标记）。
-/// P0-1：任何一次 stretch 启动都不得残留 M7 站点 outbox 行，否则 worker 会复制出
-/// 第二份整对象副本。
-async fn stretch_startup_check(db: &Db, drives: &[PathBuf]) -> Result<bool, String> {
-    let site_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM repl_outbox WHERE target_kind = 'site'")
-            .fetch_one(db.pool())
-            .await
-            .map_err(|e| format!("stretch 启动检查 repl_outbox 失败: {e}"))?;
-    if site_rows > 0 {
-        return Err(format!(
-            "stretch 禁止既有 M7 站点复制任务（repl_outbox target_kind='site' 共 {site_rows} 行）：\
-             请先导出对象并按全新部署重建"
-        ));
-    }
-    if db
-        .schema_meta("stretch_initialized")
-        .await
-        .map_err(|e| format!("stretch 启动检查 schema_meta 失败: {e}"))?
-        .is_some()
-    {
-        return Ok(false);
-    }
-    let sync_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM buckets WHERE replication_mode = 'sync'")
-            .fetch_one(db.pool())
-            .await
-            .map_err(|e| format!("stretch 启动检查 buckets 失败: {e}"))?;
-    let bucket_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM buckets")
-        .fetch_one(db.pool())
-        .await
-        .map_err(|e| format!("stretch 启动检查 buckets 失败: {e}"))?;
-    if bucket_rows > 0 {
-        return Err(format!(
-            "stretch 只允许全新空库（buckets 共 {bucket_rows} 行、其中 sync 桶 {sync_rows} 个）：\
-             请先导出对象并清空库/盘后重启"
-        ));
-    }
-    for d in drives {
-        // 全新部署的 data_dirs 可能尚未创建；不存在等价于空盘，交由 Store::open 创建。
-        if !d.exists() {
-            continue;
-        }
-        for ent in std::fs::read_dir(d)
-            .map_err(|e| format!("stretch 启动检查目录 {} 失败: {e}", d.display()))?
-            .flatten()
-        {
-            if ent.file_name() != std::ffi::OsStr::new(".oss.sys") {
-                return Err(format!(
-                    "stretch 只允许全新空存储（{} 含 {}）：请先导出并清空 data_dirs",
-                    d.display(),
-                    ent.file_name().to_string_lossy()
-                ));
-            }
-        }
-    }
-    Ok(true)
-}
-
 /// 对象根的一次性管理员引导（standalone/Raft 同路径）。
 ///
 /// `admin_username` marker 兼作「本节点已引导」标记：它在节点本地根里、快照
 /// 安装不清除，所以只在该标记缺失时建号——有意删除环境管理员后重启不会复活。
 /// 同名已存在账号（含非管理员）一律不覆盖，与 SQLite 引导语义一致。
-async fn ensure_object_admin(db: &Db, user: &str, pass: &str) -> Result<bool, sqlx::Error> {
+async fn ensure_object_admin(db: &Db, user: &str, pass: &str) -> crate::db::Result<bool> {
     if db.schema_meta("admin_username").await?.is_some() {
         return Ok(false);
     }

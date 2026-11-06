@@ -78,22 +78,22 @@ struct Env {
 
 impl Env {
     async fn last_detail(&self) -> Option<String> {
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT detail FROM audit_log ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_one(self.st.db.pool())
-        .await
-        .unwrap()
+        let q = xl_store::control_store::audit::AuditQuery {
+            limit: 1,
+            ..Default::default()
+        };
+        let rows = self.st.db.control_store().audit_page(&q).await.unwrap();
+        rows.first().and_then(|r| r.detail.clone())
     }
 
     async fn last_detail_for(&self, op: &str) -> Option<String> {
-        sqlx::query_scalar::<_, Option<String>>(
-            "SELECT detail FROM audit_log WHERE op = ? ORDER BY id DESC LIMIT 1",
-        )
-        .bind(op)
-        .fetch_one(self.st.db.pool())
-        .await
-        .unwrap()
+        let q = xl_store::control_store::audit::AuditQuery {
+            limit: 1,
+            op: Some(op.into()),
+            ..Default::default()
+        };
+        let rows = self.st.db.control_store().audit_page(&q).await.unwrap();
+        rows.first().and_then(|r| r.detail.clone())
     }
 
     fn get(&self) -> reqwest::RequestBuilder {

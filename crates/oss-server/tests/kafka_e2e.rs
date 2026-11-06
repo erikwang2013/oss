@@ -3,7 +3,7 @@
 //! 阶段由 env 驱动，缺 env 即跳过（默认测试轮零依赖）：
 //! - `OSS_KAFKA_E2E_BROKERS`   broker 地址（脚本动态端口）
 //! - `OSS_KAFKA_E2E_TOPIC`     主题
-//! - `OSS_KAFKA_E2E_DB`        跨阶段共享的 SQLite 文件（outbox 必须跨进程存活）
+//! - `OSS_KAFKA_E2E_DB`        跨阶段共享的对象控制根目录（outbox 必须跨进程存活）
 //!
 //! 阶段由测试函数名选择（phase1/2/3），脚本逐个调起。
 //!
@@ -13,16 +13,21 @@
 use std::sync::Arc;
 
 use oss_server::config::KafkaTarget;
+use oss_server::control_backend::ObjectControl;
+use oss_server::db::Db;
 use oss_server::events::{KafkaNotifier, Notifier, SqlEventSink, process_once};
-use sqlx::SqlitePool;
+use oss_server::local_store::QueueStatus;
 use xl_s3::events::{EventSink, EventSource, S3EventOp};
+use xl_store::control_state::root::Mode;
+use xl_store::store::{Store, StoreConfig};
 
 fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|s| !s.is_empty())
 }
 
 struct Ctx {
-    pool: SqlitePool,
+    db: Arc<Db>,
+    control: Arc<ObjectControl>,
     sink: Arc<SqlEventSink>,
     brokers: Vec<String>,
     topic: String,
@@ -31,31 +36,21 @@ struct Ctx {
 async fn ctx() -> Option<Ctx> {
     let broker = env("OSS_KAFKA_E2E_BROKERS")?;
     let topic = env("OSS_KAFKA_E2E_TOPIC")?;
-    let db = env("OSS_KAFKA_E2E_DB")?;
-    let pool = SqlitePool::connect(&format!("sqlite://{db}?mode=rwc"))
+    let root = env("OSS_KAFKA_E2E_DB")?;
+    std::fs::create_dir_all(&root).unwrap();
+    let store = Arc::new(Store::open(StoreConfig::new(&root)).await.unwrap());
+    let control = ObjectControl::open(store, Mode::Standalone, None)
         .await
         .unwrap();
-    sqlx::raw_sql(
-        "CREATE TABLE IF NOT EXISTS buckets (name TEXT PRIMARY KEY, owner_id INTEGER, creation_date INTEGER NOT NULL);\
-         CREATE TABLE IF NOT EXISTS event_configs (bucket TEXT PRIMARY KEY, config_json TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0);\
-         CREATE TABLE IF NOT EXISTS event_outbox (id INTEGER PRIMARY KEY AUTOINCREMENT, bucket TEXT NOT NULL, target_id TEXT NOT NULL, \
-          event_json TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, \
-          claimed_at INTEGER, next_retry_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0, last_error TEXT);",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT OR IGNORE INTO buckets (name, owner_id, creation_date) VALUES ('kbk', 1, 0)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT OR REPLACE INTO event_configs (bucket, config_json) VALUES ('kbk', ?)",
-    )
-    .bind(r#"[{"id":"a","target":"t1","events":["s3:ObjectCreated:Put"],"prefix":null,"suffix":null}]"#)
-    .execute(&pool)
+    let db = Arc::new(Db::connect_object().await.unwrap());
+    db.attach_object_control(Arc::clone(&control)).unwrap();
+    if !db.bucket_exists("kbk").await.unwrap() {
+        db.insert_bucket("kbk", Some(1)).await.unwrap();
+    }
+    let config = r#"[{"id":"a","target":"t1","events":["s3:ObjectCreated:Put"],"prefix":null,"suffix":null}]"#;
+    db.control_write("kafka-e2e-config", move |txn| {
+        Box::pin(async move { txn.bucket_notification_set("kbk", config, 1).await })
+    })
     .await
     .unwrap();
     let targets = vec![KafkaTarget {
@@ -66,9 +61,10 @@ async fn ctx() -> Option<Ctx> {
         sasl: None,
     }];
     let notifier: Arc<dyn Notifier> = Arc::new(KafkaNotifier::new(&targets));
-    let sink = Arc::new(SqlEventSink::new(pool.clone(), notifier));
+    let sink = Arc::new(SqlEventSink::new(Arc::clone(&db), notifier));
     Some(Ctx {
-        pool,
+        db,
+        control,
         sink,
         brokers: vec![broker],
         topic,
@@ -110,18 +106,39 @@ async fn ensure_topic(ctx: &Ctx) {
     let _ = ctrl.create_topic(ctx.topic.clone(), 1, 1, 5_000).await; // TopicAlreadyExists 容忍
 }
 
-async fn outbox_counts(pool: &SqlitePool) -> (i64, i64) {
-    let pending: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM event_outbox WHERE state IN ('pending','sending')",
-    )
-    .fetch_one(pool)
-    .await
-    .unwrap();
-    let dead: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE state='dead'")
-        .fetch_one(pool)
-        .await
-        .unwrap();
+fn outbox_counts(ctx: &Ctx) -> (i64, i64) {
+    let entries = ctx
+        .control
+        .control
+        .local_store()
+        .unwrap()
+        .queue("event_outbox")
+        .unwrap()
+        .scan();
+    let pending = entries
+        .iter()
+        .filter(|e| matches!(e.status, QueueStatus::Pending | QueueStatus::Claimed))
+        .count() as i64;
+    let dead = entries
+        .iter()
+        .filter(|e| e.status == QueueStatus::Dead)
+        .count() as i64;
     (pending, dead)
+}
+
+fn max_pending_attempts(ctx: &Ctx) -> i64 {
+    ctx.control
+        .control
+        .local_store()
+        .unwrap()
+        .queue("event_outbox")
+        .unwrap()
+        .scan()
+        .into_iter()
+        .filter(|e| e.status == QueueStatus::Pending)
+        .map(|e| i64::from(e.attempts))
+        .max()
+        .unwrap_or(0)
 }
 
 /// 消费全量（从 offset 0 起），返回 (键列表, 载荷列表)。
@@ -165,14 +182,14 @@ async fn phase1_broker_up_delivers() {
     emit(&ctx, "p1-0.json").await;
     // 有界重取：worker 轮询直到 outbox 清空（≤60s）
     for _ in 0..60 {
-        process_once(&ctx.pool, ctx.sink.notifier().as_ref()).await;
-        let (pending, _) = outbox_counts(&ctx.pool).await;
+        process_once(&ctx.db, ctx.sink.notifier().as_ref()).await;
+        let (pending, _) = outbox_counts(&ctx);
         if pending == 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    let (pending, dead) = outbox_counts(&ctx.pool).await;
+    let (pending, dead) = outbox_counts(&ctx);
     assert_eq!((pending, dead), (0, 0), "阶段 1 应全部投递成功");
     let (keys, payloads) = consume_all(&ctx).await;
     assert!(keys.contains(&"p1-0.json".to_string()), "{keys:?}");
@@ -200,20 +217,16 @@ async fn phase2_broker_down_buffers() {
     // broker 已停：投递必失败；有界执行（连接失败可能慢于一次 RPC 超时）
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(60),
-        process_once(&ctx.pool, ctx.sink.notifier().as_ref()),
+        process_once(&ctx.db, ctx.sink.notifier().as_ref()),
     )
     .await;
-    let (pending, dead) = outbox_counts(&ctx.pool).await;
+    let (pending, dead) = outbox_counts(&ctx);
     assert!(
         pending >= 5,
         "停机期 5 条必须积压 pending（实得 {pending}）"
     );
     assert_eq!(dead, 0, "连接类错误不得进死信");
-    let attempts: i64 =
-        sqlx::query_scalar("SELECT MAX(attempts) FROM event_outbox WHERE state='pending'")
-            .fetch_one(&ctx.pool)
-            .await
-            .unwrap();
+    let attempts = max_pending_attempts(&ctx);
     assert!(attempts >= 1, "失败应计 attempts");
     println!("phase2 ✓ 积压 {pending} 条（attempts={attempts}）");
 }
@@ -227,15 +240,15 @@ async fn phase3_recover_replays_without_dupes() {
     };
     ensure_topic(&ctx).await;
     for _ in 0..120 {
-        process_once(&ctx.pool, ctx.sink.notifier().as_ref()).await;
-        let (pending, dead) = outbox_counts(&ctx.pool).await;
+        process_once(&ctx.db, ctx.sink.notifier().as_ref()).await;
+        let (pending, dead) = outbox_counts(&ctx);
         assert_eq!(dead, 0, "恢复补投期间不得出现死信");
         if pending == 0 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    let (pending, dead) = outbox_counts(&ctx.pool).await;
+    let (pending, dead) = outbox_counts(&ctx);
     assert_eq!((pending, dead), (0, 0), "恢复后必须全部追平");
     let (keys, _) = consume_all(&ctx).await;
     let mut expect: Vec<String> = vec!["p1-0.json".to_string()];

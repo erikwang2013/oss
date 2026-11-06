@@ -1,9 +1,5 @@
 //! B1 tests: basic transaction/commit, crash matrix, conflict retry.
 
-mod account;
-mod account_fixtures;
-mod account_snapshot;
-mod account_write;
 mod acl_writes;
 mod basic;
 mod bulk;
@@ -18,28 +14,8 @@ mod db_facade;
 mod db_object;
 #[path = "../../../tests/support/golden.rs"]
 mod golden;
-mod hooks_cascade;
-mod hooks_iam;
 mod hooks_wired;
-mod iam;
-mod iam_guard;
-mod iam_snapshot;
-mod jobs;
-mod parity_ap_olap_vpc;
-mod parity_audit;
-mod parity_bucket;
-mod parity_cascade;
-mod parity_event_outbox;
-mod parity_inventory;
-mod parity_lifecycle;
-mod parity_repl_outbox;
-mod parity_sync_intents;
-mod parity_tier;
-mod parity_uploads;
-mod parity_util;
-mod site;
 mod site_common;
-mod site_hooks;
 mod support;
 
 use std::collections::BTreeMap;

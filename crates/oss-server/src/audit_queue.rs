@@ -129,19 +129,15 @@ async fn flush(db: &crate::db::Db, batch: &mut Vec<AuditEntry>) {
     if batch.is_empty() {
         return;
     }
-    let mut err = insert_batch(db, batch).await.err();
-    // 瞬时 busy/锁冲突重试一次；仍失败则放弃该批（审计不得反压请求）。
-    // 对象模式不重试：审计行已写入本地日志，重放会重复。
-    if err.is_some() && db.object_control().is_none() {
-        err = insert_batch(db, batch).await.err();
-    }
-    if let Some(e) = err {
+    // 对象模式不重试：审计行已写入本地日志，重放会重复。失败则放弃该批
+    //（审计不得反压请求）。
+    if let Err(e) = insert_batch(db, batch).await {
         tracing::warn!(error = %e, rows = batch.len(), "审计批量写入失败，丢弃该批");
     }
     batch.clear();
 }
 
-async fn insert_batch(db: &crate::db::Db, rows: &[AuditEntry]) -> Result<(), sqlx::Error> {
+async fn insert_batch(db: &crate::db::Db, rows: &[AuditEntry]) -> crate::db::Result<()> {
     use xl_store::control_store::audit::{AuditTxn, NewAuditRecord};
 
     let records: Vec<NewAuditRecord> = rows
@@ -156,22 +152,13 @@ async fn insert_batch(db: &crate::db::Db, rows: &[AuditEntry]) -> Result<(), sql
             detail: r.detail.clone(),
         })
         .collect();
-    if db.object_control().is_some() {
-        db.object_local_write("audit", move |txn| {
-            Box::pin(async move {
-                txn.audit_insert_batch(&records).await?;
-                Ok(())
-            })
+    db.object_local_write("audit", move |txn| {
+        Box::pin(async move {
+            txn.audit_insert_batch(&records).await?;
+            Ok(())
         })
-        .await?;
-        return Ok(());
-    }
-    let mut tx = db.pool().begin().await?;
-    crate::control_store::SqliteControlTxn::new(&mut tx)
-        .audit_insert_batch(&records)
-        .await
-        .map_err(crate::control_store::to_sqlx)?;
-    tx.commit().await
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -187,10 +174,21 @@ mod tests {
         assert_eq!(q.dropped(), 1);
     }
 
-    /// worker 成批落库（沿用 events 测试的内存 SQLite 单连接池模式）。
+    /// worker 成批落对象控制面的本地审计日志。
     #[tokio::test]
     async fn worker_writes_batched_rows() {
-        let db = Arc::new(crate::db::Db::connect("sqlite::memory:").await.unwrap());
+        use xl_store::control_state::root::Mode;
+        use xl_store::control_store::audit::AuditStore as _;
+        use xl_store::store::{Store, StoreConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = StoreConfig::new(dir.path());
+        cfg.fsync = false;
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let object = crate::control_backend::ObjectControl::open(store, Mode::Standalone, None)
+            .await
+            .unwrap();
+        let db = Arc::new(crate::db::Db::connect_object().await.unwrap());
+        db.attach_object_control(object).unwrap();
 
         let q = AuditQueue::new(QUEUE_CAPACITY);
         let rx = q.take_rx().expect("rx 只能取一次");
@@ -198,22 +196,23 @@ mod tests {
         assert!(q.enqueue(7, "PutObject", Some("b"), Some("k"), "allow", Some("d")));
         assert!(q.enqueue(0, "GetObject", Some("b"), Some("k"), "deny", None));
 
-        let mut rows = 0i64;
+        let query = xl_store::control_store::audit::AuditQuery {
+            limit: 10,
+            ..Default::default()
+        };
+        let mut rows = Vec::new();
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(20)).await;
-            rows = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-            if rows == 2 {
+            rows = db.control_store().audit_page(&query).await.unwrap();
+            if rows.len() == 2 {
                 break;
             }
         }
-        assert_eq!(rows, 2, "worker 应把两条审计行批量写入");
-        let uid: i64 = sqlx::query_scalar("SELECT uid FROM audit_log WHERE decision = 'allow'")
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(uid, 7);
+        assert_eq!(rows.len(), 2, "worker 应把两条审计行批量写入");
+        let allow = rows
+            .iter()
+            .find(|r| r.decision == "allow")
+            .expect("allow row");
+        assert_eq!(allow.uid, 7);
     }
 }

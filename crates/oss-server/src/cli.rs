@@ -1338,18 +1338,9 @@ pub async fn run_offline(
             )
             .await
         }
-        Command::RaftExport { out, witness } => export_cmd(cfg_path, out, witness).await,
-        Command::RaftCutover {
-            from,
-            peer_config,
-            dry_run,
-            overwrite,
-        } => cutover_cmd(cfg_path, &from, peer_config.as_deref(), dry_run, overwrite).await,
-        Command::RaftForceRecover {
-            from,
-            new_node_id,
-            yes,
-        } => force_recover_cmd(cfg_path, &from, new_node_id, yes).await,
+        Command::RaftExport { .. } => removed_sqlite_op("raft-export"),
+        Command::RaftCutover { .. } => removed_sqlite_op("raft-cutover"),
+        Command::RaftForceRecover { .. } => removed_sqlite_op("raft-force-recover"),
         Command::SyncReconcile {
             repair,
             bucket,
@@ -1364,13 +1355,7 @@ pub async fn run_offline(
         } => replica_reconcile_cmd(cfg_path, bucket, key, delete, apply, json).await,
         Command::TierAudit { json } => tier_audit_cmd(cfg_path, json).await,
         Command::Cmk(cmd) => cmk_cmd(cfg_path, cmd).await,
-        Command::ControlMigrate {
-            from,
-            state_dir,
-            raft_db,
-            dry_run,
-            json,
-        } => crate::migrate::run_cli(&from, &state_dir, &raft_db, dry_run, json).await,
+        Command::ControlMigrate { .. } => removed_sqlite_op("control-migrate"),
         other => Err(format!("{other:?} 不是离线命令（内部接线错误）").into()),
     }
 }
@@ -1403,224 +1388,39 @@ async fn membership_rpc(
     Ok(if status.is_success() { 0 } else { 1 })
 }
 
-fn sqlite_url(path: &std::path::Path) -> String {
-    format!("sqlite://{}?mode=rw", path.display())
-}
-
-/// 对象后端没有 SQLite 控制库；这些离线命令仍只读写 SQLite（或占位库），
-/// 误跑会打开/改写一个与对象根无关的库。必须在任何连接之前 fail-closed；
-/// SQLite→对象根的迁移走 `control-migrate`（本函数不拦截它）。
-fn require_sqlite_backend(
+/// 离线命令打开对象控制根（服务器必须已停止，根锁独占）。
+async fn open_offline_object_db(
     cfg: &crate::config::AppConfig,
-    op: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if cfg.server.control_backend == crate::config::ControlBackend::Objects {
-        return Err(format!(
-            "control_backend=objects 不支持 {op}：该离线命令仍只读写 SQLite 控制库，\
-             对象根没有等价实现；命令未接触数据库。SQLite→对象根迁移请用 control-migrate"
-        )
-        .into());
-    }
-    Ok(())
+) -> Result<Arc<crate::db::Db>, Box<dyn std::error::Error + Send + Sync>> {
+    let store = open_local_store(cfg).await?;
+    offline_object_db(cfg, store).await
 }
 
-fn env_has_vault() -> bool {
-    ["OSS_MASTER_KEY_FILE", "OSS_KMS_DIR"].iter().any(|k| {
-        std::env::var(k)
-            .map(|v| !v.trim().is_empty())
-            .unwrap_or(false)
-    })
-}
-
-async fn export_cmd(
-    cfg_path: &std::path::Path,
-    out: Option<std::path::PathBuf>,
-    witness: bool,
-) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let (db, source_site, node_id, role, admin, has_vault) = if witness {
-        let w = crate::config::WitnessToml::load(cfg_path)?;
-        let state_db = w.raft.state_db.as_ref().ok_or(
-            "witness 是元数据-only 状态机（无控制数据）；raft-export --witness 只支持旧库\
-             迁移输入 [raft].state_db；请从 voter 导出",
-        )?;
-        let db = crate::db::Db::connect_offline(&sqlite_url(state_db)).await?;
-        (
-            db,
-            "witness".to_string(),
-            Some(w.raft.node_id),
-            "witness".to_string(),
-            None,
-            None,
-        )
-    } else {
-        let cfg = crate::config::AppConfig::load(cfg_path)?;
-        require_sqlite_backend(&cfg, "raft-export")?;
-        let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
-        let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
-        let site = db
-            .schema_meta("raft_site_id")
-            .await?
-            .unwrap_or_else(|| "site".into());
-        let admin = db.schema_meta("admin_username").await?;
-        (
-            db,
-            site,
-            Some(raft.node_id),
-            "voter".to_string(),
-            admin,
-            Some(env_has_vault()),
-        )
-    };
-    let export = crate::raft::cutover::build_export(
-        &db,
-        source_site.clone(),
-        node_id,
-        &role,
-        admin,
-        has_vault,
+async fn offline_object_db(
+    cfg: &crate::config::AppConfig,
+    store: Arc<xl_store::store::Store>,
+) -> Result<Arc<crate::db::Db>, Box<dyn std::error::Error + Send + Sync>> {
+    let object = crate::control_backend::ObjectControl::open(
+        store,
+        crate::control_backend::expected_mode(cfg.raft.is_some()),
+        cfg.site.as_ref().and_then(|s| s.id.as_deref()),
     )
     .await?;
-    match out.as_deref() {
-        Some(p) if p != std::path::Path::new("-") => {
-            crate::raft::cutover::write_export(p, &export)?;
-            println!("导出完成: {}", p.display());
-        }
-        _ => println!("{}", serde_json::to_string_pretty(&export)?),
-    }
-    Ok(0)
+    let db = Arc::new(crate::db::Db::connect_object().await?);
+    db.attach_object_control(object)?;
+    Ok(db)
 }
 
-async fn cutover_cmd(
-    cfg_path: &std::path::Path,
-    from: &std::path::Path,
-    peer_config: Option<&std::path::Path>,
-    dry_run: bool,
-    overwrite: bool,
-) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    let export = crate::raft::cutover::read_export(from)?;
-    let mut paths = vec![cfg_path.to_path_buf()];
-    if let Some(p) = peer_config {
-        paths.push(p.to_path_buf());
-    }
-    let mut targets = Vec::new();
-    for p in &paths {
-        let cfg = crate::config::AppConfig::load(p)?;
-        require_sqlite_backend(&cfg, "raft-cutover")?;
-        let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
-        let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
-        let facts = crate::raft::cutover::TargetFacts {
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            has_vault: env_has_vault(),
-            admin_username: db.schema_meta("admin_username").await?,
-            has_cluster: cfg.cluster.is_some(),
-        };
-        let _ = raft;
-        targets.push((p.clone(), db, facts));
-    }
-    // 先 dry-run 全部目标，再写；避免第二个目标失败时第一个已切模式。
-    for (_, db, facts) in &targets {
-        let report = match crate::raft::cutover::cutover(
-            db,
-            facts,
-            &export,
-            &crate::raft::cutover::CutoverOptions {
-                dry_run: true,
-                overwrite,
-            },
-        )
-        .await
-        {
-            Ok(report) => report,
-            Err(crate::raft::cutover::CutoverError::Conflict(diffs)) => {
-                // 非 --overwrite 的冲突在返回 Error 前也打印字段级明细，便于审计定位。
-                for d in &diffs {
-                    eprintln!("conflict {} {} {}", d.table, d.key, d.field);
-                }
-                return Err(crate::raft::cutover::CutoverError::Conflict(diffs).into());
-            }
-            Err(e) => return Err(e.into()),
-        };
-        if !report.conflicts.is_empty() {
-            for d in &report.conflicts {
-                eprintln!("conflict {} {} {}", d.table, d.key, d.field);
-            }
-        }
-    }
-    if dry_run {
-        println!("dry-run: 校验通过（{} 个目标）", targets.len());
-        return Ok(0);
-    }
-    for (path, db, facts) in &targets {
-        let report = crate::raft::cutover::cutover(
-            db,
-            facts,
-            &export,
-            &crate::raft::cutover::CutoverOptions {
-                dry_run: false,
-                overwrite,
-            },
-        )
-        .await?;
-        println!(
-            "cutover 完成: {} ({} 张表)",
-            path.display(),
-            report.rows.len()
-        );
-    }
-    println!("下一步：A 以 bootstrap=true、B 以 false 启动，配对后 raft-add-witness C");
-    Ok(0)
+/// H1：这些命令的唯一输入是已删除的 SQLite 迁移库；完整实现保留在归档二进制。
+fn removed_sqlite_op(op: &str) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
+    Err(format!(
+        "{op} 依赖已经移除的 SQLite 控制库/迁移输入，本版本不再提供；请使用 v1.31.0 归档二进制 \
+         oss-server-v1.31.0-linux-x86_64（sha256 \
+         fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae）执行"
+    )
+    .into())
 }
 
-async fn force_recover_cmd(
-    cfg_path: &std::path::Path,
-    from: &std::path::Path,
-    new_node_id: u64,
-    yes: bool,
-) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
-    if !yes {
-        return Err("raft-force-recover 需要 --yes 确认".into());
-    }
-    let export = crate::raft::cutover::read_export(from)?;
-    // 数据站点配置优先；否则按 witness 配置（仅 [raft]）打开 state_db。
-    let (db, settings, raft_db) = match crate::config::AppConfig::load(cfg_path) {
-        Ok(cfg) => {
-            require_sqlite_backend(&cfg, "raft-force-recover")?;
-            let raft = cfg.raft.as_ref().ok_or("[raft] 未配置")?;
-            let settings = crate::raft::RaftSettings::from_toml(raft)?;
-            let raft_db = settings.db_path.clone();
-            let db = crate::db::Db::connect_raft(&cfg.database_url).await?;
-            (db, settings, raft_db)
-        }
-        Err(_) => {
-            let w = crate::config::WitnessToml::load(cfg_path)?;
-            let state_db = w.raft.state_db.as_ref().ok_or(
-                "witness force-recover 需要旧 state_db 作为迁移输入（新状态机为元数据-only 文件）",
-            )?;
-            let settings = crate::raft::RaftSettings::from_toml(&w.raft)?;
-            let raft_db = settings.db_path.clone();
-            for p in [state_db.as_path(), raft_db.as_path()] {
-                if let Some(dir) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
-                    std::fs::create_dir_all(dir)?;
-                }
-            }
-            let url = format!("sqlite://{}?mode=rwc", state_db.display());
-            let db = crate::db::Db::connect_witness(&url).await?;
-            (db, settings, raft_db)
-        }
-    };
-    let report =
-        crate::raft::cutover::force_recover(&db, &raft_db, &settings, &export, new_node_id).await?;
-    println!(
-        "force-recover 完成: node={} voters={:?} raft_db={}",
-        report.node_id,
-        report.voters,
-        report.raft_db.display()
-    );
-    println!("以 bootstrap=false 启动本节点；恢复其他站点后配对；对象数据从备份恢复");
-    Ok(0)
-}
-
-/// M7 遗留未映射 REPLICA 的人工对账：列出（无 --delete）或点名删除（--apply 才真删）。
 async fn replica_reconcile_cmd(
     cfg_path: &std::path::Path,
     bucket: String,
@@ -1631,8 +1431,7 @@ async fn replica_reconcile_cmd(
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     // 离线：只做 meta 读与定点版本删，不 AppState::load（会二次打开 raft.db）。
     let cfg = crate::config::AppConfig::load(cfg_path)?;
-    require_sqlite_backend(&cfg, "replica-reconcile")?;
-    let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
+    let db = open_offline_object_db(&cfg).await?;
     let drives = cfg
         .data_dirs
         .clone()
@@ -1779,8 +1578,7 @@ async fn sync_reconcile_cmd(
 ) -> Result<i32, Box<dyn std::error::Error + Send + Sync>> {
     // 离线：绝不 AppState::load（会二次打开 raft.db 并启动运行时/启动对账）。
     let cfg = crate::config::AppConfig::load(cfg_path)?;
-    require_sqlite_backend(&cfg, "sync-reconcile")?;
-    let db = crate::db::Db::connect_offline(&cfg.database_url).await?;
+    let db = open_offline_object_db(&cfg).await?;
     // sync-reconcile 是运维修数据路径：open_local_store 不注入写门/集群拓扑。
     let store = open_local_store(&cfg).await?;
     let vault = xl_s3::skvault::SecretVault::from_enc_state(store.enc_state()).map(Arc::new);
@@ -1871,18 +1669,15 @@ async fn cmk_cmd(
                 ..
             }
     );
-    if needs_db {
-        require_sqlite_backend(&cfg, "cmk scan/delete/trash-purge/rewrap --to-legacy")?;
-    }
     let store = open_local_store(&cfg).await?;
     let db = if needs_db {
-        Some(crate::db::Db::connect_offline(&cfg.database_url).await?)
+        Some(offline_object_db(&cfg, Arc::clone(&store)).await?)
     } else {
         None
     };
     let cfg_refs = db
         .as_ref()
-        .map(|d| d as &dyn xl_store::store::CmkConfigRefs);
+        .map(|d| d.as_ref() as &dyn xl_store::store::CmkConfigRefs);
     match cmd {
         CmkCommand::Scan { name, json } => {
             let name = xl_store::kms::parse_cmk_id(&name)?;
@@ -2687,60 +2482,14 @@ mod tests {
         assert_eq!(parse_args(&args(&["clean", "36526"])), Err(USAGE));
     }
 
-    /// 对象后端的 SQLite-only 离线命令必须在任何连接/建库之前 fail-closed；
-    /// 错误要可操作（指向 control-migrate），且不得创建 oss.db 或 data 目录。
-    #[tokio::test]
-    async fn object_backend_offline_commands_fail_closed_before_sqlite() {
-        let dir = tempfile::tempdir().unwrap();
-        let cfg_path = dir.path().join("oss.toml");
-        std::fs::write(
-            &cfg_path,
-            format!(
-                r#"
-listen = "127.0.0.1:0"
-data_dir = "{}"
-staging_dir = "{}"
-database_url = "sqlite://{}?mode=rwc"
-jwt_secret = "0123456789abcdef0123456789abcdef"
-
-[server]
-control_backend = "objects"
-"#,
-                dir.path().join("data").display(),
-                dir.path().join("staging").display(),
-                dir.path().join("oss.db").display(),
-            ),
-        )
-        .unwrap();
-        let db_path = dir.path().join("oss.db");
-        let commands = [
-            Command::SyncReconcile {
-                repair: false,
-                bucket: None,
-                json: false,
-            },
-            Command::ReplicaReconcile {
-                bucket: "b".into(),
-                key: "k".into(),
-                delete: Vec::new(),
-                apply: false,
-                json: false,
-            },
-            Command::Cmk(CmkCommand::Scan {
-                name: "0".into(),
-                json: false,
-            }),
-        ];
-        for cmd in commands {
-            let err = run_offline(cmd, &cfg_path).await.unwrap_err().to_string();
-            assert!(err.contains("control_backend=objects"), "{err}");
-            assert!(err.contains("命令未接触数据库"), "{err}");
-            assert!(err.contains("control-migrate"), "{err}");
-            assert!(!db_path.exists(), "守卫必须早于 Db::connect_offline: {err}");
-            assert!(
-                !dir.path().join("data").exists(),
-                "守卫必须早于 Store::open: {err}"
-            );
+    /// H1：SQLite 迁移命令的报错必须点名归档二进制，而不是泛化成未知命令。
+    #[test]
+    fn removed_migration_commands_point_at_archived_binary() {
+        for op in ["control-migrate", "raft-export", "raft-cutover"] {
+            let err = removed_sqlite_op(op).unwrap_err().to_string();
+            assert!(err.contains(op), "{err}");
+            assert!(err.contains("v1.31.0"), "{err}");
+            assert!(err.contains("oss-server-v1.31.0-linux-x86_64"), "{err}");
         }
     }
 }

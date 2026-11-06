@@ -124,10 +124,7 @@ async fn lifecycle_versioned_bucket_marks_deleted() {
     let st = state(dir.path()).await;
     st.store.create_bucket("vbk").await.unwrap();
     st.db.insert_bucket("vbk", None).await.unwrap();
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'vbk'")
-        .execute(st.db.pool())
-        .await
-        .unwrap();
+    enable_versioning(&st, "vbk").await;
     st.store
         .put_object("vbk", "v.txt", bytes::Bytes::from_static(b"v"), None)
         .await
@@ -160,35 +157,46 @@ async fn lifecycle_delete_enqueues_replication() {
     let st = state(dir.path()).await;
     st.store.create_bucket("lrb").await.unwrap();
     st.db.insert_bucket("lrb", None).await.unwrap();
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'lrb'")
-        .execute(st.db.pool())
-        .await
-        .unwrap();
+    enable_versioning(&st, "lrb").await;
     st.store
         .put_object("lrb", "old.txt", bytes::Bytes::from_static(b"v"), None)
         .await
         .unwrap();
-    sqlx::query(
-        "INSERT INTO replication_rules (bucket, rules_json) VALUES ('lrb', ?) \
-         ON CONFLICT(bucket) DO UPDATE SET rules_json=excluded.rules_json",
-    )
-    .bind(r#"[{"id":"r","prefix":null,"remote_id":"r1","dest_bucket":"dst","delete_marker":true,"enabled":true}]"#)
-    .execute(st.db.pool())
-    .await
-    .unwrap();
+    st.db
+        .control_write("lifecycle-repl-rules", |txn| {
+            Box::pin(async move {
+                txn.bucket_replication_rules_set(
+                    "lrb",
+                    r#"[{"id":"r","prefix":null,"remote_id":"r1","dest_bucket":"dst","delete_marker":true,"enabled":true}]"#,
+                    1,
+                )
+                .await
+            })
+        })
+        .await
+        .unwrap();
     let mut r = rule("", 0);
     r.bucket = "lrb".into();
     st.db.set_lifecycle_rules("lrb", &[r], 1).await.unwrap();
 
     sweep_once(&st).await;
-    let n: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM repl_outbox WHERE bucket='lrb' AND is_delete_marker=1 \
-         AND version_id != ''",
-    )
-    .fetch_one(st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(n, 1, "生命周期 marker 应带版本号入复制队列");
+    let versions = st
+        .store
+        .list_object_versions("lrb", "old.txt", 10, None, None)
+        .await
+        .unwrap();
+    let marker = versions
+        .entries
+        .iter()
+        .find(|v| v.is_marker)
+        .expect("lifecycle marker");
+    let counts = st
+        .db
+        .control_store()
+        .repl_version_counts("lrb", "old.txt", &marker.version_id)
+        .await
+        .unwrap();
+    assert_eq!(counts.pending, 1, "生命周期 marker 应带版本号入复制队列");
 }
 
 // ——— S6-1/S6-3：走真控制面路由的回归 ———
@@ -296,13 +304,12 @@ async fn lifecycle_emits_expiration_events() {
     // 非版本桶：ObjectRemoved 型 Delete
     st.store.create_bucket("lpa").await.unwrap();
     st.db.insert_bucket("lpa", None).await.unwrap();
-    sqlx::query("INSERT INTO event_configs (bucket, config_json) VALUES ('lpa', ?)")
-        .bind(
-            r#"[{"id":"a","target":"t1","events":["s3:LifecycleExpiration:Delete"],"prefix":null,"suffix":null}]"#,
-        )
-        .execute(st.db.pool())
-        .await
-        .unwrap();
+    notification_config(
+        &st,
+        "lpa",
+        r#"[{"id":"a","target":"t1","events":["s3:LifecycleExpiration:Delete"],"prefix":null,"suffix":null}]"#,
+    )
+    .await;
     st.store
         .put_object("lpa", "gone.txt", bytes::Bytes::from_static(b"x"), None)
         .await
@@ -315,17 +322,13 @@ async fn lifecycle_emits_expiration_events() {
     // 版本桶：打 marker → MarkerCreated 型
     st.store.create_bucket("lpb").await.unwrap();
     st.db.insert_bucket("lpb", None).await.unwrap();
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'lpb'")
-        .execute(st.db.pool())
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO event_configs (bucket, config_json) VALUES ('lpb', ?)")
-        .bind(
-            r#"[{"id":"b","target":"t2","events":["s3:LifecycleExpiration:DeleteMarkerCreated"],"prefix":null,"suffix":null}]"#,
-        )
-        .execute(st.db.pool())
-        .await
-        .unwrap();
+    enable_versioning(&st, "lpb").await;
+    notification_config(
+        &st,
+        "lpb",
+        r#"[{"id":"b","target":"t2","events":["s3:LifecycleExpiration:DeleteMarkerCreated"],"prefix":null,"suffix":null}]"#,
+    )
+    .await;
     // 版本桶写入：with_meta 的 versioned=true 追加版本
     st.store
         .put_object_stream_with_meta(
@@ -352,11 +355,17 @@ async fn lifecycle_emits_expiration_events() {
 
     sweep_once(&st).await;
 
-    let names: Vec<(String, String)> =
-        sqlx::query_as("SELECT target_id, event_json FROM event_outbox ORDER BY id")
-            .fetch_all(st.db.pool())
-            .await
-            .unwrap();
+    let claims = st
+        .db
+        .control_write("lifecycle-events-read", |txn| {
+            Box::pin(async move { txn.event_claim(1, 100).await })
+        })
+        .await
+        .unwrap();
+    let names: Vec<(String, String)> = claims
+        .into_iter()
+        .map(|c| (c.target_id, c.event_json))
+        .collect();
     assert_eq!(names.len(), 2, "{names:?}");
     let n0: serde_json::Value = serde_json::from_str(&names[0].1).unwrap();
     assert_eq!(n0["eventName"], "s3:LifecycleExpiration:Delete");
@@ -389,14 +398,32 @@ fn blank_spec() -> LifecycleRuleSpec {
     }
 }
 
+async fn enable_versioning(st: &AppState, bucket: &str) {
+    let bucket = bucket.to_owned();
+    st.db
+        .control_write("lifecycle-versioning", move |txn| {
+            let bucket = bucket.clone();
+            Box::pin(async move { txn.bucket_set_versioning(&bucket, "Enabled").await })
+        })
+        .await
+        .unwrap();
+}
+
+async fn notification_config(st: &AppState, bucket: &str, config: &'static str) {
+    let bucket = bucket.to_owned();
+    st.db
+        .control_write("lifecycle-notification", move |txn| {
+            let bucket = bucket.clone();
+            Box::pin(async move { txn.bucket_notification_set(&bucket, config, 1).await })
+        })
+        .await
+        .unwrap();
+}
+
 async fn versioned_bucket(st: &AppState, bucket: &str) {
     st.store.create_bucket(bucket).await.unwrap();
     st.db.insert_bucket(bucket, None).await.unwrap();
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = ?")
-        .bind(bucket)
-        .execute(st.db.pool())
-        .await
-        .unwrap();
+    enable_versioning(st, bucket).await;
 }
 
 fn stream(b: &'static [u8]) -> xl_store::store::ByteStream {

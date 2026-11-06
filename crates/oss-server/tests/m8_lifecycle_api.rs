@@ -410,40 +410,38 @@ async fn sweep_transitions_enqueues_and_dedupes() {
 
     let jobs = st.db.list_jobs(10).await.unwrap();
     assert_eq!(jobs.len(), 1);
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT action, payload_json, dedupe_key FROM job_tasks ORDER BY job_id, task_no",
-    )
-    .fetch_all(st.db.pool())
-    .await
-    .unwrap();
+    let job_id = jobs[0]["id"].as_i64().unwrap();
+    let rows = st
+        .db
+        .control_store()
+        .job_tasks(job_id)
+        .await
+        .unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].0, "Transition");
+    assert_eq!(rows[0].action, "Transition");
     assert_eq!(
-        rows[0].2.as_deref(),
+        rows[0].dedupe_key.as_deref(),
         Some("tier:bkt:a.txt:null:STANDARD_IA")
     );
-    let payload: serde_json::Value = serde_json::from_str(&rows[0].1).unwrap();
+    let payload: serde_json::Value = serde_json::from_str(&rows[0].payload_json).unwrap();
     assert_eq!(payload["class"], "STANDARD_IA");
     assert_eq!(payload["version_id"], a.version_id.unwrap());
 
     // C7：任务终态清空 dedupe_key，同键可再次入队。
-    let job_id = jobs[0]["id"].as_i64().unwrap();
-    sqlx::query("UPDATE job_tasks SET state = 'running' WHERE job_id = ? AND task_no = 1")
-        .bind(job_id)
-        .execute(st.db.pool())
-        .await
-        .unwrap();
+    let claim = st.db.claim_task(0, 3600).await.unwrap().unwrap();
+    assert_eq!(claim.job_id, job_id);
     st.db
-        .finish_task(job_id, 1, true, "ok", None, 0, 3)
+        .finish_task(claim.job_id, claim.task_no, true, "ok", None, 0, 3)
         .await
         .unwrap();
-    let key: Option<String> =
-        sqlx::query_scalar("SELECT dedupe_key FROM job_tasks WHERE job_id = ? AND task_no = 1")
-            .bind(job_id)
-            .fetch_one(st.db.pool())
-            .await
-            .unwrap();
-    assert!(key.is_none(), "终态必须清空 dedupe_key");
+    let task = st
+        .db
+        .control_store()
+        .job_task(job_id, 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(task.dedupe_key.is_none(), "终态必须清空 dedupe_key");
     let requeued =
         oss_server::tier_jobs::sweep_transitions(&st.db, &st.store, st.lifecycle.as_ref())
             .await
@@ -571,10 +569,15 @@ async fn sweep_only_transitions_current_versions() {
         .await
         .unwrap();
     assert_eq!(queued, 1, "只转当前版本");
-    let raw: String = sqlx::query_scalar("SELECT payload_json FROM job_tasks")
-        .fetch_one(st.db.pool())
+    let latest = st.db.control_store().recent_jobs(1).await.unwrap();
+    let raw = st
+        .db
+        .control_store()
+        .job_tasks(latest[0].id)
         .await
-        .unwrap();
+        .unwrap()
+        .remove(0)
+        .payload_json;
     let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(payload["version_id"], new.version_id.unwrap());
     assert_ne!(payload["version_id"], old.version_id.unwrap());
@@ -633,8 +636,10 @@ async fn sweep_enqueues_noncurrent_transition() {
     let st = state(dir.path()).await;
     st.store.create_bucket("nbk").await.unwrap();
     st.db.insert_bucket("nbk", None).await.unwrap();
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'nbk'")
-        .execute(st.db.pool())
+    st.db
+        .control_write("m8-lifecycle-versioning", |txn| {
+            Box::pin(async move { txn.bucket_set_versioning("nbk", "Enabled").await })
+        })
         .await
         .unwrap();
     let stream = |b: &'static [u8]| -> xl_store::store::ByteStream {
@@ -702,10 +707,15 @@ async fn sweep_enqueues_noncurrent_transition() {
     .await
     .unwrap();
     assert_eq!(queued, 1, "只入队 noncurrent 版本");
-    let raw: String = sqlx::query_scalar("SELECT payload_json FROM job_tasks")
-        .fetch_one(st.db.pool())
+    let latest = st.db.control_store().recent_jobs(1).await.unwrap();
+    let raw = st
+        .db
+        .control_store()
+        .job_tasks(latest[0].id)
         .await
-        .unwrap();
+        .unwrap()
+        .remove(0)
+        .payload_json;
     let payload: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(payload["version_id"], old);
     assert_eq!(payload["class"], "STANDARD_IA");

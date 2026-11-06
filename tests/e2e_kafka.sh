@@ -13,7 +13,8 @@ PY
 )
 NAME="oss-m6rp-$(date +%s)"
 WORK=$(mktemp -d)
-DB="$WORK/kafka-e2e.db"
+DB="$WORK/control"
+mkdir -p "$DB"
 TOPIC="oss-events-e2e-$RANDOM"
 
 cleanup() {

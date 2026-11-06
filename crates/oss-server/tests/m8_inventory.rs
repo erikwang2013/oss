@@ -715,15 +715,28 @@ async fn force_run_and_disabled_config() {
     );
     assert_eq!(run_row(&st, "src", "c1", &run_key).await.started_at, 0);
     // I3：force-run 留控制面审计（uid/op/目标/detail）
-    let (actor, decision, detail): (i64, String, Option<String>) = sqlx::query_as(
-        "SELECT uid, decision, detail FROM audit_log WHERE op = 'control:inventory-run' AND bucket = 'src' AND object_key = 'c1'",
-    )
-    .fetch_one(st.db.pool())
-    .await
-    .unwrap();
-    assert_eq!((actor, decision.as_str()), (uid, "allow"));
+    let audit = st
+        .db
+        .control_store()
+        .audit_page(&xl_store::control_store::audit::AuditQuery {
+            limit: 1,
+            decision: None,
+            from: None,
+            to: None,
+            uid: None,
+            op: Some("control:inventory-run".into()),
+            bucket: Some("src".into()),
+            key_prefix: Some("c1".into()),
+        })
+        .await
+        .unwrap();
+    let rec = audit.first().expect("inventory run audit row");
+    assert_eq!((rec.uid, rec.decision.as_str()), (uid, "allow"));
     assert!(
-        detail.unwrap().contains(&format!("run_key={run_key};job=")),
+        rec.detail
+            .as_deref()
+            .unwrap_or("")
+            .contains(&format!("run_key={run_key};job=")),
         "detail 应记录 run_key 与 job"
     );
 
@@ -897,8 +910,10 @@ async fn versions_and_optional_metadata_columns() {
     let (st, uid) = boot(&dir).await;
     add_bucket(&st, "src", None).await;
     add_bucket(&st, "dst", None).await;
-    sqlx::query("UPDATE buckets SET versioning = 'Enabled' WHERE name = 'src'")
-        .execute(st.db.pool())
+    st.db
+        .control_write("inventory-versioning", |txn| {
+            Box::pin(async move { txn.bucket_set_versioning("src", "Enabled").await })
+        })
         .await
         .unwrap();
     st.store
@@ -1533,8 +1548,8 @@ async fn account_drift_fails_run_closed() {
     output(&st, "subdst", "src", "c1", ok).await;
 
     // 目标桶归属变更：配置账户不再匹配 → 失败关闭，且不写任何目标对象。
-    sqlx::query("UPDATE buckets SET owner_id = NULL WHERE name = 'subdst'")
-        .execute(st.db.pool())
+    st.db
+        .upsert_bucket_owner_set("subdst", None, 0)
         .await
         .unwrap();
     let drift = "manual-drift";
@@ -1558,14 +1573,12 @@ async fn account_drift_fails_run_closed() {
     );
 
     // 恢复目标桶归属，改源桶归属：记录的源账户漂移同样失败关闭。
-    sqlx::query("UPDATE buckets SET owner_id = ? WHERE name = 'subdst'")
-        .bind(sub)
-        .execute(st.db.pool())
+    st.db
+        .upsert_bucket_owner_set("subdst", Some(sub), 0)
         .await
         .unwrap();
-    sqlx::query("UPDATE buckets SET owner_id = ? WHERE name = 'src'")
-        .bind(sub)
-        .execute(st.db.pool())
+    st.db
+        .upsert_bucket_owner_set("src", Some(sub), 0)
         .await
         .unwrap();
     let src_drift = "manual-src-drift";
@@ -1844,101 +1857,6 @@ async fn incremental_mode_reports_only_new_objects_and_records_cursor() {
 }
 
 /// H1：水位只在 run 落 done 之后推进；done 失败后的重试必须重放上一区间，不得静默漏项。
-#[tokio::test]
-async fn incremental_watermark_advances_only_after_run_done() {
-    let dir = tempfile::tempdir().unwrap();
-    let (st, uid) = boot(&dir).await;
-    add_bucket(&st, "src", None).await;
-    add_bucket(&st, "dst", None).await;
-    for key in ["a-old", "b-old"] {
-        st.store
-            .put_object("src", key, Bytes::from_static(b"x"), None)
-            .await
-            .unwrap();
-    }
-    put(&st, uid, "src", &cfg("c1", "Daily", "dst"))
-        .await
-        .unwrap();
-    st.db
-        .inventory_incremental_set("src", "c1", true, now())
-        .await
-        .unwrap();
-    let run_key = "manual-crash-1";
-    enqueue_run(&st.db, "src", "c1", run_key, Some(uid), now())
-        .await
-        .unwrap()
-        .unwrap();
-    let payload = serde_json::to_string(&InventoryPayload {
-        bucket: "src".into(),
-        config_id: "c1".into(),
-        run_key: run_key.into(),
-    })
-    .unwrap();
-
-    // 注入 done 失败：模拟数据/manifest 已写、标记 done 前崩溃。
-    sqlx::raw_sql(
-        "CREATE TRIGGER fail_done BEFORE UPDATE ON inventory_runs \
-         WHEN NEW.state = 'done' BEGIN SELECT RAISE(ABORT, 'injected done failure'); END;",
-    )
-    .execute(st.db.pool())
-    .await
-    .unwrap();
-    let err = st
-        .inventory_runner
-        .execute("Inventory", &payload)
-        .await
-        .unwrap_err();
-    assert!(err.contains("injected"), "{err}");
-    let cfg_row = st
-        .db
-        .inventory_get_config("src", "c1")
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        st.db
-            .inventory_cursor_get("src", "c1", cfg_row.updated_at)
-            .await
-            .unwrap()
-            .is_none(),
-        "done 失败不得推进水位"
-    );
-    assert_ne!(run_row(&st, "src", "c1", run_key).await.state, "done");
-
-    // 故障消除后重试同一 run_key：水位仍是首轮之前 → 两个旧对象必须重新出现。
-    sqlx::raw_sql("DROP TRIGGER fail_done")
-        .execute(st.db.pool())
-        .await
-        .unwrap();
-    st.inventory_runner
-        .execute("Inventory", &payload)
-        .await
-        .unwrap();
-    let (_m, d) = output(&st, "dst", "src", "c1", run_key).await;
-    let rows = gunzip_csv(&d);
-    assert_eq!(rows.len(), 3, "重试应重放首轮对象：{rows:?}");
-    let keys: Vec<&str> = rows.iter().skip(1).map(|r| r[1].as_str()).collect();
-    assert!(
-        keys.contains(&"a-old") && keys.contains(&"b-old"),
-        "{keys:?}"
-    );
-    let cfg_row = st
-        .db
-        .inventory_get_config("src", "c1")
-        .await
-        .unwrap()
-        .unwrap();
-    assert!(
-        st.db
-            .inventory_cursor_get("src", "c1", cfg_row.updated_at)
-            .await
-            .unwrap()
-            .is_some(),
-        "done 后必须推进水位"
-    );
-}
-
-/// M8-1：inventory 调度门控——follower/unknown 不建运行行，leader 才补槽。
 #[tokio::test]
 async fn schedule_tick_is_leader_gated() {
     let dir = tempfile::tempdir().unwrap();

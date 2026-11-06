@@ -12,7 +12,6 @@ pub(crate) mod apply;
 pub mod command;
 pub mod compat;
 pub mod control;
-pub mod cutover;
 pub mod data;
 pub mod file_log;
 pub mod file_meta;
@@ -41,7 +40,6 @@ use std::time::Duration;
 use openraft::error::{ClientWriteError, RaftError};
 use openraft::{BasicNode, Raft};
 use serde::Deserialize;
-use sqlx::SqlitePool;
 
 pub use command::{
     ControlCommand, ControlResponse, LifecycleRuleCmd, LifecycleRuleCmdV2, PermissionBits,
@@ -50,7 +48,6 @@ pub use command::{
 pub use settings::RaftSettings;
 
 use sm::RaftSm;
-use store::SqliteStateMachine;
 
 /// 控制写（console/S3 配置写）是否已可走 Raft。S6 出口已翻转（单节点）。
 pub const RAFT_READY: bool = true;
@@ -314,11 +311,6 @@ impl RaftHandle {
 
     pub fn settings(&self) -> &RaftSettings {
         &self.settings
-    }
-
-    /// SQLite 后端的底层状态机（对象模式返回 None；测试/运维诊断用）。
-    pub fn sqlite_state_machine(&self) -> Option<&SqliteStateMachine> {
-        self.state_machine.sqlite()
     }
 
     /// 已落库快照数据字节数（`/metrics` gauge）。
@@ -810,84 +802,6 @@ impl RaftHandle {
     }
 }
 
-/// S5 基座入口：打开（或恢复）`raft.db`，启动 Raft，bootstrap=true 且无成员时单节点 initialize。
-///
-/// `bootstrap=false` 且尚无成员时只启动运行时并等待 leader/join（S7 接线），不报错。
-pub async fn spawn(settings: RaftSettings) -> RaftResult<RaftHandle> {
-    spawn_with_control(settings, None, None).await
-}
-
-/// S6 生产入口：状态机指向主控制库连接池（apply 与 `raft_applied`/ctx 同库同事务）。
-/// `None` = 基座自测：状态机与日志共用 `raft.db`。
-/// `install_notify`：控制面快照安装提交后收到 applied index（S7.2 缓存/目录对账）。
-pub async fn spawn_with_control(
-    settings: RaftSettings,
-    control_pool: Option<SqlitePool>,
-    install_notify: Option<tokio::sync::watch::Sender<u64>>,
-) -> RaftResult<RaftHandle> {
-    spawn_with_control_tls(settings, control_pool, install_notify, None).await
-}
-
-/// 同 [`spawn_with_control`]；`tls = Some` 时 Raft RPC 客户端走 https。
-pub async fn spawn_with_control_tls(
-    settings: RaftSettings,
-    control_pool: Option<SqlitePool>,
-    install_notify: Option<tokio::sync::watch::Sender<u64>>,
-    tls: Option<Arc<crate::tls::Tls>>,
-) -> RaftResult<RaftHandle> {
-    let config = Arc::new(settings.openraft_config()?);
-    let log_store = store::SqliteLogStore::open(&settings.db_path).await?;
-    // 未 apply 的成员日志（崩溃窗口）也要阻止再次 initialize；openraft 启动时会重放。
-    let has_logs = log_store.has_logs().await?;
-    let witness = matches!(settings.role, crate::config::RaftRole::Witness);
-    // R8：控制库启动守卫（单点：生产/测试/witness 都经这里）。marker 高于本机配置或
-    // 二进制最高 → 拒绝启动，绝不以降低的级别继续（已激活集群的回滚必须换回二进制）。
-    if let Some(pool) = &control_pool {
-        let marker = compat::read_activation(pool)
-            .await
-            .map_err(std::io::Error::other)?;
-        compat::guard_startup(marker, settings.feature_level).map_err(std::io::Error::other)?;
-    }
-    let state_machine = match control_pool {
-        Some(pool) => {
-            SqliteStateMachine::open_with_pool(
-                pool,
-                settings.snapshot_max_bytes,
-                witness,
-                install_notify,
-                settings.feature_level,
-            )
-            .await?
-        }
-        None => SqliteStateMachine::open(&settings.db_path, settings.snapshot_max_bytes).await?,
-    };
-
-    let counters = Arc::clone(state_machine.counters());
-    let peers = Arc::new(compat::PeerVersions::default());
-    let network = build_network(&settings, &peers, &tls)?;
-    let raft = Raft::new(
-        settings.node_id,
-        config,
-        network,
-        log_store,
-        state_machine.clone(),
-    )
-    .await?;
-    watch_leader_changes(&raft, &counters);
-
-    let handle = RaftHandle {
-        raft,
-        settings,
-        state_machine: RaftSm::Sqlite(state_machine),
-        counters,
-        tls,
-        peers,
-        bucket_create_lock: tokio::sync::Mutex::new(()),
-    };
-    handle.bootstrap_if_needed(has_logs).await?;
-    Ok(handle)
-}
-
 fn build_network(
     settings: &RaftSettings,
     peers: &Arc<compat::PeerVersions>,
@@ -1032,11 +946,6 @@ pub async fn spawn_witness(
     Ok(handle)
 }
 
-/// [`spawn`] 的别名（计划中 `init_single` 名称；集成方二选一）。
-pub async fn init_single(settings: RaftSettings) -> RaftResult<RaftHandle> {
-    spawn(settings).await
-}
-
 impl RaftHandle {
     async fn bootstrap_if_needed(&self, has_logs: bool) -> RaftResult<()> {
         let (_, membership) = self.state_machine.applied().await?;
@@ -1076,10 +985,6 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    use openraft::storage::{RaftLogStorage, RaftStateMachine};
-    use openraft::{CommittedLeaderId, LogId, RaftLogReader};
-
-    use super::store::{SqliteLogStore, SqliteStateMachine};
     use super::*;
 
     fn test_settings(dir: &Path) -> RaftSettings {
@@ -1122,24 +1027,18 @@ mod tests {
         }
     }
 
-    async fn wait_snapshot(handle: &RaftHandle, min_index: u64) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        loop {
-            let snap = {
-                let m = handle.raft().metrics();
-                let m = m.borrow();
-                m.snapshot.as_ref().map(|l| l.index)
-            };
-            // 快照可能覆盖采样 last_applied 之后又提交的 entry（如选举后的 blank log）。
-            if snap.is_some_and(|i| i >= min_index) {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "snapshot build timed out (snapshot={snap:?}, want >= {min_index})"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+    async fn object_control(dir: &Path) -> Arc<crate::control_store_obj::ObjectControlStore> {
+        use xl_store::control_state::root::Mode;
+        use xl_store::store::{Store, StoreConfig};
+
+        use crate::control_store_obj::{ObjectControlStore, RootIo};
+
+        let mut cfg = StoreConfig::new(dir);
+        cfg.fsync = false;
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let control = Arc::new(ObjectControlStore::new(Arc::new(RootIo::new(store))));
+        control.bootstrap(Mode::Raft, 100).await.unwrap();
+        control
     }
 
     /// Level C 命令演进：leader 只接受显式注册的 Ext 类型。`test.noop` 是仅测试
@@ -1147,14 +1046,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registered_ext_test_type_commits() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!(
-            "sqlite://{}?mode=rwc",
-            dir.path().join("control.db").display()
-        );
-        let db = crate::db::Db::connect_raft(&url).await.unwrap();
+        let control = object_control(dir.path()).await;
         let mut settings = test_settings(dir.path());
         settings.feature_level = 3;
-        let handle = spawn_with_control(settings, Some(db.pool().clone()), None)
+        let handle = spawn_object(settings, Arc::clone(&control), None, None)
             .await
             .unwrap();
         wait_leader(&handle).await;
@@ -1168,13 +1063,8 @@ mod tests {
                 .unwrap(),
             ControlResponse::Ok
         );
-        // 首条 level-3 entry 与激活 marker 同事务提交。
-        let marker: String =
-            sqlx::query_scalar("SELECT value FROM schema_meta WHERE key = 'raft_feature_level'")
-                .fetch_one(db.pool())
-                .await
-                .unwrap();
-        assert_eq!(marker, "3");
+        // 首条 level-3 entry 与激活级别同事务提交。
+        assert_eq!(control.pin().await.unwrap().root.meta.feature_level, 3);
         handle.shutdown().await;
     }
 
@@ -1183,14 +1073,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn ext_type_requires_every_current_member_capability() {
         let dir = tempfile::tempdir().unwrap();
-        let url = format!(
-            "sqlite://{}?mode=rwc",
-            dir.path().join("control.db").display()
-        );
-        let db = crate::db::Db::connect_raft(&url).await.unwrap();
+        let control = object_control(dir.path()).await;
         let mut settings = test_settings(dir.path());
         settings.feature_level = 3;
-        let handle = spawn_with_control(settings, Some(db.pool().clone()), None)
+        let handle = spawn_object(settings, control, None, None)
             .await
             .unwrap();
         wait_leader(&handle).await;
@@ -1242,246 +1128,6 @@ mod tests {
         );
         assert_eq!(handle.write(cmd).await.unwrap(), ControlResponse::Ok);
         handle.shutdown().await;
-    }
-
-    /// R8：已激活 marker=2 的库用 feature_level=1 启动必须拒绝（错误里两个值都要在）。
-    #[tokio::test]
-    async fn startup_refuses_activation_above_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let url = format!(
-            "sqlite://{}?mode=rwc",
-            dir.path().join("control.db").display()
-        );
-        let db = crate::db::Db::connect_raft(&url).await.unwrap();
-        sqlx::query("INSERT INTO schema_meta (key, value) VALUES ('raft_feature_level', '2')")
-            .execute(db.pool())
-            .await
-            .unwrap();
-        let mut settings = test_settings(dir.path());
-        settings.feature_level = 1;
-        let err = spawn_with_control(settings, Some(db.pool().clone()), None)
-            .await
-            .err()
-            .expect("marker 2 > config 1 必须拒绝启动");
-        let msg = err.to_string();
-        assert!(msg.contains("raft_feature_level=2"), "{msg}");
-        assert!(msg.contains("feature_level=1"), "{msg}");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn single_node_write_restart_and_membership() {
-        let dir = tempfile::tempdir().unwrap();
-        let settings = test_settings(dir.path());
-
-        let handle = spawn(settings.clone()).await.unwrap();
-        assert_eq!(wait_leader(&handle).await, 1);
-        assert_eq!(
-            handle
-                .write(ControlCommand::Set {
-                    key: "k".into(),
-                    value: "v1".into(),
-                })
-                .await
-                .unwrap(),
-            ControlResponse::Ok
-        );
-
-        let applied = {
-            let m = handle.raft().metrics();
-            let m = m.borrow();
-            m.last_applied.unwrap()
-        };
-        assert!(
-            handle
-                .wait_applied(applied.index, Duration::from_secs(15))
-                .await
-        );
-        assert_eq!(
-            handle
-                .sqlite_state_machine()
-                .unwrap()
-                .get("k")
-                .await
-                .unwrap(),
-            Some("v1".to_string())
-        );
-        let (_, membership) = handle
-            .sqlite_state_machine()
-            .unwrap()
-            .applied()
-            .await
-            .unwrap();
-        assert_eq!(membership.voter_ids().collect::<Vec<_>>(), vec![1]);
-
-        handle.shutdown().await;
-        drop(handle);
-
-        // 重启：不重新 initialize，完整 LogId + StoredMembership 与 SM 数据保留。
-        let handle = spawn(settings).await.unwrap();
-        assert_eq!(wait_leader(&handle).await, 1);
-        let (reopened_applied, membership) = handle
-            .sqlite_state_machine()
-            .unwrap()
-            .applied()
-            .await
-            .unwrap();
-        assert!(reopened_applied.unwrap().index >= applied.index);
-        assert_eq!(membership.voter_ids().collect::<Vec<_>>(), vec![1]);
-        assert_eq!(
-            handle
-                .sqlite_state_machine()
-                .unwrap()
-                .get("k")
-                .await
-                .unwrap(),
-            Some("v1".to_string())
-        );
-
-        handle
-            .write(ControlCommand::Delete { key: "k".into() })
-            .await
-            .unwrap();
-        assert_eq!(
-            handle
-                .sqlite_state_machine()
-                .unwrap()
-                .get("k")
-                .await
-                .unwrap(),
-            None
-        );
-        handle.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn snapshot_build_and_install_preserves_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let handle = spawn(test_settings(dir.path())).await.unwrap();
-        wait_leader(&handle).await;
-        for i in 0..3 {
-            handle
-                .write(ControlCommand::Set {
-                    key: format!("k{i}"),
-                    value: format!("v{i}"),
-                })
-                .await
-                .unwrap();
-        }
-        let applied = {
-            let m = handle.raft().metrics();
-            let m = m.borrow();
-            m.last_applied.unwrap()
-        };
-        handle.raft().trigger().snapshot().await.unwrap();
-        wait_snapshot(&handle, applied.index).await;
-
-        let mut sm = handle.sqlite_state_machine().unwrap().clone();
-        let snapshot = RaftStateMachine::<TypeConfig>::get_current_snapshot(&mut sm)
-            .await
-            .unwrap()
-            .expect("snapshot must exist after trigger");
-        assert!(snapshot.meta.last_log_id.unwrap().index >= applied.index);
-        assert_eq!(
-            snapshot
-                .meta
-                .last_membership
-                .voter_ids()
-                .collect::<Vec<_>>(),
-            vec![1]
-        );
-        let bytes = snapshot.snapshot.get_ref().clone();
-        assert!(!bytes.is_empty());
-
-        // 安装到全新状态机：走 begin_receiving_snapshot 的 Cursor 接收路径。
-        let dir2 = tempfile::tempdir().unwrap();
-        let mut fresh = SqliteStateMachine::open(&dir2.path().join("raft.db"), 512 * 1024 * 1024)
-            .await
-            .unwrap();
-        let mut cursor = fresh.begin_receiving_snapshot().await.unwrap();
-        tokio::io::AsyncWriteExt::write_all(&mut *cursor, &bytes)
-            .await
-            .unwrap();
-        assert_eq!(fresh.applied().await.unwrap().0, None);
-        RaftStateMachine::<TypeConfig>::install_snapshot(&mut fresh, &snapshot.meta, cursor)
-            .await
-            .unwrap();
-
-        let (fresh_applied, fresh_membership) = fresh.applied().await.unwrap();
-        assert_eq!(fresh_applied, snapshot.meta.last_log_id);
-        assert_eq!(fresh_membership.voter_ids().collect::<Vec<_>>(), vec![1]);
-        for i in 0..3 {
-            assert_eq!(
-                fresh.get(&format!("k{i}")).await.unwrap(),
-                Some(format!("v{i}"))
-            );
-        }
-        handle.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn log_store_append_read_truncate_purge_and_restart() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("raft.db");
-        let handle = spawn(test_settings(dir.path())).await.unwrap();
-        wait_leader(&handle).await;
-        for i in 0..3 {
-            handle
-                .write(ControlCommand::Set {
-                    key: format!("k{i}"),
-                    value: format!("v{i}"),
-                })
-                .await
-                .unwrap();
-        }
-        handle.shutdown().await;
-        drop(handle);
-
-        let mut store = SqliteLogStore::open(&path).await.unwrap();
-        let state = store.get_log_state().await.unwrap();
-        let last = state.last_log_id.expect("logs must exist");
-        let entries = store.try_get_log_entries(..).await.unwrap();
-        assert!(
-            entries.len() >= 4,
-            "membership + 3 writes, got {}",
-            entries.len()
-        );
-        assert_eq!(entries.last().unwrap().log_id, last);
-
-        // Minor 1：[start, stop) 语义——Excluded 起点必须跳过该条。
-        let mid = store
-            .try_get_log_entries((
-                std::ops::Bound::Excluded(entries[0].log_id.index),
-                std::ops::Bound::Included(entries[2].log_id.index),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            mid.iter().map(|e| e.log_id.index).collect::<Vec<_>>(),
-            vec![entries[1].log_id.index, entries[2].log_id.index]
-        );
-
-        // vote / committed 持久化（重开文件后仍在）。
-        let vote = openraft::Vote::new_committed(9, 1);
-        store.save_vote(&vote).await.unwrap();
-        let committed = LogId::new(CommittedLeaderId::new(9, 1), last.index);
-        store.save_committed(Some(committed)).await.unwrap();
-        drop(store);
-
-        let mut store = SqliteLogStore::open(&path).await.unwrap();
-        assert_eq!(store.read_vote().await.unwrap(), Some(vote));
-        assert_eq!(store.read_committed().await.unwrap(), Some(committed));
-
-        // truncate 从指定 LogId（含）起删除；purge 从起点删到指定 LogId（含）。
-        let truncate_at = entries[1].log_id;
-        store.truncate(truncate_at).await.unwrap();
-        let after_truncate = store.try_get_log_entries(..).await.unwrap();
-        assert_eq!(after_truncate.last().unwrap().log_id, entries[0].log_id);
-
-        store.purge(entries[0].log_id).await.unwrap();
-        let state = store.get_log_state().await.unwrap();
-        assert_eq!(state.last_purged_log_id, Some(entries[0].log_id));
-        assert_eq!(state.last_log_id, Some(entries[0].log_id));
-        assert!(store.try_get_log_entries(..).await.unwrap().is_empty());
     }
 
     // ---- M8-1：leader 门控（确定性 mock 来源） ----
@@ -1569,7 +1215,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn raft_handle_leader_gate_single_node() {
         let dir = tempfile::tempdir().unwrap();
-        let handle = Arc::new(spawn(test_settings(dir.path())).await.unwrap());
+        let control = object_control(dir.path()).await;
+        let handle = Arc::new(
+            spawn_object(test_settings(dir.path()), control, None, None)
+                .await
+                .unwrap(),
+        );
         assert_eq!(wait_leader(&handle).await, 1);
         assert!(handle.is_leader());
         let epoch = handle.fencing_epoch().expect("leader 必须有 token");
@@ -1601,31 +1252,20 @@ mod tests {
         assert_eq!(epoch, FencingEpoch { term: 1, leader: 1 });
     }
 
-    /// 对象+raft 启动只装配文件日志/快照 + 对象状态机：不构造 SqliteStateMachine，
-    /// 不创建 legacy `raft.db`（占位池只在对象后端的非 raft 门面里，且无 schema）。
+    /// 对象+raft 启动只装配文件日志/快照 + 对象状态机，不创建任何单文件数据库。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn object_spawn_uses_file_stores_and_object_sm_only() {
-        use xl_store::control_state::root::Mode;
-        use xl_store::store::{Store, StoreConfig};
-
-        use crate::control_store_obj::{ObjectControlStore, RootIo};
-
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = StoreConfig::new(dir.path());
-        cfg.fsync = false;
-        let store = Arc::new(Store::open(cfg).await.unwrap());
-        let control = Arc::new(ObjectControlStore::new(Arc::new(RootIo::new(store))));
-        control.bootstrap(Mode::Raft, 100).await.unwrap();
+        let control = object_control(dir.path()).await;
         let settings = test_settings(dir.path());
-        let handle = spawn_object(settings.clone(), control.clone(), None, None)
+        let handle = spawn_object(settings.clone(), control, None, None)
             .await
             .unwrap();
         assert_eq!(wait_leader(&handle).await, 1);
         assert!(matches!(&handle.state_machine, RaftSm::Object(_)));
-        assert!(handle.sqlite_state_machine().is_none());
         assert!(
             !settings.db_path.exists(),
-            "对象后端不得创建 SQLite raft.db"
+            "对象后端不得创建单文件 raft 数据库"
         );
         let raft_dir = file_log::raft_dir(&settings.db_path);
         assert!(raft_dir.join("log").is_dir());
