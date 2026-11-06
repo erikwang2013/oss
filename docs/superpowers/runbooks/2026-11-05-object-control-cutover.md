@@ -13,7 +13,7 @@ Design: `docs/superpowers/specs/2026-11-05-object-control-store-design.md` §6. 
 |---|---|
 | Cutover binary | `oss-server-v1.31.0-linux-x86_64` from GitHub release `v1.31.0` |
 | URL | `https://github.com/erikwang2013/oss/releases/download/v1.31.0/oss-server-v1.31.0-linux-x86_64` |
-| sha256 | `fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae` |
+| sha256 | `fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae` |
 | Target binary | v1.32.0 or later (object control root only) |
 | Source files | `oss.db` (control DB), `raft.db` (Raft DB), data drives |
 | Target files | `<data_dir>/.oss.sys/control/` (root/nodes/blobs), `<data_dir>/.oss.sys/local/`, `<raft.db_path>.d/` |
@@ -70,7 +70,7 @@ only full rollback path; keep it until acceptance closes.
 asset=oss-server-v1.31.0-linux-x86_64
 curl -fL --retry 3 -o "$asset" \
   "https://github.com/erikwang2013/oss/releases/download/v1.31.0/$asset"
-echo "fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae  $asset" | sha256sum -c -
+echo "fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae  $asset" | sha256sum -c -
 chmod +x "$asset"
 ```
 

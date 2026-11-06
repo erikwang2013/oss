@@ -1,13 +1,16 @@
-# SQLite control-plane goldens (task A8)
+# SQLite control-plane goldens (task A8) — frozen
 
-Permanent byte-level oracle captured from the SQLite-backed control plane before
-the object-store backend replaces it. Every file is generated; do not hand-edit.
+Permanent byte-level oracle captured from the SQLite-backed control plane at
+v1.31.0, before H1 removed SQLite. The tree no longer contains a capture target:
+the goldens are frozen and must not be edited or regenerated. Every file is
+generated output; do not hand-edit.
 
 ## Provenance
 
-`scripts/capture_control_goldens.sh` runs the ignored test
-`golden_capture::capture_control_goldens` on the current commit (offline,
-`--locked`) and rewrites `MANIFEST` (sorted `<sha256>  <path>` lines).
+`scripts/capture_control_goldens.sh` ran the ignored test
+`golden_capture::capture_control_goldens` against the last SQLite commit and
+rewrote `MANIFEST` (sorted `<sha256>  <path>` lines). Both the script and the
+capture target were deleted in v1.32.0 with the SQLite control plane.
 
 | Path | What it freezes |
 | --- | --- |
@@ -43,10 +46,11 @@ struct field order (or `serde_json::Map` insertion order).
 Capture never touches the network: it builds on local fixtures, uses only
 `127.0.0.1` placeholder endpoints, and runs Cargo with `--offline`.
 
-## Verify / regenerate
+## Verify
 
 ```bash
 cargo test -p oss-server --test golden_manifest   # existence, hashes, no extras
-scripts/capture_control_goldens.sh                # regenerate
-git diff --exit-code crates/oss-server/tests/goldens  # must be empty on same commit
 ```
+
+Regeneration would require reconstructing the v1.31.0 SQLite build; the
+goldens intentionally stay at that byte-exact snapshot.

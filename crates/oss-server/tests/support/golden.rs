@@ -1,15 +1,13 @@
 //! Golden fixture loader and byte/JSON comparisons (task A8).
 //!
 //! Fixtures are frozen artifacts under `tests/goldens`; `MANIFEST` pins their
-//! SHA-256. Capturing is a separate ignored test driven by
-//! `scripts/capture_control_goldens.sh`; this module is read-only.
+//! SHA-256. The capture target was removed with SQLite in v1.32; this module is
+//! read-only.
 
 #![allow(dead_code)]
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-
-use serde::Serialize;
 
 /// Directory holding every golden plus `MANIFEST`.
 pub fn root() -> PathBuf {
@@ -28,19 +26,6 @@ pub fn load(rel: &str) -> Vec<u8> {
 pub fn load_json(rel: &str) -> serde_json::Value {
     serde_json::from_slice(&load(rel))
         .unwrap_or_else(|e| panic!("golden {rel} is not valid JSON: {e}"))
-}
-
-/// Capture-side write (ignored test only). Creates parents; bytes are exact.
-pub fn write(rel: &str, bytes: &[u8]) {
-    let p = path(rel);
-    std::fs::create_dir_all(p.parent().expect("golden path has a parent")).unwrap();
-    std::fs::write(&p, bytes).unwrap_or_else(|e| panic!("write golden {rel}: {e}"));
-}
-
-pub fn write_serde<T: Serialize>(rel: &str, value: &T) {
-    let mut bytes = serde_json::to_vec_pretty(value).unwrap();
-    bytes.push(b'\n');
-    write(rel, &bytes);
 }
 
 /// Byte-exact comparison; failure names the fixture and shows the first mismatch.

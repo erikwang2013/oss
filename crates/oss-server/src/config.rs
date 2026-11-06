@@ -6,24 +6,36 @@ use serde::{Deserialize, Serialize};
 
 use crate::tls_config::{TlsToml, normalize_peer_addr, parse_endpoint};
 
-/// `[server].control_backend`（B4）：控制面存储后端。`sqlite` 是 H1 前的默认；
-/// `objects` 仍处于迁移期（E/F 完成前不是完整服务形态）。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// `[server].control_backend`：v1.32 起对象控制根是唯一后端。The field is kept
+/// for config compatibility; only `"objects"` is accepted, and omitting
+/// `[server]` defaults to it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub enum ControlBackend {
     #[default]
-    Sqlite,
     Objects,
 }
 
+impl<'de> Deserialize<'de> for ControlBackend {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
 impl ControlBackend {
-    /// 解析显式值（env 覆盖用）；未知值必须拒绝，绝不静默回落到默认。
+    /// 解析显式值（TOML/env 共用）；未知值/已删除的 sqlite 必须拒绝。
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim() {
-            "sqlite" => Ok(Self::Sqlite),
             "objects" => Ok(Self::Objects),
+            "sqlite" => Err(
+                "[server].control_backend='sqlite' 已在 v1.32 移除；请先用归档的 v1.31.0 二进制执行 control-migrate"
+                    .into(),
+            ),
             other => Err(format!(
-                "[server].control_backend 非法值 {other:?}（只认 sqlite|objects）"
+                "[server].control_backend 非法值 {other:?}（只认 objects）"
             )),
         }
     }
@@ -33,7 +45,7 @@ impl ControlBackend {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerToml {
-    /// 控制面后端；默认 sqlite（未写该节 = 旧行为）。
+    /// 控制面后端；缺省 = objects（唯一后端）。
     #[serde(default)]
     pub control_backend: ControlBackend,
 }
@@ -2454,7 +2466,7 @@ mesh_secret = "x"
         assert!(c.raft_validate().is_err());
     }
 
-    /// B4：`[server].control_backend` 缺省 sqlite；显式 objects 可解析；未知值拒绝。
+    /// v1.32：缺省 objects；显式 objects 可解析；sqlite/未知值拒绝。
     #[test]
     fn backend_select_control_backend_selector() {
         let base = "listen = \"127.0.0.1:0\"\n\
@@ -2464,28 +2476,31 @@ mesh_secret = "x"
         let c: AppConfig = toml::from_str(base).unwrap();
         assert_eq!(
             c.server.control_backend,
-            ControlBackend::Sqlite,
-            "缺省必须 sqlite"
+            ControlBackend::Objects,
+            "缺省必须是 objects"
         );
 
         let objects = format!("{base}\n[server]\ncontrol_backend = \"objects\"\n");
         let c: AppConfig = toml::from_str(&objects).unwrap();
         assert_eq!(c.server.control_backend, ControlBackend::Objects);
 
+        let sqlite = format!("{base}\n[server]\ncontrol_backend = \"sqlite\"\n");
+        let err = toml::from_str::<AppConfig>(&sqlite)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("control-migrate"), "必须指引迁移: {err}");
+
         let unknown = format!("{base}\n[server]\ncontrol_backend = \"postgres\"\n");
-        assert!(
-            toml::from_str::<AppConfig>(&unknown).is_err(),
-            "未知后端必须拒绝"
-        );
+        let err = toml::from_str::<AppConfig>(&unknown)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("只认 objects"), "未知后端必须拒绝: {err}");
 
         assert_eq!(
             ControlBackend::parse("objects").unwrap(),
             ControlBackend::Objects
         );
-        assert_eq!(
-            ControlBackend::parse(" sqlite ").unwrap(),
-            ControlBackend::Sqlite
-        );
+        assert!(ControlBackend::parse("sqlite").is_err());
         assert!(ControlBackend::parse("postgres").is_err());
     }
 }

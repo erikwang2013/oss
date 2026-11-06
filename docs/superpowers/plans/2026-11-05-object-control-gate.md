@@ -96,7 +96,7 @@ weakened to make this table green.
 
 - The archived **pre-removal binary** is the GitHub Release v1.31.0 asset
   `oss-server-v1.31.0-linux-x86_64` (sha256
-  `fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`). It is the only binary that
+  `fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`). It is the only binary that
   still links SQLite and can read `oss.db`/`raft.db`; download and verify it before migration.
 - **Before the first post-cutover write:** rollback = stop all nodes, restore the pre-cutover
   `oss.db`, `raft.db` and data-dir backup, start the archived binary. The object root is ignored.

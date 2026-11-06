@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::config::{AppConfig, ControlBackend};
+use crate::config::AppConfig;
 use crate::db::Db;
 use jwt_rust::config::JwtConfig;
 use jwt_rust::integrations::JwtAuth;
@@ -300,13 +300,10 @@ impl AppState {
         cfg_path: &std::path::Path,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let mut cfg = AppConfig::load(cfg_path)?;
-        let object_backend = cfg.server.control_backend == ControlBackend::Objects;
-        // B4/F2：对象后端支持单机与 [raft]（文件日志 + 对象状态机）；集群/stretch 的
-        // 控制面仍是 SQLite 后端（M3/M9 S4）。在碰任何根或库之前拒绝，避免半形态集群。
-        if object_backend && (cfg.cluster.is_some() || cfg.stretch.is_some()) {
+        // v1.32：对象控制根是唯一后端；[cluster]/[stretch] 已随 SQLite 一并移除。
+        if cfg.cluster.is_some() || cfg.stretch.is_some() {
             return Err(
-                "control_backend=objects 暂不支持 [cluster]/[stretch]（控制面仍为 SQLite 后端）"
-                    .into(),
+                "[cluster]/[stretch] 已在 v1.32 移除；请改用 [raft] 或迁移到对象控制根".into(),
             );
         }
         // TLS 物料先于所有传输层加载（文件缺失/私钥非法 → 启动失败，不降级明文）。
@@ -489,15 +486,13 @@ impl AppState {
         let store = Arc::new(Store::open(store_cfg).await?);
         // B4：对象后端的控制根必须在任何控制面读（new_with 的 site/AP/OLAP 预加载）
         // 之前装配完成；启动锁守卫随 `ObjectControl` 存活到进程结束。
-        if object_backend {
-            let object = crate::control_backend::ObjectControl::open(
-                Arc::clone(&store),
-                crate::control_backend::expected_mode(cfg.raft.is_some()),
-                cfg.site.as_ref().and_then(|s| s.id.as_deref()),
-            )
-            .await?;
-            db.attach_object_control(object)?;
-        }
+        let object = crate::control_backend::ObjectControl::open(
+            Arc::clone(&store),
+            crate::control_backend::expected_mode(cfg.raft.is_some()),
+            cfg.site.as_ref().and_then(|s| s.id.as_deref()),
+        )
+        .await?;
+        db.attach_object_control(object)?;
         // DP-0 启动握手（best-effort，不阻断启动）：不可达节点交给运行期 quorum/降级；
         // 可达且混版 → warn，数据面在首个请求前即 fail-closed（503 peer_incompatible）。
         // 运维可见状态见 /health/cluster 与 /api/v1/cluster/status 的 data_plane_compatible。

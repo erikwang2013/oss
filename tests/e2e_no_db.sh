@@ -260,11 +260,8 @@ for i in $(seq 1 120); do
   sleep 0.5
 done
 ck [ -n "$SNAP" ]
-if [ -n "$(login "$R3" "$ADMIN" "$APW")" ]; then
-  pass "admin login on snapshot-joined node"
-else
-  pending "admin login on snapshot-joined node (pre-H1: object backend skips admin bootstrap)"
-fi
+ck wait_login "$R3" "$ADMIN" "$APW"
+ck [ -n "$(login "$R3" "$ADMIN" "$APW")" ]
 TC=$(wait_login "$R3" "$RAFT_USER" "$RAFT_PW")
 ck [ -n "$TC" ]
 ck wait_until 120 0.5 bucket_visible "$R3" "$TC" raft-user-bucket

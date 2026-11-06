@@ -4,9 +4,8 @@
 # Grep-only on purpose (no cargo/network): the H1 gate also checks
 # `cargo tree -i sqlx` is empty, but this guard must stay cheap in CI.
 #
-# Exit 0 = clean, 1 = forbidden matches. Until H1 removes SQLite the current
-# tree fails by design; .github/workflows/ci.yml runs this job with
-# continue-on-error and a TODO(H1) to make it blocking.
+# Exit 0 = clean, 1 = forbidden matches. This is a blocking CI job; the tree
+# must stay SQLite-free after the v1.32 cutover.
 #
 # Exclusions: docs/, the archived pre-removal migrator (ARCHIVE_DIR, default
 # archive/pre-h1), node_modules, and the no-db gate's own files (their text
@@ -94,5 +93,5 @@ if [ "$TOTAL" -eq 0 ]; then
   echo "PASS: no SQLite references in the final workspace"
   exit 0
 fi
-echo "BLOCKED: $TOTAL SQLite match(es) (expected pre-H1; TODO(H1) make CI blocking)"
+echo "BLOCKED: $TOTAL SQLite match(es) in the final workspace"
 exit 1

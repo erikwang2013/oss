@@ -1,41 +1,20 @@
 #!/usr/bin/env bash
 # Shared helpers for tests/e2e_no_db.sh (H2 no-database gate).
 #
-# Sourced by the gate script after it sets BIN, W, PIDS and STRICT. The helper
-# implementations are trimmed from tests/e2e_object_control.sh and
-# tests/e2e_object_control_cluster.sh so the H2 gate behaves like the G3
-# rehearsals it replaces.
+# Sourced by the gate script after it sets BIN, W and PIDS.
 
-PASSES=0 FAILS=0 PENDINGS=0 SKIPS=0
-PENDING_LIST=""
+PASSES=0 FAILS=0 SKIPS=0
 
 pass() { PASSES=$((PASSES + 1)); echo "  PASS: $*"; }
 fail() { FAILS=$((FAILS + 1)); echo "  FAIL: $*"; }
 skip() { SKIPS=$((SKIPS + 1)); echo "  SKIP: $*"; }
-
-# A known pre-H1 gap. Default mode records it and stays green; strict mode
-# (STRICT_NO_DB=1 / --require-no-sqlite) turns it into a real failure.
-pending() {
-  if [ "${STRICT:-0}" = 1 ]; then
-    fail "STRICT-PENDING-H1: $*"
-  else
-    PENDINGS=$((PENDINGS + 1))
-    PENDING_LIST="${PENDING_LIST}  - $*
-"
-    echo "  PENDING-H1: $*"
-  fi
-}
 
 ck() { if "$@" >/dev/null 2>&1; then pass "$*"; else fail "$*"; fi; }
 ck_eq() { if [ "$1" = "$2" ]; then pass "$3"; else fail "$3 (got '$1', want '$2')"; fi; }
 
 finish() {
   echo
-  echo "PASS=$PASSES FAIL=$FAILS PENDING=$PENDINGS SKIP=$SKIPS"
-  if [ -n "$PENDING_LIST" ]; then
-    echo "PENDING-H1 (not failures in default mode; enforced by STRICT_NO_DB=1):"
-    printf '%s' "$PENDING_LIST"
-  fi
+  echo "PASS=$PASSES FAIL=$FAILS SKIP=$SKIPS"
   if [ "$FAILS" -ne 0 ]; then
     echo "FAIL: no-database gate has $FAILS failing assertion(s)"
     exit 1
@@ -136,32 +115,21 @@ ck_node_no_db() { # label pid dir
   fi
 }
 
-# Config for any node. Object mode (default) points database_url at a directory
-# that must never exist: if a pre-H1 path opens SQLite it fails closed instead
-# of silently creating oss.db. SQLite mode is only used to seed pre-H1 fixtures.
-mkcfg() { # name port [standalone|site|raft] [node_id] [bootstrap] [objects|sqlite] [cfg_file]
+# Config for any node. The object root is the only backend.
+mkcfg() { # name port [standalone|site|raft] [node_id] [bootstrap]
   local name=$1 port=$2 kind=${3:-standalone} node=${4:-1} boot=${5:-false}
-  local backend=${6:-objects} cfg=${7:-oss.toml}
-  local d="$W/$name" dburl
-  if [ "$backend" = sqlite ]; then
-    dburl="sqlite://$d/oss.db?mode=rwc"
-  else
-    dburl="sqlite://$d/no-sqlite/oss.db?mode=rwc"
-  fi
+  local d="$W/$name"
   mkdir -p "$d/data" "$d/staging"
-  cat >"$d/$cfg" <<EOF
+  cat >"$d/oss.toml" <<EOF
 listen = "127.0.0.1:$port"
 data_dir = "$d/data"
 staging_dir = "$d/staging"
-database_url = "$dburl"
 jwt_secret = "$JWT"
 max_put_bytes = 268435456
 groups = []
-[server]
-control_backend = "$backend"
 EOF
   if [ "$kind" != "standalone" ]; then
-    cat >>"$d/$cfg" <<EOF
+    cat >>"$d/oss.toml" <<EOF
 [site]
 name = "$name"
 region = "us-east-1"
@@ -170,7 +138,7 @@ token = "$SITE_TOKEN"
 EOF
   fi
   if [ "$kind" = "raft" ]; then
-    cat >>"$d/$cfg" <<EOF
+    cat >>"$d/oss.toml" <<EOF
 [raft]
 node_id = $node
 role = "voter"
@@ -243,41 +211,4 @@ wait_until() { # tries interval command...
     sleep "$interval"
   done
   return 1
-}
-
-# --- pre-H1 fixture seeding -------------------------------------------------
-# H1 deletes SQLite, so these three helpers and every fixture section in
-# tests/e2e_no_db.sh disappear at H1. The replacement is an archived seed DB
-# created by the pre-removal binary (see the gate record rollback note).
-
-migrate_fixture() { # name
-  local d="$W/$1" rc
-  "$BIN" control-migrate --from "$d/oss.db" --state-dir "$d/data" \
-    --raft-db "$d/raft.db" --apply --json >"$d/migrate.json" 2>&1
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    echo "  control-migrate failed for $1:" >&2
-    tail -20 "$d/migrate.json" >&2
-  fi
-  return "$rc"
-}
-
-# Move fixture SQLite files out of an object node dir so the no-db assertions
-# see only object state. Directories such as raft.db.d stay in place.
-stash_sqlite() { # node_name
-  local d="$W/$1" dest="$W/fixtures/$1"
-  mkdir -p "$dest"
-  find "$d" -maxdepth 1 -type f \
-    \( -name '*.db' -o -name '*.db-wal' -o -name '*.db-shm' -o -name '*.db-journal' \) \
-    -exec mv -t "$dest" {} + 2>/dev/null || true
-}
-
-set_fixture_feature_level() { # oss.db level
-  python3 - "$1" "${2:-3}" <<'PY'
-import sqlite3, sys
-conn = sqlite3.connect(sys.argv[1])
-conn.execute("INSERT INTO schema_meta(key,value) VALUES('raft_feature_level',?) "
-             "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (sys.argv[2],))
-conn.commit()
-PY
 }

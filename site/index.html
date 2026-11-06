@@ -217,7 +217,7 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
             </article>
             <article class="bento-card span-8" data-reveal>
               <h3>对象控制根，v1.32 移除 SQLite</h3>
-              <p>v1.31.0 已把 27 张控制表存为节点本地 COW B+tree，单根 CAS 提交、盘级多数派 quorum、启动 flock；Raft 使用文件日志/元数据/快照与元数据型 witness。v1.32.0 让对象控制根成为唯一后端：<code>.oss.sys/control/state/{node,blob}/</code> 内容寻址、<code>.oss.sys/local/</code> 本地运行态、<code>&lt;raft.db_path&gt;.d/</code> 文件 Raft；<code>sqlx</code>/SQLite、<code>migrations/</code>、<code>[cluster]</code>/<code>[stretch]</code> 与 <code>database_url</code> 移除。升级为停全部节点的一次性单向割接：用归档的 <code>oss-server-v1.31.0-linux-x86_64</code>（sha256 <code>fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae</code>）先 <code>control-migrate --dry-run</code> 再 <code>--apply</code>，首次新写入后只能前进。10 万行快照导入 8.3s（此前超时）、导出 1.5s；控制写 p99 仍需 release build 重测，不宣称达标。</p>
+              <p>v1.31.0 已把 27 张控制表存为节点本地 COW B+tree，单根 CAS 提交、盘级多数派 quorum、启动 flock；Raft 使用文件日志/元数据/快照与元数据型 witness。v1.32.0 让对象控制根成为唯一后端：<code>.oss.sys/control/state/{node,blob}/</code> 内容寻址、<code>.oss.sys/local/</code> 本地运行态、<code>&lt;raft.db_path&gt;.d/</code> 文件 Raft；<code>sqlx</code>/SQLite、<code>migrations/</code>、<code>[cluster]</code>/<code>[stretch]</code> 与 <code>database_url</code> 移除。升级为停全部节点的一次性单向割接：用归档的 <code>oss-server-v1.31.0-linux-x86_64</code>（sha256 <code>fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae</code>）先 <code>control-migrate --dry-run</code> 再 <code>--apply</code>，首次新写入后只能前进。10 万行快照导入 8.3s（此前超时）、导出 1.5s；控制写 p99 仍需 release build 重测，不宣称达标。</p>
               <div class="chip-row"><span>object control</span><span>no SQLite</span><span>one-way cutover</span><span>file Raft</span><span>site seam</span><span>v1-32-0</span></div>
             </article>
             <article class="bento-card tint span-4" data-reveal>
@@ -574,7 +574,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
           <div class="download-band" data-reveal>
             <div>
               <h2>下载 v1.32.0</h2>
-              <p>Release 提供源码归档，以及用于 v1.32.0 割接的归档二进制 <a href="https://github.com/erikwang2013/oss/releases/download/v1.31.0/oss-server-v1.31.0-linux-x86_64"><code>oss-server-v1.31.0-linux-x86_64</code></a>（sha256 <code>fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae</code>）；割接步骤见 <a href="https://github.com/erikwang2013/oss/blob/main/docs/superpowers/runbooks/2026-11-05-object-control-cutover.md">runbook</a>。日常部署仍推荐 Docker Compose 或按安装文档从源码构建。</p>
+              <p>Release 提供源码归档，以及用于 v1.32.0 割接的归档二进制 <a href="https://github.com/erikwang2013/oss/releases/download/v1.31.0/oss-server-v1.31.0-linux-x86_64"><code>oss-server-v1.31.0-linux-x86_64</code></a>（sha256 <code>fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae</code>）；割接步骤见 <a href="https://github.com/erikwang2013/oss/blob/main/docs/superpowers/runbooks/2026-11-05-object-control-cutover.md">runbook</a>。日常部署仍推荐 Docker Compose 或按安装文档从源码构建。</p>
             </div>
             <div class="download-actions">
               <a class="btn btn-primary btn-lg" href="https://github.com/erikwang2013/oss/releases/tag/v1.32.0" target="_blank" rel="noopener">打开 Release</a>

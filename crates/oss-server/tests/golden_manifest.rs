@@ -1,8 +1,8 @@
 //! A8 gate: every golden listed in MANIFEST exists and matches its SHA-256,
 //! the manifest is sorted, and no unlisted file lives under `tests/goldens`.
 //!
-//! Regenerate with `scripts/capture_control_goldens.sh`; never hand-edit the
-//! manifest or fixture bytes.
+//! The goldens are frozen at the last SQLite commit (v1.31.0); the capture
+//! target was removed with SQLite in v1.32. Never edit the manifest or bytes.
 
 #[path = "support/golden.rs"]
 mod golden;

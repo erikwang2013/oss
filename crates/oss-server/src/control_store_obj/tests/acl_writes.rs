@@ -57,7 +57,9 @@ async fn missing_write_seam_fails_closed() {
 #[tokio::test]
 async fn lock_and_versioning_writes() {
     let fx = fixture().await;
+    let before = crate::db::now();
     fx.acl.enable_bucket_lock("locked").await.unwrap();
+    let after = crate::db::now();
     let row = BucketStore::bucket(fx.control.as_ref(), "locked")
         .await
         .unwrap()
@@ -66,7 +68,11 @@ async fn lock_and_versioning_writes() {
     assert_eq!(row.versioning, "Enabled");
     assert_eq!(row.owner_uid, None);
     assert_eq!(stored_set_id(fx.control.as_ref(), "locked").await, 0);
-    assert_eq!(row.creation_date, crate::db::now());
+    assert!(
+        (before..=after).contains(&row.creation_date),
+        "creation_date {} outside [{before}, {after}]",
+        row.creation_date
+    );
 
     fx.acl
         .set_bucket_lock_rule("locked", Some("GOVERNANCE"), Some(3))
