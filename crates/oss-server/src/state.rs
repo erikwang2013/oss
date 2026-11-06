@@ -1049,6 +1049,7 @@ impl AppState {
         let remote_ids: Vec<String> = cfg.remotes.iter().map(|r| r.id.clone()).collect();
         let repl_store = Arc::new(
             crate::replication::SqlReplStore::new(db.pool().clone(), remote_ids)
+                .with_db(Arc::clone(&db))
                 .with_control(Arc::clone(&control)),
         );
         // M9 S3：共享删除服务（sync 桶 remote-first；非 sync 委托 store）。
@@ -1064,6 +1065,7 @@ impl AppState {
         );
         let repl_sink = Arc::new(
             crate::replication::SqlReplSink::new(db.pool().clone(), Arc::clone(&store))
+                .with_db(Arc::clone(&db))
                 // M9 S4：stretch 关闭 M7 异步站点对象复制（EC 双站点数据面已承担）。
                 .with_site_data_replication(cfg.stretch.is_none())
                 // 4.19：仅配置 site_token 的远端具备同源 id（版本删除可定点）。

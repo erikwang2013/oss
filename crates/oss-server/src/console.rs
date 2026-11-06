@@ -20,11 +20,10 @@ use xl_s3::events::EventSink as _;
 use xl_s3::sync_delete::SyncDeleteSink as _;
 use xl_store::control_store::OwnerRef;
 use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry};
-use xl_store::control_store::event_outbox::{EventOutboxStore, EventOutboxTxn};
 use xl_store::control_store::repl_outbox::ReplOutboxStore;
 use xl_store::store::VersioningMode;
 
-use crate::control_store::{SqliteControlStore, SqliteControlTxn};
+use crate::control_store::SqliteControlStore;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -1333,9 +1332,7 @@ async fn list_dead_events(
         return r;
     }
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    let rows = SqliteControlStore::new(state.db.pool().clone())
-        .dead_events(limit)
-        .await;
+    let rows = state.db.control_store().dead_events(limit).await;
     match rows {
         Ok(rows) => Json(
             rows.iter()
@@ -1382,17 +1379,7 @@ async fn redeliver_event(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let redelivered = match state.db.pool().acquire().await {
-        Ok(mut conn) => {
-            SqliteControlTxn::new(&mut conn)
-                .event_redeliver(id, now)
-                .await
-        }
-        Err(e) => Err(xl_store::control_store::ControlError::Backend(
-            e.to_string(),
-        )),
-    };
-    match redelivered {
+    match state.db.event_redeliver(id, now).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, "死信事件不存在").into_response(),
         Err(e) => {
@@ -3015,7 +3002,7 @@ async fn delete_bucket(
             if let Err(e) = state.acl().clear_lifecycle_rules(&bucket).await {
                 tracing::warn!(error = ?e, "清理桶生命周期规则失败");
             }
-            if let Err(e) = state.acl().clear_bucket_notification(&bucket).await {
+            if let Err(e) = state.db.clear_bucket_notification(&bucket).await {
                 tracing::warn!(error = %e, bucket = %bucket, "删桶清通知配置失败");
             }
             if let Err(e) = state.db.clear_bucket_policy(&bucket).await {

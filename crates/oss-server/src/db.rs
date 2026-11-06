@@ -9,6 +9,7 @@ use crate::raft::FencingEpoch;
 use crate::raft::apply::ControlWrite;
 use xl_store::control_store::account::AccountTxn;
 use xl_store::control_store::bucket::BucketTxn;
+use xl_store::control_store::event_outbox::EventOutboxTxn;
 use xl_store::control_store::iam::{IamTxn, PermissionRow as IamPermissionRow};
 use xl_store::control_store::inventory::{
     InventoryConfigEntry, InventoryConfigView, InventoryCursorRow, InventoryIncrementalRow,
@@ -3827,6 +3828,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bucket_notification_object_backend_set_clear() {
+        let (_dir, db) = object_db().await;
+        db.set_bucket_notification("b", "[{\"id\":\"t1\"}]", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.bucket_notification("b").await.unwrap().as_deref(),
+            Some("[{\"id\":\"t1\"}]")
+        );
+        // 删桶清理走同一方法；对象模式下命中 seam（占位 pool 无 event_configs）。
+        db.clear_bucket_notification("b").await.unwrap();
+        assert!(db.bucket_notification("b").await.unwrap().is_none());
+        db.clear_bucket_notification("b").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_site_object_backend_drops_rows_and_local_state() {
+        use crate::local_store::DeadLetter;
+        use xl_store::control_store::repl_outbox::NewReplOutbox;
+        let (_dir, db) = object_db().await;
+        let peer = SitePeerRow {
+            peer_id: "peer-a".into(),
+            remote_site_id: "remote-a".into(),
+            name: "a".into(),
+            endpoint: "http://a".into(),
+            region: "us-east-1".into(),
+            priority: 0,
+            s3_access_key: "ak".into(),
+            s3_secret_key: "sk".into(),
+            peer_site_token: "tok".into(),
+            created_at: 1,
+            last_seen: None,
+            last_error: None,
+            raft_node_id: None,
+            reconcile_required: false,
+        };
+        let row = NewReplOutbox {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: "v1".into(),
+            etag: "e".into(),
+            size: 1,
+            remote_id: "peer-a".into(),
+            dest_bucket: "b".into(),
+            is_delete_marker: false,
+            is_version_delete: false,
+            target_kind: "site".into(),
+            created_at: 1,
+        };
+        db.object_local_write("test", move |txn| {
+            Box::pin(async move {
+                txn.site_insert(&peer, 1).await?;
+                txn.repl_enqueue(&row).await?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+        let local = db.object_control().unwrap().control.local_store().unwrap();
+        local.cursor("peer-a").unwrap().store(7, 1).unwrap();
+        local
+            .dead("remote-a")
+            .unwrap()
+            .append(&DeadLetter {
+                peer_id: "remote-a".into(),
+                seq: 3,
+                entity: "bucket".into(),
+                entity_id: "b".into(),
+                error: "bad".into(),
+                payload: "{}".into(),
+                created_at: 1,
+            })
+            .unwrap();
+
+        let affected = db.delete_site("peer-a").await.unwrap().unwrap();
+        assert_eq!(affected, vec![("b".into(), "k".into(), "v1".into())]);
+        assert!(db.control_store().site("peer-a").await.unwrap().is_none());
+        assert_eq!(
+            db.control_store().repl_site_total("peer-a").await.unwrap(),
+            0
+        );
+        assert!(local.cursor("peer-a").unwrap().load().unwrap().is_none());
+        assert!(local.dead("remote-a").unwrap().scan().unwrap().is_empty());
+        assert!(db.delete_site("peer-a").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn upload_records() {
         let db = db().await;
         let uid = db.create_user("u", "pw", false).await.unwrap();
@@ -6218,6 +6306,22 @@ impl Db {
             .map_err(crate::control_store::to_sqlx)?;
         tx.commit().await?;
         Ok(())
+    }
+
+    /// 死信重投（dead → pending）；0 行 = 不存在或不是 dead。
+    pub async fn event_redeliver(&self, id: i64, now: i64) -> Result<bool> {
+        if self.object.get().is_some() {
+            return self
+                .object_local_write("console", move |txn| {
+                    Box::pin(async move { txn.event_redeliver(id, now).await })
+                })
+                .await;
+        }
+        let mut conn = self.pool.acquire().await?;
+        SqliteControlTxn::new(&mut conn)
+            .event_redeliver(id, now)
+            .await
+            .map_err(crate::control_store::to_sqlx)
     }
 
     /// C5：审计保留策略——删除 ts < cutoff 的行，返回删除数（worker 按 OSS_AUDIT_RETENTION_DAYS）。

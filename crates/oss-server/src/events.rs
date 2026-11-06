@@ -1083,6 +1083,48 @@ mod tests {
         assert_eq!(dead[0].last_error.as_deref(), Some("auth failed"));
     }
 
+    #[tokio::test]
+    async fn object_dead_list_and_redeliver() {
+        let f = object_db().await;
+        let sink = object_sink(&f).await;
+        sink.emit(
+            S3EventOp::CreatedPut,
+            "bkt",
+            "k",
+            Some("v1"),
+            Some(1),
+            Some("e"),
+            src(),
+        )
+        .await;
+        let backend = EventBackend::new(&f.db);
+        let t0 = now();
+        let row = backend.claim(t0).await.unwrap().remove(0);
+        let perm = NotifyFailure::permanent("auth failed");
+        assert!(
+            backend
+                .requeue_or_bury(row.id, row.claimed_at, MAX_ATTEMPTS + 1, &perm, t0)
+                .await
+        );
+        // 死信列表（console 同路径）经 seam 可见。
+        let dead = f.db.control_store().dead_events(10).await.unwrap();
+        assert_eq!(dead.len(), 1);
+        let id = dead[0].id;
+        // 重投复位 attempts/死信状态，worker 可再次 claim。
+        assert!(f.db.event_redeliver(id, t0 + 1).await.unwrap());
+        assert!(
+            f.db.control_store()
+                .dead_events(10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let again = backend.claim(t0 + 1).await.unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].id, id);
+        assert_eq!(again[0].attempts, 0);
+    }
+
     /// 事件 JSON 形状（规格 §11.3 必需字段逐项）。
     #[test]
     fn event_json_shape() {

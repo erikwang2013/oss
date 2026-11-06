@@ -34,6 +34,8 @@ const MAX_ATTEMPTS: i64 = 10;
 pub struct SqlReplStore {
     pool: SqlitePool,
     remote_ids: Vec<String>,
+    /// object 后端：规则读写走控制 seam；`None` = SQLite 后端。
+    db: Option<Arc<crate::db::Db>>,
     /// M9 S6c：仅 Raft 模式路由控制写（None/Local = M7 直写）。
     control: Option<Arc<crate::raft::control::ControlPlane>>,
 }
@@ -43,8 +45,17 @@ impl SqlReplStore {
         Self {
             pool,
             remote_ids,
+            db: None,
             control: None,
         }
+    }
+
+    /// 仅对象后端生效：SQLite 模式保持原 SQL 路径（`None`）。
+    pub fn with_db(mut self, db: Arc<crate::db::Db>) -> Self {
+        if db.object_control().is_some() {
+            self.db = Some(db);
+        }
+        self
     }
 
     pub fn with_control(mut self, control: Arc<crate::raft::control::ControlPlane>) -> Self {
@@ -67,13 +78,30 @@ fn control_result(
     }
 }
 
+/// 桶复制规则原文：object 走 seam，SQLite 走原 SQL。
+async fn rules_json(
+    db: Option<&Arc<crate::db::Db>>,
+    pool: &SqlitePool,
+    bucket: &str,
+) -> Result<Option<String>, ControlError> {
+    match db {
+        Some(db) => Ok(db
+            .control_store()
+            .bucket_replication_rules(bucket)
+            .await?
+            .map(|e| e.rules_json)),
+        None => Ok(SqliteControlStore::new(pool.clone())
+            .bucket_replication_rules(bucket)
+            .await?
+            .map(|e| e.rules_json)),
+    }
+}
+
 #[async_trait]
 impl ReplicationStore for SqlReplStore {
     async fn load_rules(&self, bucket: &str) -> Result<Option<String>, String> {
-        crate::control_store::SqliteControlStore::new(self.pool.clone())
-            .bucket_replication_rules(bucket)
+        rules_json(self.db.as_ref(), &self.pool, bucket)
             .await
-            .map(|o| o.map(|e| e.rules_json))
             .map_err(|e| e.to_string())
     }
 
@@ -90,6 +118,21 @@ impl ReplicationStore for SqlReplStore {
             );
         }
         let ts = now();
+        if let Some(db) = &self.db {
+            let bucket = bucket.to_string();
+            let rules_json = rules_json.to_string();
+            return db
+                .control_write("console", move |txn| {
+                    let bucket = bucket.clone();
+                    let rules_json = rules_json.clone();
+                    Box::pin(async move {
+                        txn.bucket_replication_rules_set(&bucket, &rules_json, ts)
+                            .await
+                    })
+                })
+                .await
+                .map_err(|e| e.to_string());
+        }
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .bucket_replication_rules_set(bucket, rules_json, ts)
@@ -108,6 +151,16 @@ impl ReplicationStore for SqlReplStore {
                     })
                     .await,
             );
+        }
+        if let Some(db) = &self.db {
+            let bucket = bucket.to_string();
+            return db
+                .control_write("console", move |txn| {
+                    let bucket = bucket.clone();
+                    Box::pin(async move { txn.bucket_replication_rules_delete(&bucket).await })
+                })
+                .await
+                .map_err(|e| e.to_string());
         }
         let mut tx = self.pool.begin().await.map_err(|e| e.to_string())?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
@@ -128,6 +181,8 @@ impl ReplicationStore for SqlReplStore {
 pub struct SqlReplSink {
     pool: SqlitePool,
     store: Arc<Store>,
+    /// object 后端：规则/versioning 读与出站入队走 seam；`None` = SQLite 后端。
+    db: Option<Arc<crate::db::Db>>,
     /// M9 S4：stretch 站点关闭 M7 异步**站点**对象复制（数据面已由 EC 双站点承担，
     /// 再复制一份是浪费且单站点本就写不成功）；M6 规则复制不受影响。
     site_data_replication: bool,
@@ -140,9 +195,18 @@ impl SqlReplSink {
         Self {
             pool,
             store,
+            db: None,
             site_data_replication: true,
             versioned_remotes: Vec::new(),
         }
+    }
+
+    /// 仅对象后端生效：SQLite 模式保持原事务路径（`None`）。
+    pub fn with_db(mut self, db: Arc<crate::db::Db>) -> Self {
+        if db.object_control().is_some() {
+            self.db = Some(db);
+        }
+        self
     }
 
     /// M9 S4：`[stretch]` 传 false——`enqueue_sites` 整体短路（不写 `target_kind='site'` 行）。
@@ -157,18 +221,57 @@ impl SqlReplSink {
         self
     }
 
+    async fn bucket_versioning(&self, bucket: &str) -> Result<Option<String>, ControlError> {
+        match &self.db {
+            Some(db) => Ok(db
+                .control_store()
+                .bucket(bucket)
+                .await?
+                .map(|b| b.versioning)),
+            None => Ok(SqliteControlStore::new(self.pool.clone())
+                .bucket(bucket)
+                .await?
+                .map(|b| b.versioning)),
+        }
+    }
+
     /// 源桶当前是否 versioning=Enabled（版本删除/同源 id 的前提）。
     async fn versioning_enabled(&self, bucket: &str) -> bool {
-        match crate::control_store::SqliteControlStore::new(self.pool.clone())
-            .bucket(bucket)
-            .await
-        {
-            Ok(Some(v)) => v.versioning == "Enabled",
+        match self.bucket_versioning(bucket).await {
+            Ok(Some(v)) => v == "Enabled",
             Ok(None) => false,
             Err(e) => {
                 tracing::warn!(error = %e, bucket, "读桶 versioning 失败——版本删除不入队");
                 false
             }
+        }
+    }
+
+    async fn site_peer_ids(&self) -> Result<Vec<String>, ControlError> {
+        match &self.db {
+            Some(db) => db.control_store().site_peer_ids().await,
+            None => {
+                SqliteControlStore::new(self.pool.clone())
+                    .site_peer_ids()
+                    .await
+            }
+        }
+    }
+
+    /// 入队一行：object 落本地队列（经 seam），SQLite 保持原事务。
+    async fn enqueue_repl(&self, new: &NewReplOutbox) -> Result<(), ControlError> {
+        if let Some(db) = &self.db {
+            let new = new.clone();
+            return db
+                .object_local_write("replication", move |txn| {
+                    Box::pin(async move { txn.repl_enqueue(&new).await })
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string()));
+        }
+        match self.pool.acquire().await {
+            Ok(mut conn) => SqliteControlTxn::new(&mut conn).repl_enqueue(new).await,
+            Err(e) => Err(ControlError::Backend(e.to_string())),
         }
     }
 }
@@ -220,11 +323,8 @@ impl ReplicationSink for SqlReplSink {
                 || (!self.versioned_remotes.is_empty()
                     && self.versioning_enabled(info.bucket).await));
         if m6_delivery {
-            match crate::control_store::SqliteControlStore::new(self.pool.clone())
-                .bucket_replication_rules(info.bucket)
-                .await
-            {
-                Ok(Some(json)) => match xl_s3::replication::rules_from_json(&json.rules_json) {
+            match rules_json(self.db.as_ref(), &self.pool, info.bucket).await {
+                Ok(Some(json)) => match xl_s3::replication::rules_from_json(&json) {
                     Ok(rules) => {
                         // 标签条件需要对象标签快照；删除事件没有（marker 无标签、版本已删），
                         // 标签规则不投递删除。
@@ -273,15 +373,7 @@ impl ReplicationSink for SqlReplSink {
                                 target_kind: "remote".into(),
                                 created_at: now(),
                             };
-                            let enqueued = match self.pool.acquire().await {
-                                Ok(mut conn) => {
-                                    SqliteControlTxn::new(&mut conn).repl_enqueue(&new).await
-                                }
-                                Err(e) => Err(xl_store::control_store::ControlError::Backend(
-                                    e.to_string(),
-                                )),
-                            };
-                            if let Err(e) = enqueued {
+                            if let Err(e) = self.enqueue_repl(&new).await {
                                 tracing::warn!(error = %e, bucket = info.bucket, key = info.key, "复制入队失败");
                             }
                         }
@@ -325,26 +417,16 @@ impl SqlReplSink {
             return false;
         }
         if info.is_delete_marker || info.version_id.is_none() || info.is_version_delete {
-            let v: Option<String> = match crate::control_store::SqliteControlStore::new(
-                self.pool.clone(),
-            )
-            .bucket(info.bucket)
-            .await
-            {
-                Ok(v) => v.map(|b| b.versioning),
+            match self.bucket_versioning(info.bucket).await {
+                Ok(v) if v.as_deref() == Some("Enabled") => {}
+                Ok(_) => return false,
                 Err(e) => {
                     tracing::warn!(error = %e, bucket = info.bucket, "读桶 versioning 失败——站点删除不入队");
                     return false;
                 }
-            };
-            if v.as_deref() != Some("Enabled") {
-                return false;
             }
         }
-        let peers: Vec<String> = match SqliteControlStore::new(self.pool.clone())
-            .site_peer_ids()
-            .await
-        {
+        let peers: Vec<String> = match self.site_peer_ids().await {
             Ok(p) => p,
             Err(e) => {
                 tracing::warn!(error = %e, "读站点对失败——本写不复制到站点");
@@ -369,13 +451,7 @@ impl SqlReplSink {
                 target_kind: "site".into(),
                 created_at: now(),
             };
-            let enqueued = match self.pool.acquire().await {
-                Ok(mut conn) => SqliteControlTxn::new(&mut conn).repl_enqueue(&new).await,
-                Err(e) => Err(xl_store::control_store::ControlError::Backend(
-                    e.to_string(),
-                )),
-            };
-            match enqueued {
+            match self.enqueue_repl(&new).await {
                 Ok(()) => matched = true,
                 Err(e) => {
                     tracing::warn!(error = %e, bucket = info.bucket, key = info.key, peer = %peer, "站点复制入队失败");
@@ -1311,21 +1387,27 @@ mod tests {
     struct ObjFixture {
         _dir: tempfile::TempDir,
         db: Arc<crate::db::Db>,
+        store: Arc<Store>,
     }
 
     async fn object_db() -> ObjFixture {
         use xl_store::control_state::root::Mode;
-        use xl_store::store::{Store, StoreConfig};
+        use xl_store::store::StoreConfig;
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = StoreConfig::new(dir.path());
         cfg.fsync = false;
         let store = Arc::new(Store::open(cfg).await.unwrap());
-        let object = crate::control_backend::ObjectControl::open(store, Mode::Standalone, None)
-            .await
-            .unwrap();
+        let object =
+            crate::control_backend::ObjectControl::open(Arc::clone(&store), Mode::Standalone, None)
+                .await
+                .unwrap();
         let db = Arc::new(crate::db::Db::connect_object().await.unwrap());
         db.attach_object_control(object).unwrap();
-        ObjFixture { _dir: dir, db }
+        ObjFixture {
+            _dir: dir,
+            db,
+            store,
+        }
     }
 
     async fn enqueue_object_row(db: &crate::db::Db) {
@@ -1386,6 +1468,105 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((counts.pending, counts.sending, counts.dead), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn with_db_is_ignored_without_object_backend() {
+        let f = object_db().await;
+        let plain = Arc::new(crate::db::Db::connect_object().await.unwrap());
+        let rs = SqlReplStore::new(plain.pool().clone(), Vec::new()).with_db(Arc::clone(&plain));
+        assert!(rs.db.is_none(), "SQLite 模式必须保持原 SQL 路径");
+        let sink = SqlReplSink::new(plain.pool().clone(), Arc::clone(&f.store)).with_db(plain);
+        assert!(sink.db.is_none());
+    }
+
+    #[tokio::test]
+    async fn object_rules_crud_and_enqueue_on_matching_put() {
+        use bytes::Bytes;
+        use xl_store::store::VersioningMode;
+        let f = object_db().await;
+        let rs =
+            SqlReplStore::new(f.db.pool().clone(), vec!["r1".into()]).with_db(Arc::clone(&f.db));
+        let rule = ReplRule {
+            id: "r".into(),
+            prefix: Some("logs/".into()),
+            tags: Vec::new(),
+            remote_id: "r1".into(),
+            dest_bucket: "dst".into(),
+            delete_marker: true,
+            enabled: true,
+        };
+        let v1 = serde_json::to_string(&vec![rule.clone()]).unwrap();
+        rs.save_rules("rbk", &v1).await.unwrap();
+        assert_eq!(
+            rs.load_rules("rbk").await.unwrap().as_deref(),
+            Some(v1.as_str())
+        );
+        let mut rule2 = rule.clone();
+        rule2.prefix = Some("logs/v2/".into());
+        let v2 = serde_json::to_string(&vec![rule2]).unwrap();
+        rs.save_rules("rbk", &v2).await.unwrap();
+        assert_eq!(
+            rs.load_rules("rbk").await.unwrap().as_deref(),
+            Some(v2.as_str())
+        );
+        rs.remove_rules("rbk").await.unwrap();
+        assert!(rs.load_rules("rbk").await.unwrap().is_none());
+
+        // 规则重建后，命中前缀的版本化 PUT 经 seam 入队并置 PENDING。
+        rs.save_rules("rbk", &v1).await.unwrap();
+        f.store.create_bucket("rbk").await.unwrap();
+        let info = f
+            .store
+            .put_object_stream_with_meta(
+                "rbk",
+                "logs/a",
+                Box::pin(futures::stream::once(async {
+                    Ok(Bytes::from_static(b"hello"))
+                })),
+                None,
+                Default::default(),
+                None,
+                VersioningMode::Enabled,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let vid = info.version_id.clone().unwrap();
+        let sink =
+            SqlReplSink::new(f.db.pool().clone(), Arc::clone(&f.store)).with_db(Arc::clone(&f.db));
+        sink.on_write(WriteInfo {
+            bucket: "rbk",
+            key: "logs/a",
+            version_id: Some(&vid),
+            etag: &info.etag,
+            size: 5,
+            is_delete_marker: false,
+            is_version_delete: false,
+            is_replica: false,
+        })
+        .await;
+        let backend = ReplBackend::new(&f.db);
+        let t0 = now();
+        let rows = backend.claim(t0).await.unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "matching PUT must enqueue through the object seam"
+        );
+        assert_eq!(rows[0].remote_id, "r1");
+        assert_eq!(rows[0].target_kind, "remote");
+        let h = f
+            .store
+            .head_object_version("rbk", "logs/a", &vid)
+            .await
+            .unwrap();
+        assert_eq!(h.replication_status.as_deref(), Some("PENDING"));
+        assert!(backend.finish_ok(rows[0].seq, rows[0].claimed_at).await);
+        assert!(backend.claim(t0).await.unwrap().is_empty());
     }
 
     #[test]
