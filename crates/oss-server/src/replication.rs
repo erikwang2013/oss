@@ -15,7 +15,7 @@ use xl_s3::replication::{ReplRule, ReplicationSink, ReplicationStore, WriteInfo}
 use xl_store::control_store::ControlError;
 use xl_store::control_store::bucket::BucketStore;
 use xl_store::control_store::bucket::BucketTxn;
-use xl_store::control_store::repl_outbox::{NewReplOutbox, ReplOutboxStore, ReplOutboxTxn};
+use xl_store::control_store::repl_outbox::{NewReplOutbox, ReplOutboxRow, ReplOutboxTxn};
 use xl_store::control_store::sites::SiteStore;
 use xl_store::meta::ObjectTag;
 use xl_store::store::Store;
@@ -458,109 +458,191 @@ fn site_404_retry(e: ReplError, cache_key: &str, op: &str) -> ReplError {
     }
 }
 
+/// 复制 worker 的 per-backend 派发：SQLite 原路径逐字节保留；object 走本地队列
+/// （`ObjectControlTxn` 的 `ReplOutboxTxn` 适配器）。
+#[derive(Clone, Copy)]
+enum ReplBackend<'a> {
+    Sqlite(&'a SqlitePool),
+    Object(&'a crate::db::Db),
+}
+
+impl<'a> ReplBackend<'a> {
+    fn new(db: &'a crate::db::Db) -> Self {
+        if db.object_control().is_some() {
+            Self::Object(db)
+        } else {
+            Self::Sqlite(db.pool())
+        }
+    }
+
+    fn control(self) -> Arc<dyn xl_store::control_store::ControlStore> {
+        match self {
+            Self::Sqlite(pool) => Arc::new(SqliteControlStore::new((*pool).clone())),
+            Self::Object(db) => db.control_store(),
+        }
+    }
+
+    async fn reclaim_expired(self, now_s: i64) -> Result<u64, ControlError> {
+        match self {
+            Self::Sqlite(pool) => match pool.acquire().await {
+                Ok(mut conn) => {
+                    SqliteControlTxn::new(&mut conn)
+                        .repl_reclaim_expired(now_s, REPL_LEASE_SECS)
+                        .await
+                }
+                Err(e) => Err(ControlError::Backend(e.to_string())),
+            },
+            Self::Object(db) => db
+                .object_local_write("replication", move |txn| {
+                    Box::pin(async move { txn.repl_reclaim_expired(now_s, REPL_LEASE_SECS).await })
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string())),
+        }
+    }
+
+    async fn claim(self, now_s: i64) -> Result<Vec<ReplOutboxRow>, ControlError> {
+        match self {
+            Self::Sqlite(pool) => match pool.acquire().await {
+                Ok(mut conn) => {
+                    SqliteControlTxn::new(&mut conn)
+                        .repl_claim(now_s, CLAIM_BATCH)
+                        .await
+                }
+                Err(e) => Err(ControlError::Backend(e.to_string())),
+            },
+            Self::Object(db) => db
+                .object_local_write("replication", move |txn| {
+                    Box::pin(async move { txn.repl_claim(now_s, CLAIM_BATCH).await })
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string())),
+        }
+    }
+
+    async fn renew(self, seq: i64, old: Option<i64>) -> Option<i64> {
+        let now_s = now();
+        let res = match self {
+            Self::Sqlite(pool) => match pool.acquire().await {
+                Ok(mut conn) => {
+                    SqliteControlTxn::new(&mut conn)
+                        .repl_renew(seq, old, now_s)
+                        .await
+                }
+                Err(e) => Err(ControlError::Backend(e.to_string())),
+            },
+            Self::Object(db) => db
+                .object_local_write("replication", move |txn| {
+                    Box::pin(async move { txn.repl_renew(seq, old, now_s).await })
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string())),
+        };
+        match res {
+            Ok(true) => Some(now_s),
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, seq, "复制续租失败（跳过本轮）");
+                None
+            }
+        }
+    }
+
+    async fn finish_ok(self, seq: i64, token: Option<i64>) -> bool {
+        let res = match self {
+            Self::Sqlite(pool) => match pool.acquire().await {
+                Ok(mut conn) => {
+                    SqliteControlTxn::new(&mut conn)
+                        .repl_finish_ok(seq, token)
+                        .await
+                }
+                Err(e) => Err(ControlError::Backend(e.to_string())),
+            },
+            Self::Object(db) => db
+                .object_local_write("replication", move |txn| {
+                    Box::pin(async move { txn.repl_finish_ok(seq, token).await })
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string())),
+        };
+        match res {
+            Ok(ok) => ok,
+            Err(e) => {
+                tracing::warn!(error = %e, seq, "复制完成删行失败");
+                false
+            }
+        }
+    }
+
+    async fn requeue_or_bury(
+        self,
+        seq: i64,
+        token: Option<i64>,
+        attempts: i64,
+        failure: &ReplError,
+        now_s: i64,
+    ) -> bool {
+        let bury = failure.class == ErrClass::Permanent && attempts > MAX_ATTEMPTS;
+        let message = failure.message.clone();
+        let retry_at = now_s + backoff_secs(attempts);
+        let res = match self {
+            Self::Sqlite(pool) => match pool.acquire().await {
+                Ok(mut conn) => {
+                    let mut txn = SqliteControlTxn::new(&mut conn);
+                    if bury {
+                        txn.repl_bury(seq, token, attempts, &message).await
+                    } else {
+                        txn.repl_retry(seq, token, attempts, retry_at, &message)
+                            .await
+                    }
+                }
+                Err(e) => Err(ControlError::Backend(e.to_string())),
+            },
+            Self::Object(db) => db
+                .object_local_write("replication", move |txn| {
+                    Box::pin(async move {
+                        if bury {
+                            txn.repl_bury(seq, token, attempts, &message).await
+                        } else {
+                            txn.repl_retry(seq, token, attempts, retry_at, &message)
+                                .await
+                        }
+                    })
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string())),
+        };
+        match res {
+            Ok(ok) => ok,
+            Err(e) => {
+                tracing::warn!(error = %e, seq, "复制失败状态回写失败");
+                false
+            }
+        }
+    }
+}
+
 async fn site_peer(
-    pool: &SqlitePool,
+    backend: ReplBackend<'_>,
     peer_id: &str,
 ) -> Result<Option<(String, String, String, String, String)>, ControlError> {
-    Ok(SqliteControlStore::new(pool.clone())
-        .site_credentials(peer_id)
-        .await?
-        .map(|c| {
-            (
-                c.endpoint,
-                c.s3_access_key,
-                c.s3_secret_key,
-                c.region,
-                c.peer_site_token,
-            )
-        }))
+    Ok(backend.control().site_credentials(peer_id).await?.map(|c| {
+        (
+            c.endpoint,
+            c.s3_access_key,
+            c.s3_secret_key,
+            c.region,
+            c.peer_site_token,
+        )
+    }))
 }
 
 /// 4.16：同 (bucket,key,version) 更早的出站行仍在途 → 版本删除必须先等待。
-async fn earlier_version_rows(pool: &SqlitePool, r: &ReplRow) -> Result<i64, ControlError> {
-    SqliteControlStore::new(pool.clone())
+async fn earlier_version_rows(backend: ReplBackend<'_>, r: &ReplRow) -> Result<i64, ControlError> {
+    backend
+        .control()
         .repl_earlier_inflight(&r.bucket, &r.key, &r.version_id, r.seq)
         .await
-}
-
-async fn renew_claim(pool: &SqlitePool, seq: i64, old: Option<i64>) -> Option<i64> {
-    let now_s = now();
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, seq, "复制续租失败（跳过本轮）");
-            return None;
-        }
-    };
-    match SqliteControlTxn::new(&mut conn)
-        .repl_renew(seq, old, now_s)
-        .await
-    {
-        Ok(true) => Some(now_s),
-        Ok(false) => None,
-        Err(e) => {
-            tracing::warn!(error = %e, seq, "复制续租失败（跳过本轮）");
-            None
-        }
-    }
-}
-
-async fn finish_ok(pool: &SqlitePool, seq: i64, token: Option<i64>) -> bool {
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, seq, "复制完成删行失败");
-            return false;
-        }
-    };
-    match SqliteControlTxn::new(&mut conn)
-        .repl_finish_ok(seq, token)
-        .await
-    {
-        Ok(ok) => ok,
-        Err(e) => {
-            tracing::warn!(error = %e, seq, "复制完成删行失败");
-            false
-        }
-    }
-}
-
-async fn requeue_or_bury(
-    pool: &SqlitePool,
-    seq: i64,
-    token: Option<i64>,
-    attempts: i64,
-    failure: &ReplError,
-    now_s: i64,
-) -> bool {
-    let bury = failure.class == ErrClass::Permanent && attempts > MAX_ATTEMPTS;
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, seq, "复制失败状态回写失败");
-            return false;
-        }
-    };
-    let mut txn = SqliteControlTxn::new(&mut conn);
-    let res = if bury {
-        txn.repl_bury(seq, token, attempts, &failure.message).await
-    } else {
-        txn.repl_retry(
-            seq,
-            token,
-            attempts,
-            now_s + backoff_secs(attempts),
-            &failure.message,
-        )
-        .await
-    };
-    match res {
-        Ok(ok) => ok,
-        Err(e) => {
-            tracing::warn!(error = %e, seq, "复制失败状态回写失败");
-            false
-        }
-    }
 }
 
 /// 一行复制：marker → 目标 DELETE；数据版本 → 读源 + PUT（带 REPLICA）。
@@ -700,9 +782,15 @@ async fn send_row(
 /// P2-1：一个版本的复制终态聚合——仍有 pending/sending 行则保持 PENDING；
 /// 存在 dead 行则 FAILED；否则 COMPLETED。`dropped=true` 表示解配丢弃了剩余行：
 /// 无剩余行时清除状态（`None`，不再有复制义务），而不是谎报 COMPLETED。
-async fn settle_version_status(pool: &SqlitePool, store: &Store, r: &ReplRow, dropped: bool) {
+async fn settle_version_status(
+    backend: ReplBackend<'_>,
+    store: &Store,
+    r: &ReplRow,
+    dropped: bool,
+) {
     // 单条聚合：三次独立 COUNT 之间的窗口可能把仍有 pending 行误判为已完成。
-    let counts = SqliteControlStore::new(pool.clone())
+    let counts = backend
+        .control()
         .repl_version_counts(&r.bucket, &r.key, &r.version_id)
         .await;
     let (pending, sending, dead) = match counts {
@@ -732,7 +820,7 @@ async fn settle_version_status(pool: &SqlitePool, store: &Store, r: &ReplRow, dr
 
 /// 解配后结算（console `DELETE /sites/{id}` 用）：该版本可能只剩被删掉的 site 行。
 pub async fn settle_version_after_drop(
-    pool: &SqlitePool,
+    db: &crate::db::Db,
     store: &Store,
     bucket: &str,
     key: &str,
@@ -752,37 +840,21 @@ pub async fn settle_version_after_drop(
         attempts: 0,
         claimed_at: None,
     };
-    settle_version_status(pool, store, &r, true).await;
+    settle_version_status(ReplBackend::new(db), store, &r, true).await;
 }
 
 /// 一轮：回收过期租约 → claim → 逐行续租/发送/完成或重试。返回 (成功, 失败)。
-pub async fn process_repl_once(
-    pool: &SqlitePool,
+async fn process_repl_once_backend(
+    backend: ReplBackend<'_>,
     store: &Store,
     client: &ReplClient,
 ) -> (usize, usize) {
     let now_s = now();
-    let reclaimed = match pool.acquire().await {
-        Ok(mut conn) => {
-            SqliteControlTxn::new(&mut conn)
-                .repl_reclaim_expired(now_s, REPL_LEASE_SECS)
-                .await
-        }
-        Err(e) => Err(ControlError::Backend(e.to_string())),
-    };
-    if let Err(e) = reclaimed {
+    if let Err(e) = backend.reclaim_expired(now_s).await {
         tracing::warn!(error = %e, "repl_outbox 租约回收失败");
         return (0, 0);
     }
-    let rows = match pool.acquire().await {
-        Ok(mut conn) => {
-            SqliteControlTxn::new(&mut conn)
-                .repl_claim(now_s, CLAIM_BATCH)
-                .await
-        }
-        Err(e) => Err(ControlError::Backend(e.to_string())),
-    };
-    let rows = match rows {
+    let rows = match backend.claim(now_s).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "repl_outbox claim 失败");
@@ -805,11 +877,11 @@ pub async fn process_repl_once(
             attempts: row.attempts,
             claimed_at: row.claimed_at,
         };
-        let Some(token) = renew_claim(pool, r.seq, r.claimed_at).await else {
+        let Some(token) = backend.renew(r.seq, r.claimed_at).await else {
             continue;
         };
         let outcome: Result<(), ReplError> = if r.target_kind == "site" {
-            match site_peer(pool, &r.remote_id).await {
+            match site_peer(backend, &r.remote_id).await {
                 Ok(Some((endpoint, ak, sk, region, token))) => {
                     match ReplClient::single(&endpoint, &ak, &sk, &region)
                         .map(|c| c.with_tls(client.tls()))
@@ -819,7 +891,7 @@ pub async fn process_repl_once(
                             // 4.16：同版本更早的行（PUT）仍在途时先等待——否则删除先到、
                             // PUT 重投成功会把已删版本在目标复活。
                             let earlier = if r.is_version_delete {
-                                earlier_version_rows(pool, &r).await
+                                earlier_version_rows(backend, &r).await
                             } else {
                                 Ok(0)
                             };
@@ -841,9 +913,9 @@ pub async fn process_repl_once(
                 }
                 Ok(None) => {
                     // 已解除配对：丢行并结算版本状态（否则只有该 site 行的版本永久 PENDING——P1-3）。
-                    finish_ok(pool, r.seq, Some(token)).await;
+                    backend.finish_ok(r.seq, Some(token)).await;
                     if !r.version_id.is_empty() && !r.is_version_delete {
-                        settle_version_status(pool, store, &r, true).await;
+                        settle_version_status(backend, store, &r, true).await;
                     }
                     tracing::warn!(seq = r.seq, peer = %r.remote_id, "站点对已解除——丢弃出站行");
                     continue;
@@ -857,7 +929,7 @@ pub async fn process_repl_once(
             let cache_key =
                 token.and_then(|_| client.target_cache_key(&r.remote_id, &r.dest_bucket));
             let earlier = if r.is_version_delete {
-                earlier_version_rows(pool, &r).await
+                earlier_version_rows(backend, &r).await
             } else {
                 Ok(0)
             };
@@ -873,7 +945,7 @@ pub async fn process_repl_once(
         };
         match outcome {
             Ok(()) => {
-                let claimed = finish_ok(pool, r.seq, Some(token)).await;
+                let claimed = backend.finish_ok(r.seq, Some(token)).await;
                 if claimed {
                     sent += 1;
                 } else {
@@ -883,14 +955,16 @@ pub async fn process_repl_once(
                 // P3-5：token 失配时不得写状态（该行可能已被新 worker 接管）。
                 // 版本删除后源版本已不在，不写复制终态（无对象可标）。
                 if claimed && !r.version_id.is_empty() && !r.is_version_delete {
-                    settle_version_status(pool, store, &r, false).await;
+                    settle_version_status(backend, store, &r, false).await;
                 }
             }
             Err(f) => {
                 failed += 1;
                 let a = r.attempts + 1;
                 let bury = f.class == ErrClass::Permanent && a > MAX_ATTEMPTS;
-                let wrote = requeue_or_bury(pool, r.seq, Some(token), a, &f, now_s).await;
+                let wrote = backend
+                    .requeue_or_bury(r.seq, Some(token), a, &f, now_s)
+                    .await;
                 if !wrote {
                     tracing::warn!(
                         seq = r.seq,
@@ -917,6 +991,15 @@ pub async fn process_repl_once(
         }
     }
     (sent, failed)
+}
+
+/// SQLite 后端入口（集成测试与既有调用方保持原签名）。
+pub async fn process_repl_once(
+    pool: &SqlitePool,
+    store: &Store,
+    client: &ReplClient,
+) -> (usize, usize) {
+    process_repl_once_backend(ReplBackend::Sqlite(pool), store, client).await
 }
 
 // ---------- M7 遗留未映射 REPLICA 的人工对账 ----------
@@ -1170,7 +1253,7 @@ pub async fn delete_unmapped_replicas(
 }
 
 /// serve 挂载（`OSS_REPL_INTERVAL_SECS` 默认 1s；显式 0 = 关闭）。
-pub fn spawn_repl_worker(pool: SqlitePool, store: Arc<Store>, client: Arc<ReplClient>) {
+pub fn spawn_repl_worker(db: Arc<crate::db::Db>, store: Arc<Store>, client: Arc<ReplClient>) {
     let secs: u64 = std::env::var("OSS_REPL_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1184,7 +1267,7 @@ pub fn spawn_repl_worker(pool: SqlitePool, store: Arc<Store>, client: Arc<ReplCl
         t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             t.tick().await;
-            let _ = process_repl_once(&pool, &store, &client).await;
+            let _ = process_repl_once_backend(ReplBackend::new(&db), &store, &client).await;
         }
     });
 }
@@ -1223,6 +1306,86 @@ mod tests {
             key: key.into(),
             value: value.into(),
         }
+    }
+
+    struct ObjFixture {
+        _dir: tempfile::TempDir,
+        db: Arc<crate::db::Db>,
+    }
+
+    async fn object_db() -> ObjFixture {
+        use xl_store::control_state::root::Mode;
+        use xl_store::store::{Store, StoreConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = StoreConfig::new(dir.path());
+        cfg.fsync = false;
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let object = crate::control_backend::ObjectControl::open(store, Mode::Standalone, None)
+            .await
+            .unwrap();
+        let db = Arc::new(crate::db::Db::connect_object().await.unwrap());
+        db.attach_object_control(object).unwrap();
+        ObjFixture { _dir: dir, db }
+    }
+
+    async fn enqueue_object_row(db: &crate::db::Db) {
+        let new = NewReplOutbox {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: "v1".into(),
+            etag: "e".into(),
+            size: 1,
+            remote_id: "site-a".into(),
+            dest_bucket: "b".into(),
+            is_delete_marker: false,
+            is_version_delete: false,
+            target_kind: "site".into(),
+            created_at: now(),
+        };
+        db.object_local_write("test", move |txn| {
+            Box::pin(async move { txn.repl_enqueue(&new).await })
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn object_worker_claim_reclaim_complete() {
+        let f = object_db().await;
+        enqueue_object_row(&f.db).await;
+        let backend = ReplBackend::new(&f.db);
+        let t0 = 1_000;
+        let first = backend.claim(t0).await.unwrap();
+        assert_eq!(
+            first.len(),
+            1,
+            "row must be visible through the object seam"
+        );
+        assert_eq!(first[0].version_id, "v1");
+        let seq = first[0].seq;
+        assert!(
+            backend.claim(t0).await.unwrap().is_empty(),
+            "a claimed row must be invisible to a second worker"
+        );
+        // 租约过期 → 回收 → 新 token 可 claim；旧 token 完成必须 no-op。
+        let later = t0 + REPL_LEASE_SECS + 1;
+        assert_eq!(backend.reclaim_expired(later).await.unwrap(), 1);
+        assert!(
+            !backend.finish_ok(seq, first[0].claimed_at).await,
+            "stale token must not complete a reclaimed row"
+        );
+        let again = backend.claim(later).await.unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].seq, seq);
+        assert_eq!(again[0].attempts, 0, "reclaim preserves attempts");
+        assert!(backend.finish_ok(seq, again[0].claimed_at).await);
+        assert!(backend.claim(later + 1).await.unwrap().is_empty());
+        let counts =
+            f.db.control_store()
+                .repl_version_counts("b", "k", "v1")
+                .await
+                .unwrap();
+        assert_eq!((counts.pending, counts.sending, counts.dead), (0, 0, 0));
     }
 
     #[test]

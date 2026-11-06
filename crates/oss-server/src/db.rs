@@ -1875,6 +1875,12 @@ impl Db {
     }
 
     pub async fn instant_get(&self, k: &str) -> Result<Option<String>> {
+        if let Some(object) = self.object.get() {
+            return object
+                .control
+                .instant_get(k, now())
+                .map_err(crate::control_store::to_sqlx);
+        }
         let row = sqlx::query("SELECT v FROM instant_index WHERE k = ? AND expires_at > ?")
             .bind(k)
             .bind(now())
@@ -1886,6 +1892,12 @@ impl Db {
     pub async fn instant_set(&self, k: &str, v: &str, ttl_seconds: u64) -> Result<()> {
         // ttl = 0 视为「立刻过期」，与 aetherupload 的 SETEX 语义一致
         let expires = now() + ttl_seconds as i64;
+        if let Some(object) = self.object.get() {
+            return object
+                .control
+                .instant_set(k, v, expires)
+                .map_err(crate::control_store::to_sqlx);
+        }
         sqlx::query(
             "INSERT INTO instant_index (k, v, expires_at) VALUES (?, ?, ?) \
                      ON CONFLICT(k) DO UPDATE SET v = excluded.v, expires_at = excluded.expires_at",
@@ -1899,6 +1911,12 @@ impl Db {
     }
 
     pub async fn instant_del(&self, k: &str) -> Result<()> {
+        if let Some(object) = self.object.get() {
+            return object
+                .control
+                .instant_del(k)
+                .map_err(crate::control_store::to_sqlx);
+        }
         sqlx::query("DELETE FROM instant_index WHERE k = ?")
             .bind(k)
             .execute(&self.pool)
@@ -1910,6 +1928,12 @@ impl Db {
     /// 前缀只来自 aetherupload 的 `KEY_PREFIX`（`aetherupload:resource:`，无 LIKE 通配符），
     /// 故直接 LIKE 匹配，不做转义。
     pub async fn instant_delete_prefix(&self, prefix: &str) -> Result<()> {
+        if let Some(object) = self.object.get() {
+            return object
+                .control
+                .instant_delete_prefix(prefix)
+                .map_err(crate::control_store::to_sqlx);
+        }
         sqlx::query("DELETE FROM instant_index WHERE k LIKE ? || '%'")
             .bind(prefix)
             .execute(&self.pool)
@@ -1919,6 +1943,12 @@ impl Db {
 
     /// 清过期秒传索引行（有界批；过期行不影响命中，但会无限增长）。
     pub async fn instant_purge_expired(&self, limit: i64) -> Result<u64> {
+        if let Some(object) = self.object.get() {
+            return object
+                .control
+                .instant_purge_expired(now(), limit)
+                .map_err(crate::control_store::to_sqlx);
+        }
         let n = sqlx::query(
             "DELETE FROM instant_index WHERE k IN \
              (SELECT k FROM instant_index WHERE expires_at <= ? ORDER BY expires_at LIMIT ?)",
@@ -3655,6 +3685,80 @@ mod tests {
             db.instant_get("other").await.unwrap().as_deref(),
             Some("keep")
         );
+    }
+
+    async fn object_db() -> (tempfile::TempDir, Db) {
+        use xl_store::control_state::root::Mode;
+        use xl_store::store::{Store, StoreConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = StoreConfig::new(dir.path());
+        cfg.fsync = false;
+        let store = std::sync::Arc::new(Store::open(cfg).await.unwrap());
+        let object = crate::control_backend::ObjectControl::open(store, Mode::Standalone, None)
+            .await
+            .unwrap();
+        let db = Db::connect_object().await.unwrap();
+        db.attach_object_control(object).unwrap();
+        (dir, db)
+    }
+
+    #[tokio::test]
+    async fn instant_index_object_backend_put_get_expiry_prefix() {
+        let (_dir, db) = object_db().await;
+        assert!(db.object_control().is_some());
+        db.instant_set("k", "v", 3600).await.unwrap();
+        assert_eq!(db.instant_get("k").await.unwrap().as_deref(), Some("v"));
+        // 回归：记录落在 node-local KV（占位 pool 上不可能有行）。
+        let raw = db
+            .object_control()
+            .unwrap()
+            .control
+            .local_store()
+            .unwrap()
+            .kv("instant_index")
+            .unwrap()
+            .get("k")
+            .unwrap();
+        assert!(raw.is_some(), "instant row must live in the local KV");
+        db.instant_set("expired", "v", 0).await.unwrap();
+        assert_eq!(db.instant_get("expired").await.unwrap(), None);
+        db.instant_set("aetherupload:resource:file_a", "v1", 3600)
+            .await
+            .unwrap();
+        db.instant_set("aetherupload:resource:file_b", "v2", 3600)
+            .await
+            .unwrap();
+        db.instant_delete_prefix("aetherupload:resource:")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.instant_get("aetherupload:resource:file_a")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.instant_get("aetherupload:resource:file_b")
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(db.instant_get("k").await.unwrap().as_deref(), Some("v"));
+        db.instant_del("k").await.unwrap();
+        assert_eq!(db.instant_get("k").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn instant_index_object_backend_purges_expired_in_batches() {
+        let (_dir, db) = object_db().await;
+        for k in ["e1", "e2", "e3"] {
+            db.instant_set(k, "v", 0).await.unwrap();
+        }
+        db.instant_set("live", "v", 3600).await.unwrap();
+        assert_eq!(db.instant_purge_expired(2).await.unwrap(), 2);
+        assert_eq!(db.instant_purge_expired(10).await.unwrap(), 1);
+        assert_eq!(db.instant_purge_expired(10).await.unwrap(), 0);
+        assert_eq!(db.instant_get("live").await.unwrap().as_deref(), Some("v"));
     }
 
     #[tokio::test]
@@ -6008,6 +6112,20 @@ impl Db {
         config_json: &str,
         now: i64,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_string();
+            let config_json = config_json.to_string();
+            return self
+                .control_write("console", move |txn| {
+                    let bucket = bucket.clone();
+                    let config_json = config_json.clone();
+                    Box::pin(async move {
+                        txn.bucket_notification_set(&bucket, &config_json, now)
+                            .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .bucket_notification_set(bucket, config_json, now)
@@ -6019,6 +6137,15 @@ impl Db {
 
     /// 清桶事件通知配置（幂等）。
     pub async fn clear_bucket_notification(&self, bucket: &str) -> Result<()> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_string();
+            return self
+                .control_write("console", move |txn| {
+                    let bucket = bucket.clone();
+                    Box::pin(async move { txn.bucket_notification_delete(&bucket).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .bucket_notification_delete(bucket)

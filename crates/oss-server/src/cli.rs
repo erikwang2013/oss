@@ -858,10 +858,7 @@ pub async fn run(
                 crate::accounts_canonical::spawn_worker(state.clone(), leader.clone());
                 crate::accounts_usage::spawn_sampler(state.clone());
                 // M6 切片 0：事件 outbox worker（OSS_EVENT_INTERVAL_SECS，0=关）
-                crate::events::spawn_worker(
-                    std::sync::Arc::clone(&state.events),
-                    state.db.pool().clone(),
-                );
+                crate::events::spawn_worker(std::sync::Arc::clone(&state.events));
                 // M7：站点控制面 changelog worker（OSS_SITE_INTERVAL_SECS，0=关）
                 // M9 S6a：Raft 模式不挂站点 worker（控制写不经 changelog；S6d 再决定替代）。
                 if state.site_enabled && state.cfg.raft.is_none() {
@@ -872,7 +869,7 @@ pub async fn run(
                 }
                 // M6 切片 4：复制 outbox worker（OSS_REPL_INTERVAL_SECS，0=关）
                 crate::replication::spawn_repl_worker(
-                    state.db.pool().clone(),
+                    std::sync::Arc::clone(&state.db),
                     std::sync::Arc::clone(&state.store),
                     std::sync::Arc::clone(&state.repl_client),
                 );

@@ -21,6 +21,7 @@ mod iam;
 mod iam_snapshot;
 mod iam_txn;
 mod iam_write;
+mod instant_index;
 mod inventory;
 mod inventory_txn;
 pub(crate) mod jobs;

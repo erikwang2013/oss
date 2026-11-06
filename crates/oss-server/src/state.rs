@@ -1021,10 +1021,10 @@ impl AppState {
         // M6 切片 0/1：事件接收方（worker 在 serve 路径挂载；Kafka 目标优先，否则 env 文件 sink）
         let notifier =
             crate::events::notifier_from_config_tls(&cfg.kafka.targets, Arc::clone(&tls));
-        let events = Arc::new(crate::events::SqlEventSink::new(
-            db.pool().clone(),
-            notifier,
-        ));
+        let events = Arc::new(match db.object_control() {
+            Some(_) => crate::events::SqlEventSink::with_db(Arc::clone(&db), notifier),
+            None => crate::events::SqlEventSink::new(db.pool().clone(), notifier),
+        });
         // M9 S6：门面与副作用执行器共享同一批 Arc；Raft 句柄来自 load。
         // 先于共享存储构造——S6c 起它们的控制写要经同一门面。
         let control = Arc::new(match &raft {

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sqlx::SqlitePool;
-use xl_store::control_store::bucket::BucketStore;
-use xl_store::control_store::event_outbox::EventOutboxTxn;
+use xl_store::control_store::ControlError;
+use xl_store::control_store::event_outbox::{EventOutboxClaim, EventOutboxTxn};
 
 use crate::control_store::{SqliteControlStore, SqliteControlTxn};
 
@@ -498,27 +498,42 @@ pub fn build_event_json(
 // ---------- 接收方（EventSink 实现） ----------
 
 pub struct SqlEventSink {
-    pool: SqlitePool,
+    /// object 后端为 `None`：占位 pool 不赋值，也就不会被误用。
+    pool: Option<SqlitePool>,
+    /// object 后端：配置读取与 outbox 写入都走 seam；`None` = SQLite 后端。
+    db: Option<Arc<crate::db::Db>>,
     region: String,
     notifier: Arc<dyn Notifier>,
 }
 
 impl SqlEventSink {
     pub fn new(pool: SqlitePool, notifier: Arc<dyn Notifier>) -> Self {
-        Self {
-            pool,
-            region: EVENT_REGION.to_string(),
-            notifier,
-        }
+        Self::with_notifier(pool, notifier)
     }
 
     /// 测试/装配用：指定 notifier。
     pub fn with_notifier(pool: SqlitePool, notifier: Arc<dyn Notifier>) -> Self {
         Self {
-            pool,
+            pool: Some(pool),
+            db: None,
             region: EVENT_REGION.to_string(),
             notifier,
         }
+    }
+
+    /// object 控制后端：请求路径按 `db.control_backend()` 分派，worker 用
+    /// `db` 的本地队列，不再碰占位 SQLite pool。
+    pub fn with_db(db: Arc<crate::db::Db>, notifier: Arc<dyn Notifier>) -> Self {
+        Self {
+            pool: None,
+            db: Some(db),
+            region: EVENT_REGION.to_string(),
+            notifier,
+        }
+    }
+
+    fn sqlite(&self) -> &SqlitePool {
+        self.pool.as_ref().expect("SQLite event sink has a pool")
     }
 
     pub fn notifier(&self) -> Arc<dyn Notifier> {
@@ -548,7 +563,11 @@ impl SqlEventSink {
         if targets.is_empty() {
             return;
         }
-        let owner_uid: Option<i64> = SqliteControlStore::new(self.pool.clone())
+        let control = match &self.db {
+            Some(db) => db.control_store(),
+            None => Arc::new(SqliteControlStore::new(self.sqlite().clone())),
+        };
+        let owner_uid: Option<i64> = control
             .bucket(bucket)
             .await
             .ok()
@@ -585,15 +604,26 @@ impl SqlEventSink {
                 &source,
                 owner_uid,
             );
-            let enqueued = match self.pool.acquire().await {
-                Ok(mut conn) => {
-                    SqliteControlTxn::new(&mut conn)
-                        .event_enqueue(bucket, &t.target, &payload, now())
-                        .await
+            let enqueued = match &self.db {
+                Some(db) => {
+                    let (bucket, target, payload) =
+                        (bucket.to_string(), t.target.clone(), payload.clone());
+                    db.object_local_write("events", move |txn| {
+                        Box::pin(async move {
+                            txn.event_enqueue(&bucket, &target, &payload, now()).await
+                        })
+                    })
+                    .await
+                    .map_err(|e| ControlError::Backend(e.to_string()))
                 }
-                Err(e) => Err(xl_store::control_store::ControlError::Backend(
-                    e.to_string(),
-                )),
+                None => match self.sqlite().acquire().await {
+                    Ok(mut conn) => {
+                        SqliteControlTxn::new(&mut conn)
+                            .event_enqueue(bucket, &t.target, &payload, now())
+                            .await
+                    }
+                    Err(e) => Err(ControlError::Backend(e.to_string())),
+                },
             };
             if let Err(e) = enqueued {
                 tracing::warn!(error = %e, bucket, key, "事件入 outbox 失败（丢弃本条，不影响请求）");
@@ -602,7 +632,11 @@ impl SqlEventSink {
     }
 
     async fn load_targets(&self, bucket: &str) -> Result<Vec<EventTarget>, sqlx::Error> {
-        let config = crate::control_store::SqliteControlStore::new(self.pool.clone())
+        let control = match &self.db {
+            Some(db) => db.control_store(),
+            None => Arc::new(SqliteControlStore::new(self.sqlite().clone())),
+        };
+        let config = control
             .bucket_notification(bucket)
             .await
             .map_err(crate::control_store::to_sqlx)?;
@@ -632,121 +666,183 @@ impl EventSink for SqlEventSink {
 
 // ---------- worker（R2 两态租约 + R1 分级重试） ----------
 
-/// P2-2 修复：每行发送前**续租**（claim token 轮换）。返回新 token；`None` = 行已被
-/// 他实例回收（丢失 claim）→ 调用方**跳过发送**（防「回收后旧 sender 仍发」的重复）。
-async fn renew_claim(pool: &SqlitePool, id: i64, old: Option<i64>) -> Option<i64> {
-    let now_s = now();
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, id, "事件续租失败（跳过本轮）");
-            return None;
-        }
-    };
-    match SqliteControlTxn::new(&mut conn)
-        .event_renew(id, old, now_s)
-        .await
-    {
-        Ok(true) => Some(now_s),
-        Ok(false) => None,
-        Err(e) => {
-            tracing::warn!(error = %e, id, "事件续租失败（跳过本轮）");
-            None
-        }
-    }
+/// 事件 outbox 的 per-backend 派发：SQLite 原路径逐字节保留；object 走本地队列
+/// （`ObjectControlTxn` 的 `EventOutboxTxn` 适配器）。
+#[derive(Clone, Copy)]
+enum EventBackend<'a> {
+    Sqlite(&'a SqlitePool),
+    Object(&'a crate::db::Db),
 }
 
-/// 成功删行（claim token 守卫；stale sender 不得复活已被重投/删除的行）。
-async fn finish_ok(pool: &SqlitePool, id: i64, token: Option<i64>) -> bool {
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, id, "事件完成删行失败");
-            return false;
-        }
-    };
-    match SqliteControlTxn::new(&mut conn)
-        .event_finish_ok(id, token)
-        .await
-    {
-        Ok(ok) => ok,
-        Err(e) => {
-            tracing::warn!(error = %e, id, "事件完成删行失败");
-            false
+impl<'a> EventBackend<'a> {
+    fn new(db: &'a crate::db::Db) -> Self {
+        if db.object_control().is_some() {
+            Self::Object(db)
+        } else {
+            Self::Sqlite(db.pool())
         }
     }
-}
 
-/// 失败回写（重试 or 死信；同 guarded 口径）。
-async fn requeue_or_bury(
-    pool: &SqlitePool,
-    id: i64,
-    token: Option<i64>,
-    attempts: i64,
-    failure: &NotifyFailure,
-    now_s: i64,
-) -> bool {
-    let bury = failure.permanent && attempts > MAX_ATTEMPTS;
-    let mut conn = match pool.acquire().await {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(error = %e, id, "事件失败状态回写失败");
-            return false;
+    async fn reclaim_expired(self, now_s: i64) -> Result<u64, ControlError> {
+        match self {
+            Self::Sqlite(pool) => match pool.acquire().await {
+                Ok(mut conn) => {
+                    SqliteControlTxn::new(&mut conn)
+                        .event_reclaim_expired(now_s, EVENT_LEASE_SECS)
+                        .await
+                }
+                Err(e) => Err(ControlError::Backend(e.to_string())),
+            },
+            Self::Object(db) => db
+                .object_local_write("events", move |txn| {
+                    Box::pin(
+                        async move { txn.event_reclaim_expired(now_s, EVENT_LEASE_SECS).await },
+                    )
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string())),
         }
-    };
-    let mut txn = SqliteControlTxn::new(&mut conn);
-    let res = if bury {
-        txn.event_bury(id, token, attempts, &failure.message).await
-    } else {
-        txn.event_retry(
-            id,
-            token,
-            attempts,
-            now_s + backoff_secs(attempts),
-            &failure.message,
-        )
-        .await
-    };
-    match res {
-        Ok(ok) => ok,
-        Err(e) => {
-            tracing::warn!(error = %e, id, "事件失败状态回写失败");
-            false
+    }
+
+    async fn claim(self, now_s: i64) -> Result<Vec<EventOutboxClaim>, ControlError> {
+        match self {
+            Self::Sqlite(pool) => match pool.acquire().await {
+                Ok(mut conn) => {
+                    SqliteControlTxn::new(&mut conn)
+                        .event_claim(now_s, CLAIM_BATCH)
+                        .await
+                }
+                Err(e) => Err(ControlError::Backend(e.to_string())),
+            },
+            Self::Object(db) => db
+                .object_local_write("events", move |txn| {
+                    Box::pin(async move { txn.event_claim(now_s, CLAIM_BATCH).await })
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string())),
+        }
+    }
+
+    /// P2-2：每行发送前**续租**（claim token 轮换）。返回新 token；`None` = 行已被
+    /// 他实例回收（丢失 claim）→ 调用方**跳过发送**（防「回收后旧 sender 仍发」的重复）。
+    async fn renew(self, id: i64, old: Option<i64>) -> Option<i64> {
+        let now_s = now();
+        let res = match self {
+            Self::Sqlite(pool) => match pool.acquire().await {
+                Ok(mut conn) => {
+                    SqliteControlTxn::new(&mut conn)
+                        .event_renew(id, old, now_s)
+                        .await
+                }
+                Err(e) => Err(ControlError::Backend(e.to_string())),
+            },
+            Self::Object(db) => db
+                .object_local_write("events", move |txn| {
+                    Box::pin(async move { txn.event_renew(id, old, now_s).await })
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string())),
+        };
+        match res {
+            Ok(true) => Some(now_s),
+            Ok(false) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, id, "事件续租失败（跳过本轮）");
+                None
+            }
+        }
+    }
+
+    /// 成功删行（claim token 守卫；stale sender 不得复活已被重投/删除的行）。
+    async fn finish_ok(self, id: i64, token: Option<i64>) -> bool {
+        let res = match self {
+            Self::Sqlite(pool) => match pool.acquire().await {
+                Ok(mut conn) => {
+                    SqliteControlTxn::new(&mut conn)
+                        .event_finish_ok(id, token)
+                        .await
+                }
+                Err(e) => Err(ControlError::Backend(e.to_string())),
+            },
+            Self::Object(db) => db
+                .object_local_write("events", move |txn| {
+                    Box::pin(async move { txn.event_finish_ok(id, token).await })
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string())),
+        };
+        match res {
+            Ok(ok) => ok,
+            Err(e) => {
+                tracing::warn!(error = %e, id, "事件完成删行失败");
+                false
+            }
+        }
+    }
+
+    /// 失败回写（重试 or 死信；同 guarded 口径）。
+    async fn requeue_or_bury(
+        self,
+        id: i64,
+        token: Option<i64>,
+        attempts: i64,
+        failure: &NotifyFailure,
+        now_s: i64,
+    ) -> bool {
+        let bury = failure.permanent && attempts > MAX_ATTEMPTS;
+        let message = failure.message.clone();
+        let retry_at = now_s + backoff_secs(attempts);
+        let res = match self {
+            Self::Sqlite(pool) => match pool.acquire().await {
+                Ok(mut conn) => {
+                    let mut txn = SqliteControlTxn::new(&mut conn);
+                    if bury {
+                        txn.event_bury(id, token, attempts, &message).await
+                    } else {
+                        txn.event_retry(id, token, attempts, retry_at, &message)
+                            .await
+                    }
+                }
+                Err(e) => Err(ControlError::Backend(e.to_string())),
+            },
+            Self::Object(db) => db
+                .object_local_write("events", move |txn| {
+                    Box::pin(async move {
+                        if bury {
+                            txn.event_bury(id, token, attempts, &message).await
+                        } else {
+                            txn.event_retry(id, token, attempts, retry_at, &message)
+                                .await
+                        }
+                    })
+                })
+                .await
+                .map_err(|e| ControlError::Backend(e.to_string())),
+        };
+        match res {
+            Ok(ok) => ok,
+            Err(e) => {
+                tracing::warn!(error = %e, id, "事件失败状态回写失败");
+                false
+            }
         }
     }
 }
 
 /// 一轮处理：回收过期租约 → claim（有序，逐条串行投递）→ 成功删行 / 分级重试。
 /// 返回 `(成功, 失败)` 计数（测试与观测用）。
-pub async fn process_once(pool: &SqlitePool, notifier: &dyn Notifier) -> (usize, usize) {
+async fn process_once_backend(
+    backend: EventBackend<'_>,
+    notifier: &dyn Notifier,
+) -> (usize, usize) {
     let now_s = now();
     // R2 回收：state='sending' 且租约过期 → 置回 pending（不计 attempts；崩溃自愈）
-    let reclaimed = match pool.acquire().await {
-        Ok(mut conn) => {
-            SqliteControlTxn::new(&mut conn)
-                .event_reclaim_expired(now_s, EVENT_LEASE_SECS)
-                .await
-        }
-        Err(e) => Err(xl_store::control_store::ControlError::Backend(
-            e.to_string(),
-        )),
-    };
-    if let Err(e) = reclaimed {
+    if let Err(e) = backend.reclaim_expired(now_s).await {
         tracing::warn!(error = %e, "事件 outbox 租约回收失败");
         return (0, 0);
     }
     // claim（原子 UPDATE…RETURNING；ORDER BY id = seq 序，逐条串行投递）
-    let rows = match pool.acquire().await {
-        Ok(mut conn) => {
-            SqliteControlTxn::new(&mut conn)
-                .event_claim(now_s, CLAIM_BATCH)
-                .await
-        }
-        Err(e) => Err(xl_store::control_store::ControlError::Backend(
-            e.to_string(),
-        )),
-    };
-    let rows = match rows {
+    let rows = match backend.claim(now_s).await {
         Ok(r) => r,
         Err(e) => {
             tracing::warn!(error = %e, "事件 outbox claim 失败");
@@ -761,12 +857,12 @@ pub async fn process_once(pool: &SqlitePool, notifier: &dyn Notifier) -> (usize,
         let attempts = r.attempts;
         let claimed = r.claimed_at;
         // P2-2：发送前续租（claim token 轮换）——丢失 claim 则跳过（他实例已接管）
-        let Some(token) = renew_claim(pool, id, claimed).await else {
+        let Some(token) = backend.renew(id, claimed).await else {
             continue;
         };
         match notifier.send(&target, &payload).await {
             Ok(()) => {
-                if finish_ok(pool, id, Some(token)).await {
+                if backend.finish_ok(id, Some(token)).await {
                     sent += 1;
                 } else {
                     tracing::warn!(id, "事件完成时 claim token 不符（已被回收重投？）");
@@ -775,7 +871,7 @@ pub async fn process_once(pool: &SqlitePool, notifier: &dyn Notifier) -> (usize,
             Err(f) => {
                 failed += 1;
                 let a = attempts + 1;
-                let wrote = requeue_or_bury(pool, id, Some(token), a, &f, now_s).await;
+                let wrote = backend.requeue_or_bury(id, Some(token), a, &f, now_s).await;
                 if !wrote {
                     tracing::warn!(id, "事件失败回写时 claim token 不符（已被回收重投？）");
                 }
@@ -788,8 +884,24 @@ pub async fn process_once(pool: &SqlitePool, notifier: &dyn Notifier) -> (usize,
     (sent, failed)
 }
 
+/// SQLite 后端入口（集成测试与既有调用方保持原签名）。
+pub async fn process_once(pool: &SqlitePool, notifier: &dyn Notifier) -> (usize, usize) {
+    process_once_backend(EventBackend::Sqlite(pool), notifier).await
+}
+
+impl SqlEventSink {
+    async fn run_once(&self) {
+        let notifier = self.notifier();
+        let backend = match &self.db {
+            Some(db) => EventBackend::new(db),
+            None => EventBackend::Sqlite(self.sqlite()),
+        };
+        process_once_backend(backend, notifier.as_ref()).await;
+    }
+}
+
 /// serve 挂载（`OSS_EVENT_INTERVAL_SECS` 默认 1s；显式 0 = 关闭）。
-pub fn spawn_worker(sink: Arc<SqlEventSink>, pool: SqlitePool) {
+pub fn spawn_worker(sink: Arc<SqlEventSink>) {
     let secs: u64 = std::env::var("OSS_EVENT_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -803,8 +915,7 @@ pub fn spawn_worker(sink: Arc<SqlEventSink>, pool: SqlitePool) {
         t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             t.tick().await;
-            let notifier = sink.notifier();
-            process_once(&pool, notifier.as_ref()).await;
+            sink.run_once().await;
         }
     });
     tracing::info!(interval_secs = secs, "事件 worker 已启动");
@@ -851,6 +962,125 @@ mod tests {
             port: 9000,
             user_agent: "aws-cli/2.0".into(),
         }
+    }
+
+    struct ObjFixture {
+        _dir: tempfile::TempDir,
+        db: Arc<crate::db::Db>,
+    }
+
+    async fn object_db() -> ObjFixture {
+        use xl_store::control_state::root::Mode;
+        use xl_store::store::{Store, StoreConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = StoreConfig::new(dir.path());
+        cfg.fsync = false;
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let object = crate::control_backend::ObjectControl::open(store, Mode::Standalone, None)
+            .await
+            .unwrap();
+        let db = Arc::new(crate::db::Db::connect_object().await.unwrap());
+        db.attach_object_control(object).unwrap();
+        ObjFixture { _dir: dir, db }
+    }
+
+    async fn object_sink(f: &ObjFixture) -> SqlEventSink {
+        f.db.set_bucket_notification(
+            "bkt",
+            r#"[{"id":"a","target":"t1","events":["s3:ObjectCreated:Put"],"prefix":null,"suffix":null}]"#,
+            now(),
+        )
+        .await
+        .unwrap();
+        SqlEventSink::with_db(Arc::clone(&f.db), Arc::new(NoopNotifier))
+    }
+
+    #[tokio::test]
+    async fn object_emit_claim_is_seam_visible_and_exclusive() {
+        let f = object_db().await;
+        let sink = object_sink(&f).await;
+        sink.emit(
+            S3EventOp::CreatedPut,
+            "bkt",
+            "k",
+            Some("v1"),
+            Some(1),
+            Some("e"),
+            src(),
+        )
+        .await;
+        let backend = EventBackend::new(&f.db);
+        let t0 = now();
+        let first = backend.claim(t0).await.unwrap();
+        assert_eq!(
+            first.len(),
+            1,
+            "event must be visible through the object seam"
+        );
+        assert_eq!(first[0].target_id, "t1");
+        assert!(
+            backend.claim(t0).await.unwrap().is_empty(),
+            "a claimed row must be invisible to a second worker"
+        );
+        // 租约过期 → 回收 → 可再次 claim；回收不计 attempts。
+        let later = t0 + EVENT_LEASE_SECS + 1;
+        assert_eq!(backend.reclaim_expired(later).await.unwrap(), 1);
+        let again = backend.claim(later).await.unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].id, first[0].id);
+        assert_eq!(again[0].attempts, 0, "reclaim must not count attempts");
+    }
+
+    #[tokio::test]
+    async fn object_retry_backoff_and_dead_letter() {
+        let f = object_db().await;
+        let sink = object_sink(&f).await;
+        sink.emit(
+            S3EventOp::CreatedPut,
+            "bkt",
+            "k",
+            None,
+            Some(1),
+            Some("e"),
+            src(),
+        )
+        .await;
+        let backend = EventBackend::new(&f.db);
+        let t0 = now();
+        let row = backend.claim(t0).await.unwrap().remove(0);
+        // 可重试错 → pending + 退避（到期前不可 claim）；attempts 由调用方传入。
+        let retry = NotifyFailure::retryable("connection refused");
+        assert!(
+            backend
+                .requeue_or_bury(row.id, row.claimed_at, 2, &retry, t0)
+                .await
+        );
+        assert!(
+            backend.claim(t0 + 1).await.unwrap().is_empty(),
+            "retry_at must gate the next claim"
+        );
+        let due = t0 + backoff_secs(2);
+        let again = backend.claim(due).await.unwrap();
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0].attempts, 2);
+        // 永久错超限 → dead；dead 行不可再 claim，且经 seam 可见。
+        let perm = NotifyFailure::permanent("auth failed");
+        assert!(
+            backend
+                .requeue_or_bury(
+                    again[0].id,
+                    again[0].claimed_at,
+                    MAX_ATTEMPTS + 1,
+                    &perm,
+                    due
+                )
+                .await
+        );
+        assert!(backend.claim(due + 1).await.unwrap().is_empty());
+        let dead = f.db.control_store().dead_events(10).await.unwrap();
+        assert_eq!(dead.len(), 1);
+        assert_eq!(dead[0].attempts, MAX_ATTEMPTS + 1);
+        assert_eq!(dead[0].last_error.as_deref(), Some("auth failed"));
     }
 
     /// 事件 JSON 形状（规格 §11.3 必需字段逐项）。
@@ -1115,18 +1345,19 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let backend = EventBackend::Sqlite(&pool);
         // 续租：正确 token → 新 token；旧 token 再来 → 丢失（None）
-        let t1 = renew_claim(&pool, id, Some(t0)).await.expect("续租应成功");
+        let t1 = backend.renew(id, Some(t0)).await.expect("续租应成功");
         assert!(t1 > t0);
         assert!(
-            renew_claim(&pool, id, Some(t0)).await.is_none(),
+            backend.renew(id, Some(t0)).await.is_none(),
             "旧 token 不得再续"
         );
         // 旧 token 的完成/回写必须 no-op（stale sender 不得复活/删行）
-        assert!(!finish_ok(&pool, id, Some(t0)).await, "旧 token 不得删行");
+        assert!(!backend.finish_ok(id, Some(t0)).await, "旧 token 不得删行");
         let f = NotifyFailure::permanent("denied");
         assert!(
-            !requeue_or_bury(&pool, id, Some(t0), 2, &f, now()).await,
+            !backend.requeue_or_bury(id, Some(t0), 2, &f, now()).await,
             "旧 token 不得回写"
         );
         let (state, attempts): (String, i64) =
@@ -1137,7 +1368,7 @@ mod tests {
                 .unwrap();
         assert_eq!((state.as_str(), attempts), ("sending", 0), "no-op 后行不变");
         // 正确 token 完成 → 删行
-        assert!(finish_ok(&pool, id, Some(t1)).await);
+        assert!(backend.finish_ok(id, Some(t1)).await);
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox")
             .fetch_one(&pool)
             .await

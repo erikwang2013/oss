@@ -5052,7 +5052,7 @@ async fn delete_site(
         Ok(Some(affected)) => {
             for (bucket, key, version_id) in affected {
                 crate::replication::settle_version_after_drop(
-                    state.db.pool(),
+                    &state.db,
                     &state.store,
                     &bucket,
                     &key,
