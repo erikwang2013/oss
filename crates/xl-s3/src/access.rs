@@ -272,6 +272,8 @@ pub trait AuditSink: Send + Sync {
 #[derive(Clone)]
 pub struct Acl {
     pool: SqlitePool,
+    /// 账户硬配额/用量后端（serve 路径由 oss-server 注入；默认 [`crate::account_quota::NoQuota`]）。
+    quota: Arc<dyn crate::account_quota::QuotaBackend>,
     /// 集群控制面扇出（None = 单节点：本地查无即拒，fail-closed 语义不变）
     mesh: Option<ControlMesh>,
     /// M1：匿名拒绝审计限流器（进程级；Clone 共享同一桶）。
@@ -408,28 +410,37 @@ fn view_err(e: xl_store::control_store::ControlError) -> sqlx::Error {
 }
 
 impl Acl {
+    /// 默认无配额后端（测试/离线命令）；serve 路径用 [`Self::with_quota`] 注入。
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
+            quota: Arc::new(crate::account_quota::NoQuota),
             mesh: None,
             anon_deny: Arc::new(AnonDenyLimiter::new()),
             audit: None,
         }
     }
 
-    /// 硬配额记账/采样复用同一控制库连接池（同 crate 服务层）。
-    pub(crate) fn pool(&self) -> &SqlitePool {
-        &self.pool
-    }
-
     /// 集群形态（Task 9）：读路径本地 miss → peers 扇出（写入仍只落本节点；强一致归 M9）。
     pub fn with_mesh(pool: SqlitePool, mesh: Option<ControlMesh>) -> Self {
         Self {
             pool,
+            quota: Arc::new(crate::account_quota::NoQuota),
             mesh,
             anon_deny: Arc::new(AnonDenyLimiter::new()),
             audit: None,
         }
+    }
+
+    /// 注入账户硬配额后端（SQLite 本地缓存或对象后端复制账本）。
+    pub fn with_quota(mut self, quota: Arc<dyn crate::account_quota::QuotaBackend>) -> Self {
+        self.quota = quota;
+        self
+    }
+
+    /// S3 服务层取配额后端（不暴露控制库连接）。
+    pub(crate) fn quota(&self) -> &dyn crate::account_quota::QuotaBackend {
+        self.quota.as_ref()
     }
 
     /// 注入异步审计接收方（serve 路径）；None = 保持同步直写。
@@ -1277,15 +1288,15 @@ impl Acl {
         Ok(names)
     }
 
-    /// 桶主账户硬配额（E1）：请求视图存在时读视图；否则走本地 `account_usage` 缓存路径。
+    /// 桶主账户硬配额（E1）：由注入的配额后端负责请求视图/本地缓存选择。
     pub async fn account_quota_for_bucket(
         &self,
         bucket: &str,
     ) -> Result<Option<crate::account_quota::AccountQuota>, sqlx::Error> {
-        if let Some(v) = request_view() {
-            return v.account_quota_for_bucket(bucket).await.map_err(view_err);
-        }
-        crate::account_quota::account_for_bucket(&self.pool, bucket).await
+        self.quota
+            .account_quota_for_bucket(bucket)
+            .await
+            .map_err(view_err)
     }
 
     /// 桶归属登记（历史形态，无 set；幂等——已存在不覆盖，测试钉）。

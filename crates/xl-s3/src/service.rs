@@ -273,23 +273,11 @@ impl OssS3 {
                 }
             };
         }
-        // E1：对象后端已视图化配额*配置*，但用量账本写仍是 SQLite 本地缓存（D4）。
-        // 有硬配额时 fail-closed，绝不静默落到占位库。
-        if crate::control::request_view().is_some() {
-            tracing::error!(
-                account = %quota.account,
-                "control_backend=objects：硬配额用量记账尚未迁移（D4）"
-            );
-            return Err(s3s::s3_error!(InternalError, "internal error"));
-        }
-        match crate::account_quota::admit(
-            self.acl.pool(),
-            &self.store,
-            quota,
-            delta_bytes,
-            delta_objects,
-        )
-        .await
+        match self
+            .acl
+            .quota()
+            .admit(&self.store, quota, delta_bytes, delta_objects)
+            .await
         {
             Ok(Ok(())) => Ok(()),
             Ok(Err(denied)) => Err(s3s::s3_error!(AccessDenied, "{}", denied)),
@@ -309,12 +297,7 @@ impl OssS3 {
             }
             return;
         }
-        // 对象后端：本地 account_usage 缓存不存在（用量账本归 D4），无可修正。
-        if crate::control::request_view().is_some() {
-            return;
-        }
-        if let Err(e) = crate::account_quota::adjust(self.acl.pool(), account, bytes, objects).await
-        {
+        if let Err(e) = self.acl.quota().adjust(account, bytes, objects).await {
             tracing::warn!(error = %e, account, "账户用量修正失败（等待采样器）");
         }
     }

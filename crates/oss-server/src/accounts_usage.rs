@@ -24,12 +24,12 @@ use crate::state::AppState;
 /// 硬配额用量采样间隔：跨节点缓存的最大陈旧度（另有写入路径 30s 惰性刷新兜底）。
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// serve worker：本节点周期重算配置了硬配额的账户用量（每节点各持本地缓存）。
+/// serve worker：周期重算配置了硬配额的账户用量（SQLite = 本地缓存；对象后端 = 账本）。
 pub(crate) fn spawn_sampler(state: AppState) {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = xl_s3::account_quota::refresh_all(state.db.pool(), &state.store).await {
-                tracing::warn!(error = %e, "账户硬配额用量采样失败（保留旧缓存）");
+            if let Err(e) = state.quota.refresh_all(&state.store).await {
+                tracing::warn!(error = %e, "账户硬配额用量采样失败（保留旧缓存/账本）");
             }
             tokio::time::sleep(SAMPLE_INTERVAL).await;
         }
@@ -177,6 +177,33 @@ pub(crate) async fn set_hard_quota(
     let Some(object_quota) = optional_limit(&body.object_quota) else {
         return bad("object_quota 必须 >= 0 或 null");
     };
+    // 对象后端：账户行写入走根 CAS（ControlPlane::Local 的 SQLite apply 不适用）。
+    if state.db.control_backend() == crate::config::ControlBackend::Objects {
+        let id_owned = id.clone();
+        let r = state
+            .db
+            .control_write("console", move |txn| {
+                let id = id_owned.clone();
+                Box::pin(async move {
+                    txn.account_set_hard_limits(
+                        &id,
+                        hard_byte_quota,
+                        object_quota,
+                        crate::db::now(),
+                    )
+                    .await
+                })
+            })
+            .await;
+        return match r {
+            Ok(true) => StatusCode::NO_CONTENT.into_response(),
+            Ok(false) => StatusCode::NOT_FOUND.into_response(),
+            Err(e) => {
+                tracing::error!(error = %e, "硬配额更新失败");
+                internal_error()
+            }
+        };
+    }
     control_write_status(
         state
             .control

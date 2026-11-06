@@ -552,7 +552,7 @@ impl xl_s3::account_quota::ClusterQuota for ControlPlane {
         objects: i64,
     ) -> Result<(), xl_s3::account_quota::ClusterQuotaError> {
         let (baseline_bytes, baseline_objects) =
-            xl_s3::account_quota::usage_baseline(self.db.pool(), account).await;
+            crate::quota::usage_baseline(&self.db, account).await;
         ledger_result(
             self.write(ControlCommand::AccountUsageReserve {
                 account: account.into(),
@@ -572,7 +572,7 @@ impl xl_s3::account_quota::ClusterQuota for ControlPlane {
         objects: i64,
     ) -> Result<(), xl_s3::account_quota::ClusterQuotaError> {
         let (baseline_bytes, baseline_objects) =
-            xl_s3::account_quota::usage_baseline(self.db.pool(), account).await;
+            crate::quota::usage_baseline(&self.db, account).await;
         ledger_result(
             self.write(ControlCommand::AccountUsageRelease {
                 account: account.into(),
@@ -592,7 +592,7 @@ impl xl_s3::account_quota::ClusterQuota for ControlPlane {
         objects: i64,
     ) -> Result<(), xl_s3::account_quota::ClusterQuotaError> {
         let (baseline_bytes, baseline_objects) =
-            xl_s3::account_quota::usage_baseline(self.db.pool(), account).await;
+            crate::quota::usage_baseline(&self.db, account).await;
         ledger_result(
             self.write(ControlCommand::AccountUsageAdjust {
                 account: account.into(),

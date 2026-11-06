@@ -198,7 +198,14 @@ pub(crate) async fn bucket_accounts(
         let Some(uid) = bucket_owner_uid(txn, &parse_bucket(&value)?).await? else {
             continue;
         };
-        let name = String::from_utf8(key).map_err(backend)?;
+        // 表键是 `component` 编码（`name\0\0`）；S3 桶名不含 NUL，去掉终止符即原名。
+        // 兼容测试夹具直接写入的裸键（无终止符）。
+        let name = key
+            .strip_suffix(&[0, 0])
+            .and_then(|k| std::str::from_utf8(k).ok())
+            .or_else(|| std::str::from_utf8(&key).ok())
+            .ok_or_else(|| backend("bad buckets key"))?
+            .to_owned();
         let account = members
             .get(&uid)
             .cloned()

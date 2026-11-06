@@ -78,6 +78,8 @@ pub struct AppState {
     pub inventory_runner: Arc<crate::inventory::InventoryRunner>,
     /// M9 S6：控制写门面（Local = M7/standalone；Raft = `[raft]`）。S6b-d 的路由唯一入口。
     pub control: Arc<crate::raft::control::ControlPlane>,
+    /// AC-3/AC-4：账户硬配额读写（SQLite 本地缓存 / 对象后端复制账本）。
+    pub quota: Arc<dyn xl_s3::account_quota::QuotaBackend>,
     /// M8-2：作业运行态写入门面（Raft 且 feature≥4 时行经复制日志；否则本地直写）。
     pub jobs: Arc<crate::job_state::JobState>,
     /// M9 S7.1：Raft 句柄（路由/状态共用；无 `[raft]` = None）。
@@ -838,7 +840,8 @@ impl AppState {
 
     /// 三面共用的判权实例（Task 9：集群时自动带读扇出；SQL 唯一事实源在 xl-s3::Acl）。
     pub fn acl(&self) -> xl_s3::access::Acl {
-        let acl = xl_s3::access::Acl::with_mesh(self.db.pool().clone(), self.control_mesh());
+        let acl = xl_s3::access::Acl::with_mesh(self.db.pool().clone(), self.control_mesh())
+            .with_quota(Arc::clone(&self.quota));
         let sink = self
             .audit
             .clone()
@@ -1118,6 +1121,7 @@ impl AppState {
             None => None,
         };
         let control_view = db.object_control().map(|object| Arc::clone(&object.view));
+        let quota = crate::quota::for_db(&db);
         let cfg = Arc::new(cfg);
         let ingest = Arc::new(crate::aether::IngestSink {
             store: Arc::clone(&store),
@@ -1160,6 +1164,7 @@ impl AppState {
             inventory,
             inventory_runner,
             control,
+            quota,
             jobs,
             raft,
             admin_username,

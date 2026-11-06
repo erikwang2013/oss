@@ -141,10 +141,12 @@ pub fn build_router_with_trust(
     // Task 9：集群时 Acl/SigV4Auth 接控制面读扇出（本地 miss → peers；写仍本地，M9 收口）
     let acl = state.acl();
     // strict：硬配额走复制账本（Local 控制面在 standalone 下同样走账本表）。
-    let cluster_quota = state
-        .cfg
-        .quota
-        .strict
+    // 对象后端 standalone 没有 SQLite 账本表：QuotaBackend 直接读/写根账本，
+    // 此时不能再注入 `ControlPlane`（其 Local apply 走占位库）。对象 + raft 仍走
+    // 复制命令（账本经对象状态机 apply）。
+    let object_standalone = state.db.control_backend() == crate::config::ControlBackend::Objects
+        && !state.control.is_raft();
+    let cluster_quota = (state.cfg.quota.strict && !object_standalone)
         .then(|| Arc::clone(&state.control) as Arc<dyn xl_s3::account_quota::ClusterQuota>);
     let oss_s3 = OssS3::new(
         Arc::clone(&state.store),
