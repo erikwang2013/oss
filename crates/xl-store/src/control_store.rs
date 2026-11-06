@@ -201,6 +201,15 @@ pub trait ControlTxn:
         &mut self,
         bucket: &str,
     ) -> Result<(), ControlError>;
+
+    /// `schema_meta` 等价物（对象后端：根 `meta.markers`）无条件 upsert。
+    async fn schema_meta_set(&mut self, key: &str, value: &str) -> Result<(), ControlError>;
+    /// 仅 key 不存在时写入；返回是否写入。
+    async fn schema_meta_set_if_absent(
+        &mut self,
+        key: &str,
+        value: &str,
+    ) -> Result<bool, ControlError>;
 }
 
 #[cfg(test)]

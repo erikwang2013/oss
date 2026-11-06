@@ -239,4 +239,102 @@ impl BucketTxn for ObjectControlTxn {
         }
         Ok(())
     }
+
+    async fn bucket_clear_owner(&mut self, uid: i64) -> CResult<()> {
+        bucket_clear_owner(self, uid).await
+    }
+
+    async fn bucket_insert_ignore(
+        &mut self,
+        name: &str,
+        owner_id: Option<i64>,
+        set_id: i64,
+        replication_mode: &str,
+        creation_date: i64,
+    ) -> CResult<()> {
+        if get_bucket(self, name).await?.is_some() {
+            return Ok(());
+        }
+        let row = BucketRow {
+            name: name.into(),
+            owner_uid: owner_id,
+            set_id,
+            creation_date,
+            versioning: "Off".into(),
+            object_lock: false,
+            default_encryption: None,
+            object_lock_default_mode: None,
+            object_lock_default_days: None,
+            replication_mode: replication_mode.into(),
+            deleting: false,
+        };
+        put_bucket(self, &row).await
+    }
+
+    async fn bucket_upsert_owner_set_mode(
+        &mut self,
+        name: &str,
+        owner_id: Option<i64>,
+        set_id: i64,
+        replication_mode: &str,
+        creation_date: i64,
+    ) -> CResult<()> {
+        let mut row = match get_bucket(self, name).await? {
+            Some(row) => row,
+            None => BucketRow {
+                name: name.into(),
+                owner_uid: owner_id,
+                set_id,
+                creation_date,
+                versioning: "Off".into(),
+                object_lock: false,
+                default_encryption: None,
+                object_lock_default_mode: None,
+                object_lock_default_days: None,
+                replication_mode: replication_mode.into(),
+                deleting: false,
+            },
+        };
+        // ON CONFLICT 全列重置（creation_date 保留首建）。
+        row.owner_uid = owner_id;
+        row.set_id = set_id;
+        row.versioning = if replication_mode == "sync" {
+            "Enabled".into()
+        } else {
+            "Off".into()
+        };
+        row.object_lock = false;
+        row.object_lock_default_mode = None;
+        row.object_lock_default_days = None;
+        row.default_encryption = None;
+        row.replication_mode = replication_mode.into();
+        row.deleting = false;
+        put_bucket(self, &row).await
+    }
+
+    async fn bucket_upsert_set(
+        &mut self,
+        name: &str,
+        set_id: i64,
+        creation_date: i64,
+    ) -> CResult<()> {
+        let mut row = match get_bucket(self, name).await? {
+            Some(row) => row,
+            None => BucketRow {
+                name: name.into(),
+                owner_uid: None,
+                set_id,
+                creation_date,
+                versioning: "Off".into(),
+                object_lock: false,
+                default_encryption: None,
+                object_lock_default_mode: None,
+                object_lock_default_days: None,
+                replication_mode: "async".into(),
+                deleting: false,
+            },
+        };
+        row.set_id = set_id;
+        put_bucket(self, &row).await
+    }
 }

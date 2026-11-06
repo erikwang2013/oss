@@ -120,4 +120,21 @@ impl ControlTxn for ObjectControlTxn {
     ) -> Result<(), ControlError> {
         BucketDomainCleanup::delete_lifecycle_inventory_tier_for_bucket(self, bucket).await
     }
+
+    async fn schema_meta_set(&mut self, key: &str, value: &str) -> Result<(), ControlError> {
+        self.set_marker(key, value);
+        Ok(())
+    }
+
+    async fn schema_meta_set_if_absent(
+        &mut self,
+        key: &str,
+        value: &str,
+    ) -> Result<bool, ControlError> {
+        if self.meta().markers.contains_key(key) {
+            return Ok(false);
+        }
+        self.set_marker(key, value);
+        Ok(true)
+    }
 }

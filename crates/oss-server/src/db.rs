@@ -547,6 +547,17 @@ impl Db {
     /// 仅在 key 不存在时写入（首启身份持久化；返回是否写入）。
     /// S7.5：无条件写 `schema_meta`（cutover/force-recover 标记）。
     pub async fn schema_meta_set(&self, key: &str, value: &str) -> Result<()> {
+        if self.object.get().is_some() {
+            let key = key.to_owned();
+            let value = value.to_owned();
+            return self
+                .control_write("schema-meta", move |txn| {
+                    let key = key.clone();
+                    let value = value.clone();
+                    Box::pin(async move { txn.schema_meta_set(&key, &value).await })
+                })
+                .await;
+        }
         sqlx::query(
             "INSERT INTO schema_meta (key, value) VALUES (?, ?) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -559,6 +570,17 @@ impl Db {
     }
 
     pub async fn schema_meta_set_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        if self.object.get().is_some() {
+            let key = key.to_owned();
+            let value = value.to_owned();
+            return self
+                .control_write("schema-meta", move |txn| {
+                    let key = key.clone();
+                    let value = value.clone();
+                    Box::pin(async move { txn.schema_meta_set_if_absent(&key, &value).await })
+                })
+                .await;
+        }
         let res = sqlx::query("INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, ?)")
             .bind(key)
             .bind(value)
@@ -569,6 +591,17 @@ impl Db {
 
     /// 无条件写 `schema_meta`（Raft 身份状态：initialize 后置 1 等）。
     pub async fn upsert_schema_meta(&self, key: &str, value: &str) -> Result<()> {
+        if self.object.get().is_some() {
+            let key = key.to_owned();
+            let value = value.to_owned();
+            return self
+                .control_write("schema-meta", move |txn| {
+                    let key = key.clone();
+                    let value = value.clone();
+                    Box::pin(async move { txn.schema_meta_set(&key, &value).await })
+                })
+                .await;
+        }
         sqlx::query(
             "INSERT INTO schema_meta (key, value) VALUES (?, ?) \
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1789,7 +1822,17 @@ impl Db {
         {
             return Ok(None);
         }
-        if legacy && !self.raft_mode() {
+        // 对象根的 `mode` 与 SQLite 的 raft_mode 同义：Raft 下各站点盐不同，禁止本地升级。
+        let object_raft = match self.object.get() {
+            Some(object) => object
+                .control
+                .pin()
+                .await
+                .map(|p| p.root.meta.mode == xl_store::control_state::root::Mode::Raft)
+                .unwrap_or(false),
+            None => false,
+        };
+        if legacy && !self.raft_mode() && !object_raft {
             // 透明升级（失败只 warn：本次登录已成功，下次再来）。
             // Raft 模式：随机盐会让各站点写出的 hash 不同 → 禁止本地写，只验通过。
             // 哈希同样走阻塞池 + 并发闸（旧哈希账户登录频率低，但不应占 tokio worker）。
@@ -1802,11 +1845,23 @@ impl Db {
                 }
             };
             let upgrade = async {
+                if self.object.get().is_some() {
+                    let upgraded = upgraded.clone();
+                    return self
+                        .control_write("login-upgrade", move |txn| {
+                            let upgraded = upgraded.clone();
+                            Box::pin(async move {
+                                txn.user_set_password(id, &upgraded).await.map(|_| ())
+                            })
+                        })
+                        .await;
+                }
                 let mut conn = self.pool.acquire().await?;
                 crate::control_store::SqliteControlTxn::new(&mut conn)
                     .user_set_password(id, &upgraded)
                     .await
                     .map_err(crate::control_store::to_sqlx)
+                    .map(|_| ())
             }
             .await;
             if let Err(e) = upgrade {
@@ -1817,6 +1872,19 @@ impl Db {
     }
 
     pub async fn create_access_key(&self, ak: &str, sk: &str, user_id: i64) -> Result<()> {
+        if self.object.get().is_some() {
+            let ak = ak.to_owned();
+            let sk = sk.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let ak = ak.clone();
+                    let sk = sk.clone();
+                    Box::pin(
+                        async move { txn.access_key_create_legacy(&ak, &sk, user_id, now()).await },
+                    )
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         crate::control_store::SqliteControlTxn::new(&mut conn)
             .access_key_create_legacy(ak, sk, user_id, now())
@@ -1859,6 +1927,27 @@ impl Db {
         set: u16,
         replication_mode: &str,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let name = name.to_owned();
+            let replication_mode = replication_mode.to_owned();
+            let creation_date = now();
+            return self
+                .control_write("bucket-row", move |txn| {
+                    let name = name.clone();
+                    let replication_mode = replication_mode.clone();
+                    Box::pin(async move {
+                        txn.bucket_insert_ignore(
+                            &name,
+                            owner_id,
+                            set as i64,
+                            &replication_mode,
+                            creation_date,
+                        )
+                        .await
+                    })
+                })
+                .await;
+        }
         sqlx::query(
             "INSERT OR IGNORE INTO buckets \
              (name, owner_id, creation_date, versioning, set_id, object_lock, \
@@ -1901,6 +1990,34 @@ impl Db {
         set: u16,
         replication_mode: &str,
     ) -> Result<BucketRowOutcome> {
+        if self.object.get().is_some() {
+            let name = name.to_owned();
+            let replication_mode = replication_mode.to_owned();
+            let creation_date = now();
+            return self
+                .control_write("console", move |txn| {
+                    let name = name.clone();
+                    let replication_mode = replication_mode.clone();
+                    Box::pin(async move {
+                        // 新建行才判配额；已存在行是重建收敛（桶数不变）。
+                        if !txn.bucket_exists(&name).await?
+                            && txn.bucket_quota_reached(owner_id).await?
+                        {
+                            return Ok(BucketRowOutcome::QuotaExceeded);
+                        }
+                        txn.bucket_upsert_owner_set_mode(
+                            &name,
+                            owner_id,
+                            set as i64,
+                            &replication_mode,
+                            creation_date,
+                        )
+                        .await?;
+                        Ok(BucketRowOutcome::Written)
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM buckets WHERE name = ?")
             .bind(name)
@@ -1977,6 +2094,17 @@ impl Db {
 
     /// M9 S3：删桶 quiesce 标志（S6 起改由 Raft `SetBucketDeleting` 命令承载）。
     pub async fn set_bucket_deleting(&self, name: &str, deleting: bool) -> Result<()> {
+        if self.object.get().is_some() {
+            let name = name.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let name = name.clone();
+                    Box::pin(
+                        async move { txn.bucket_set_deleting(&name, deleting).await.map(|_| ()) },
+                    )
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .bucket_set_deleting(name, deleting)
@@ -2007,6 +2135,19 @@ impl Db {
     /// 陈旧行会把旧值原样写回，收敛不成立——verifier 高 2）。
     // shortcut: 启动回填/set 指派/配额 BEGIN IMMEDIATE 属本地路由与 Slice 5 账户配额职责，最终 set 路由迁移时改走 seam。
     pub async fn upsert_bucket_set(&self, name: &str, set: u16) -> Result<()> {
+        if self.object.get().is_some() {
+            let name = name.to_owned();
+            let creation_date = now();
+            return self
+                .control_write("bucket-row", move |txn| {
+                    let name = name.clone();
+                    Box::pin(async move {
+                        txn.bucket_upsert_set(&name, set as i64, creation_date)
+                            .await
+                    })
+                })
+                .await;
+        }
         sqlx::query(
             "INSERT INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, NULL, ?, ?) \
              ON CONFLICT(name) DO UPDATE SET set_id = excluded.set_id",
@@ -2323,6 +2464,13 @@ impl Db {
     /// 非管理员恒可停；管理员仅在「当前在册管理员 > 1」时可停——子查询与写入同语句，
     /// SQLite 写锁串行化下天然防 TOCTOU。启用无锁死风险，走普通 UPDATE。
     pub async fn set_user_status(&self, uid: i64, active: bool) -> Result<bool> {
+        if self.object.get().is_some() {
+            return self
+                .control_write("console", move |txn| {
+                    Box::pin(async move { txn.user_set_status(uid, active).await })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         crate::control_store::SqliteControlTxn::new(&mut conn)
             .user_set_status(uid, active)
@@ -2373,9 +2521,18 @@ impl Db {
 
     /// 改口令。返回是否有该用户。
     pub async fn set_password(&self, uid: i64, password: &str) -> Result<bool> {
+        let hash = crate::db::hash_password(password);
+        if self.object.get().is_some() {
+            return self
+                .control_write("console", move |txn| {
+                    let hash = hash.clone();
+                    Box::pin(async move { txn.user_set_password(uid, &hash).await })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         crate::control_store::SqliteControlTxn::new(&mut conn)
-            .user_set_password(uid, &crate::db::hash_password(password))
+            .user_set_password(uid, &hash)
             .await
             .map_err(crate::control_store::to_sqlx)
     }
@@ -2388,6 +2545,33 @@ impl Db {
     /// （`UPDATE users SET id=id WHERE …`），既取写锁串行化并发删除/停用，又在同一语句里
     /// 完成判定——通过才继续级联；不通过直接返回 false，一个字节都不改。
     pub async fn delete_user(&self, uid: i64) -> Result<bool> {
+        if self.object.get().is_some() {
+            let deleted = self
+                .control_write("console", move |txn| {
+                    Box::pin(async move {
+                        if !txn.user_delete_guard(uid).await? {
+                            return Ok(false);
+                        }
+                        txn.user_delete_access_keys_permissions(uid).await?;
+                        txn.bucket_clear_owner(uid).await?;
+                        txn.user_delete(uid).await?;
+                        Ok(true)
+                    })
+                })
+                .await?;
+            // 本地上传属主是节点本地域，不能进根 CAS（D3）：CAS 成功后清，失败下次对账。
+            if deleted && let Ok(uploads) = self.object_uploads() {
+                for mut record in uploads.all().unwrap_or_default() {
+                    if record.owner_uid == Some(uid) {
+                        record.owner_uid = None;
+                        if let Err(e) = uploads.put(&record) {
+                            tracing::warn!(error = %e, "清本地上传属主失败（下次启动对账）");
+                        }
+                    }
+                }
+            }
+            return Ok(deleted);
+        }
         let mut tx = self.pool.begin().await?;
         let gate = crate::control_store::SqliteControlTxn::new(&mut tx)
             .user_delete_guard(uid)
@@ -2601,6 +2785,18 @@ impl Db {
         hard_byte_quota: Option<i64>,
         object_quota: Option<i64>,
     ) -> Result<bool> {
+        if self.object.get().is_some() {
+            let id = id.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let id = id.clone();
+                    Box::pin(async move {
+                        txn.account_set_hard_limits(&id, hard_byte_quota, object_quota, now())
+                            .await
+                    })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         crate::control_store::SqliteControlTxn::new(&mut conn)
             .account_set_hard_limits(id, hard_byte_quota, object_quota, now())
@@ -2727,6 +2923,30 @@ impl Db {
     /// 新建账户。id 为 12 位随机数（与派生账户空间重叠概率可忽略，冲突重试）。
     pub async fn create_account(&self, name: &str, bucket_quota: Option<i64>) -> Result<String> {
         let ts = now();
+        if self.object.get().is_some() {
+            let name = name.to_owned();
+            for _ in 0..8 {
+                let id = crate::accounts_support::new_account_id();
+                let insert_id = id.clone();
+                let name = name.clone();
+                let inserted = self
+                    .control_write("console", move |txn| {
+                        let id = insert_id.clone();
+                        let name = name.clone();
+                        Box::pin(async move {
+                            txn.account_insert_if_absent(&id, &name, bucket_quota, ts, ts)
+                                .await
+                        })
+                    })
+                    .await?;
+                if inserted {
+                    return Ok(id);
+                }
+            }
+            return Err(sqlx::Error::Protocol(
+                "account id generation collision (retry)".into(),
+            ));
+        }
         let mut conn = self.pool.acquire().await?;
         for _ in 0..8 {
             // random() 是有符号 64 位：先掩掉符号位再取模，否则 % 保留负号会生成负 id。
@@ -2749,6 +2969,17 @@ impl Db {
     }
 
     pub async fn rename_account(&self, id: &str, name: &str) -> Result<bool> {
+        if self.object.get().is_some() {
+            let id = id.to_owned();
+            let name = name.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let id = id.clone();
+                    let name = name.clone();
+                    Box::pin(async move { txn.account_set_name(&id, &name, now()).await })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         crate::control_store::SqliteControlTxn::new(&mut conn)
             .account_set_name(id, name, now())
@@ -2759,6 +2990,17 @@ impl Db {
     /// 启停账户。停用是原子条件更新：账户里还有在册全局管理员时拒绝
     /// （否则该管理员会随账户一起被锁死，且可能锁死最后一个管理员）。
     pub async fn set_account_status(&self, id: &str, status: &str) -> Result<bool> {
+        if self.object.get().is_some() {
+            let id = id.to_owned();
+            let status = status.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let id = id.clone();
+                    let status = status.clone();
+                    Box::pin(async move { txn.account_set_status(&id, &status, now()).await })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         crate::control_store::SqliteControlTxn::new(&mut conn)
             .account_set_status(id, status, now())
@@ -2767,6 +3009,15 @@ impl Db {
     }
 
     pub async fn set_account_quota(&self, id: &str, quota: Option<i64>) -> Result<bool> {
+        if self.object.get().is_some() {
+            let id = id.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let id = id.clone();
+                    Box::pin(async move { txn.account_set_bucket_quota(&id, quota, now()).await })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         crate::control_store::SqliteControlTxn::new(&mut conn)
             .account_set_bucket_quota(id, quota, now())
@@ -2779,6 +3030,22 @@ impl Db {
     pub async fn delete_account(&self, id: &str) -> Result<bool> {
         if id == xl_s3::access::LEGACY_ACCOUNT {
             return Ok(false);
+        }
+        if self.object.get().is_some() {
+            let id = id.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let id = id.clone();
+                    Box::pin(async move {
+                        let members = txn.account_member_count(&id).await?;
+                        let buckets = txn.account_bucket_count(&id).await?;
+                        if members != 0 || buckets != 0 {
+                            return Ok(false);
+                        }
+                        txn.account_delete(&id).await
+                    })
+                })
+                .await;
         }
         let mut tx = self.pool.begin().await?;
         let deleted = {
@@ -2837,6 +3104,27 @@ impl Db {
         uid: i64,
         role: &str,
     ) -> Result<bool> {
+        if self.object.get().is_some() {
+            let account_id = account_id.to_owned();
+            let role = role.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let account_id = account_id.clone();
+                    let role = role.clone();
+                    Box::pin(async move {
+                        if !txn.user_non_admin_exists(uid).await? {
+                            return Ok(false);
+                        }
+                        txn.account_member_upsert(&account_id, uid, &role, now())
+                            .await?;
+                        if role == "admin" {
+                            txn.account_set_admin_if_unset(&account_id, uid).await?;
+                        }
+                        Ok(true)
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         {
             let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
@@ -2869,6 +3157,29 @@ impl Db {
         password: &str,
         role: &str,
     ) -> Result<i64> {
+        let ts = now();
+        if self.object.get().is_some() {
+            let account_id = account_id.to_owned();
+            let username = username.to_owned();
+            let role = role.to_owned();
+            let hash = crate::db::hash_password(password);
+            return self
+                .control_write("console", move |txn| {
+                    let account_id = account_id.clone();
+                    let username = username.clone();
+                    let role = role.clone();
+                    let hash = hash.clone();
+                    Box::pin(async move {
+                        let uid = txn
+                            .user_create_default_status(&username, &hash, false, ts)
+                            .await?;
+                        txn.account_member_insert(&account_id, uid, &role, ts)
+                            .await?;
+                        Ok(uid)
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let ts = now();
         let uid = {
@@ -6815,7 +7126,7 @@ impl Db {
     /// 审计查询（控制台；可选 decision/时间窗/uid/op/bucket/key 前缀过滤；最新在前）。
     /// 动态 WHERE 只拼**固定片段**，用户值一律绑定参数。
     pub async fn list_audit(&self, f: &AuditFilter<'_>) -> Result<Vec<serde_json::Value>> {
-        use xl_store::control_store::audit::{AuditQuery, AuditStore};
+        use xl_store::control_store::audit::AuditQuery;
 
         let query = AuditQuery {
             limit: f.limit,
@@ -6827,7 +7138,8 @@ impl Db {
             bucket: f.bucket.map(str::to_owned),
             key_prefix: f.key_prefix.map(str::to_owned),
         };
-        let rows = crate::control_store::SqliteControlStore::new(self.pool.clone())
+        let rows = self
+            .control_store()
             .audit_page(&query)
             .await
             .map_err(crate::control_store::to_sqlx)?;

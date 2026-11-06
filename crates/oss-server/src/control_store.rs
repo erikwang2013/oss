@@ -441,6 +441,33 @@ impl ControlTxn for SqliteControlTxn<'_> {
     ) -> Result<(), ControlError> {
         delete_lifecycle_inventory_tier_for_bucket(self, bucket).await
     }
+
+    async fn schema_meta_set(&mut self, key: &str, value: &str) -> Result<(), ControlError> {
+        sqlx::query(
+            "INSERT INTO schema_meta (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&mut *self.conn)
+        .await
+        .map_err(backend)?;
+        Ok(())
+    }
+
+    async fn schema_meta_set_if_absent(
+        &mut self,
+        key: &str,
+        value: &str,
+    ) -> Result<bool, ControlError> {
+        let res = sqlx::query("INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, ?)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *self.conn)
+            .await
+            .map_err(backend)?;
+        Ok(res.rows_affected() > 0)
+    }
 }
 
 #[async_trait::async_trait]
@@ -859,6 +886,57 @@ impl BucketTxn for SqliteControlTxn<'_> {
 
     async fn delete_bucket_configs_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError> {
         bucket_write::delete_bucket_configs_for_bucket(self, bucket).await
+    }
+
+    async fn bucket_clear_owner(&mut self, uid: i64) -> Result<(), ControlError> {
+        bucket_write::bucket_clear_owner(self, uid).await
+    }
+
+    async fn bucket_insert_ignore(
+        &mut self,
+        name: &str,
+        owner_id: Option<i64>,
+        set_id: i64,
+        replication_mode: &str,
+        creation_date: i64,
+    ) -> Result<(), ControlError> {
+        bucket_write::bucket_insert_ignore(
+            self,
+            name,
+            owner_id,
+            set_id,
+            replication_mode,
+            creation_date,
+        )
+        .await
+    }
+
+    async fn bucket_upsert_owner_set_mode(
+        &mut self,
+        name: &str,
+        owner_id: Option<i64>,
+        set_id: i64,
+        replication_mode: &str,
+        creation_date: i64,
+    ) -> Result<(), ControlError> {
+        bucket_write::bucket_upsert_owner_set_mode(
+            self,
+            name,
+            owner_id,
+            set_id,
+            replication_mode,
+            creation_date,
+        )
+        .await
+    }
+
+    async fn bucket_upsert_set(
+        &mut self,
+        name: &str,
+        set_id: i64,
+        creation_date: i64,
+    ) -> Result<(), ControlError> {
+        bucket_write::bucket_upsert_set(self, name, set_id, creation_date).await
     }
 }
 

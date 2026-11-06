@@ -153,6 +153,33 @@ pub trait BucketTxn: Send {
     async fn bucket_exists(&mut self, name: &str) -> Result<bool, ControlError>;
     /// 删该桶的策略/事件/复制规则（桶删除级联）。
     async fn delete_bucket_configs_for_bucket(&mut self, bucket: &str) -> Result<(), ControlError>;
+    /// 用户删除级联：该用户拥有的桶 `owner_id` 置 NULL（记录保留）。
+    async fn bucket_clear_owner(&mut self, uid: i64) -> Result<(), ControlError>;
+    /// 建桶行：已存在不覆盖（`INSERT OR IGNORE`），`set_id` 是本地路由列。
+    async fn bucket_insert_ignore(
+        &mut self,
+        name: &str,
+        owner_id: Option<i64>,
+        set_id: i64,
+        replication_mode: &str,
+        creation_date: i64,
+    ) -> Result<(), ControlError>;
+    /// 建桶行**覆盖**语义：同名行全列重置（`creation_date` 保留首建）。
+    async fn bucket_upsert_owner_set_mode(
+        &mut self,
+        name: &str,
+        owner_id: Option<i64>,
+        set_id: i64,
+        replication_mode: &str,
+        creation_date: i64,
+    ) -> Result<(), ControlError>;
+    /// 仅收敛已有行的 `set_id`；缺行时插入 owner NULL 的新行。
+    async fn bucket_upsert_set(
+        &mut self,
+        name: &str,
+        set_id: i64,
+        creation_date: i64,
+    ) -> Result<(), ControlError>;
 }
 
 /// 快照导出/安装（调用方事务内）。

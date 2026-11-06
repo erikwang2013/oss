@@ -320,6 +320,102 @@ pub(super) async fn delete_bucket_configs_for_bucket(
     Ok(())
 }
 
+pub(super) async fn bucket_clear_owner(
+    txn: &mut SqliteControlTxn<'_>,
+    uid: i64,
+) -> Result<(), ControlError> {
+    sqlx::query("UPDATE buckets SET owner_id = NULL WHERE owner_id = ?")
+        .bind(uid)
+        .execute(&mut *txn.conn)
+        .await
+        .map_err(backend)?;
+    Ok(())
+}
+
+pub(super) async fn bucket_insert_ignore(
+    txn: &mut SqliteControlTxn<'_>,
+    name: &str,
+    owner_id: Option<i64>,
+    set_id: i64,
+    replication_mode: &str,
+    creation_date: i64,
+) -> Result<(), ControlError> {
+    sqlx::query(
+        "INSERT OR IGNORE INTO buckets \
+         (name, owner_id, creation_date, versioning, set_id, object_lock, \
+          object_lock_default_mode, object_lock_default_days, default_encryption, \
+          replication_mode, deleting) \
+         VALUES (?, ?, ?, 'Off', ?, 0, NULL, NULL, NULL, ?, 0)",
+    )
+    .bind(name)
+    .bind(owner_id)
+    .bind(creation_date)
+    .bind(set_id)
+    .bind(replication_mode)
+    .execute(&mut *txn.conn)
+    .await
+    .map_err(backend)?;
+    Ok(())
+}
+
+pub(super) async fn bucket_upsert_owner_set_mode(
+    txn: &mut SqliteControlTxn<'_>,
+    name: &str,
+    owner_id: Option<i64>,
+    set_id: i64,
+    replication_mode: &str,
+    creation_date: i64,
+) -> Result<(), ControlError> {
+    sqlx::query(
+        "INSERT INTO buckets \
+         (name, owner_id, creation_date, versioning, set_id, object_lock, \
+          object_lock_default_mode, object_lock_default_days, default_encryption, \
+          replication_mode, deleting) \
+         VALUES (?, ?, ?, ?, ?, 0, NULL, NULL, NULL, ?, 0) \
+         ON CONFLICT(name) DO UPDATE SET \
+          owner_id = excluded.owner_id, set_id = excluded.set_id, \
+          versioning = excluded.versioning, \
+          object_lock = excluded.object_lock, \
+          object_lock_default_mode = excluded.object_lock_default_mode, \
+          object_lock_default_days = excluded.object_lock_default_days, \
+          default_encryption = excluded.default_encryption, \
+          replication_mode = excluded.replication_mode, deleting = excluded.deleting",
+    )
+    .bind(name)
+    .bind(owner_id)
+    .bind(creation_date)
+    .bind(if replication_mode == "sync" {
+        "Enabled"
+    } else {
+        "Off"
+    })
+    .bind(set_id)
+    .bind(replication_mode)
+    .execute(&mut *txn.conn)
+    .await
+    .map_err(backend)?;
+    Ok(())
+}
+
+pub(super) async fn bucket_upsert_set(
+    txn: &mut SqliteControlTxn<'_>,
+    name: &str,
+    set_id: i64,
+    creation_date: i64,
+) -> Result<(), ControlError> {
+    sqlx::query(
+        "INSERT INTO buckets (name, owner_id, creation_date, set_id) VALUES (?, NULL, ?, ?) \
+         ON CONFLICT(name) DO UPDATE SET set_id = excluded.set_id",
+    )
+    .bind(name)
+    .bind(creation_date)
+    .bind(set_id)
+    .execute(&mut *txn.conn)
+    .await
+    .map_err(backend)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
