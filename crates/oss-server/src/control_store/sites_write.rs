@@ -198,6 +198,34 @@ impl SiteTxn for SqliteControlTxn<'_> {
             .rows_affected())
     }
 
+    async fn site_set_last_error(
+        &mut self,
+        peer_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), ControlError> {
+        sqlx::query("UPDATE sites SET last_error = ? WHERE peer_id = ?")
+            .bind(error)
+            .bind(peer_id)
+            .execute(&mut *conn(self))
+            .await
+            .map_err(super::backend)?;
+        Ok(())
+    }
+
+    async fn site_set_last_error_for_remote(
+        &mut self,
+        remote_site_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), ControlError> {
+        sqlx::query("UPDATE sites SET last_error = ? WHERE remote_site_id = ?")
+            .bind(error)
+            .bind(remote_site_id)
+            .execute(&mut *conn(self))
+            .await
+            .map_err(super::backend)?;
+        Ok(())
+    }
+
     async fn site_delete(&mut self, peer_id: &str) -> Result<u64, ControlError> {
         Ok(sqlx::query("DELETE FROM sites WHERE peer_id = ?")
             .bind(peer_id)

@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use xl_store::control_store::ControlError;
+pub use xl_store::control_store::sites::{SiteChangelogRow, SiteEntityClockRow};
 use xl_store::control_store::sites::{
     SiteCredentialsRow, SiteIdentityRow, SitePeerRow, SiteStore, SiteTxn,
 };
@@ -27,39 +28,16 @@ pub struct SiteConfigRow {
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SiteChangelogRow {
-    pub seq: i64,
-    pub origin_site_id: String,
-    pub entity: String,
-    pub entity_id: String,
-    pub op: String,
-    pub payload: String,
-    pub priority: i64,
-    pub ts: i64,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SiteEntityClockRow {
-    pub entity: String,
-    pub entity_id: String,
-    pub ts: i64,
-    pub priority: i64,
-    pub origin_site_id: String,
-    pub seq: i64,
-}
-
 pub(super) fn site_key(peer_id: &str) -> &[u8] {
     peer_id.as_bytes()
 }
 
-pub(super) fn changelog_key(seq: i64) -> [u8; 8] {
+pub(crate) fn changelog_key(seq: i64) -> [u8; 8] {
     seq.to_be_bytes()
 }
 
 /// `entity` is ASCII and never contains NUL, so a NUL separator is unambiguous.
-pub(super) fn clock_key(entity: &str, entity_id: &str) -> Vec<u8> {
+pub(crate) fn clock_key(entity: &str, entity_id: &str) -> Vec<u8> {
     let mut key = Vec::with_capacity(entity.len() + 1 + entity_id.len());
     key.extend_from_slice(entity.as_bytes());
     key.push(0);
@@ -172,20 +150,45 @@ impl SiteStore for ObjectControlStore {
         }))
     }
 
-    async fn site_cursor(&self, _peer_id: &str) -> Result<Option<i64>, ControlError> {
-        // shortcut: site cursors are local files in the object backend (design
-        // §7); the shipping worker owns them and a missing cursor restarts at 0.
-        Ok(None)
+    async fn site_cursor(&self, peer_id: &str) -> Result<Option<i64>, ControlError> {
+        let local = self.local_store()?;
+        let cursor = local
+            .cursor(peer_id)
+            .map_err(|e| ControlError::Backend(e.to_string()))?;
+        Ok(cursor
+            .load()
+            .map_err(|e| ControlError::Backend(e.to_string()))?
+            .map(|cursor| cursor.last_seq))
     }
 
     async fn site_lag_rows(&self) -> Result<i64, ControlError> {
-        // Conservative cutover gate: without local cursor files every paired
-        // peer is assumed behind once anything has been logged.
-        let max = self.site_changelog_max_seq().await?;
+        let max = ObjectControlStore::site_changelog_max_seq(self).await?;
         if max == 0 {
             return Ok(0);
         }
-        self.site_count().await
+        let mut lag = 0;
+        for peer_id in self.site_peer_ids().await? {
+            if self.site_cursor(&peer_id).await?.unwrap_or(0) < max {
+                lag += 1;
+            }
+        }
+        Ok(lag)
+    }
+
+    async fn site_changelog_after(&self, seq: i64) -> Result<Vec<SiteChangelogRow>, ControlError> {
+        ObjectControlStore::site_changelog_after(self, seq).await
+    }
+
+    async fn site_changelog_max_seq(&self) -> Result<i64, ControlError> {
+        ObjectControlStore::site_changelog_max_seq(self).await
+    }
+
+    async fn site_clock(
+        &self,
+        entity: &str,
+        entity_id: &str,
+    ) -> Result<Option<SiteEntityClockRow>, ControlError> {
+        ObjectControlStore::site_clock(self, entity, entity_id).await
     }
 }
 
@@ -387,8 +390,34 @@ impl SiteTxn for ObjectControlTxn {
     }
 
     async fn site_cursor_delete(&mut self, _peer_id: &str) -> Result<u64, ControlError> {
-        // shortcut: cursor files are local state; D3 owns their deletion.
+        // shortcut: cursor files are local state; caller deletes them.
         Ok(0)
+    }
+
+    async fn site_set_last_error(
+        &mut self,
+        peer_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), ControlError> {
+        self.set_last_error_where(site_key(peer_id), error).await
+    }
+
+    async fn site_set_last_error_for_remote(
+        &mut self,
+        remote_site_id: &str,
+        error: Option<&str>,
+    ) -> Result<(), ControlError> {
+        let key = scan_txn(self, TableId::Sites)
+            .await?
+            .into_iter()
+            .find(|(_, value)| {
+                decode::<SitePeerRow>(value).is_ok_and(|row| row.remote_site_id == remote_site_id)
+            })
+            .map(|(key, _)| key);
+        match key {
+            Some(key) => self.set_last_error_where(&key, error).await,
+            None => Ok(()),
+        }
     }
 
     async fn site_delete(&mut self, peer_id: &str) -> Result<u64, ControlError> {
@@ -397,5 +426,22 @@ impl SiteTxn for ObjectControlTxn {
                 .await
                 .map_err(backend)?,
         ))
+    }
+}
+
+impl ObjectControlTxn {
+    async fn set_last_error_where(
+        &mut self,
+        key: &[u8],
+        error: Option<&str>,
+    ) -> Result<(), ControlError> {
+        if let Some(bytes) = self.get(TableId::Sites, key).await.map_err(backend)? {
+            let mut row = decode::<SitePeerRow>(&bytes)?;
+            row.last_error = error.map(str::to_owned);
+            self.put(TableId::Sites, key, &encode(&row)?)
+                .await
+                .map_err(backend)?;
+        }
+        Ok(())
     }
 }

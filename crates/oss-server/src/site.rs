@@ -13,6 +13,8 @@ use xl_store::store::Store;
 
 use crate::state::AppState;
 
+mod object;
+
 const MAX_ENTRIES: usize = 500;
 /// 单条 payload 上限（策略 64KiB 经一层 JSON 转义后仍可容纳——L5）。
 const MAX_PAYLOAD: usize = 256 * 1024;
@@ -166,6 +168,23 @@ fn pi64(v: &serde_json::Value, k: &str) -> Option<i64> {
 
 /// 应用一批来自 peer 的 changelog 条目。错误 = 整批 500（重试幂等）。
 pub async fn apply_changelog(state: &AppState, entries: Vec<Entry>) -> Result<ApplyStats, String> {
+    if let Some(object) = state.db.object_control() {
+        return object::apply_changelog(
+            &object.control,
+            &state.store,
+            &state.site.id,
+            state.bucket_cleanup.as_ref(),
+            &entries,
+        )
+        .await;
+    }
+    apply_changelog_sqlite(state, entries).await
+}
+
+async fn apply_changelog_sqlite(
+    state: &AppState,
+    entries: Vec<Entry>,
+) -> Result<ApplyStats, String> {
     if entries.len() > MAX_ENTRIES {
         return Err(bad(format!("批次超过 {MAX_ENTRIES} 条")));
     }
@@ -1028,7 +1047,7 @@ pub async fn ship_once_tls(
 }
 
 /// serve 挂载（`OSS_SITE_INTERVAL_SECS` 默认 1s；0=关）。
-pub fn spawn_site_worker(pool: SqlitePool, tls: Arc<crate::tls::Tls>) {
+pub fn spawn_site_worker(state: AppState, tls: Arc<crate::tls::Tls>) {
     let secs: u64 = std::env::var("OSS_SITE_INTERVAL_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1037,12 +1056,18 @@ pub fn spawn_site_worker(pool: SqlitePool, tls: Arc<crate::tls::Tls>) {
         tracing::info!("站点 changelog worker 已关闭（OSS_SITE_INTERVAL_SECS=0）");
         return;
     }
+    let pool = state.db.pool().clone();
+    let object = state.db.object_control().map(|o| Arc::clone(&o.control));
     tokio::spawn(async move {
         let mut t = tokio::time::interval(std::time::Duration::from_secs(secs));
         t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             t.tick().await;
-            let _ = ship_once_tls(&pool, Some(&tls)).await;
+            let result = match &object {
+                Some(control) => object::ship_once(control, Some(&tls)).await,
+                None => ship_once_tls(&pool, Some(&tls)).await,
+            };
+            let _ = result;
         }
     });
 }

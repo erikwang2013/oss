@@ -866,7 +866,7 @@ pub async fn run(
                 // M9 S6a：Raft 模式不挂站点 worker（控制写不经 changelog；S6d 再决定替代）。
                 if state.site_enabled && state.cfg.raft.is_none() {
                     crate::site::spawn_site_worker(
-                        state.db.pool().clone(),
+                        state.clone(),
                         std::sync::Arc::clone(&state.tls),
                     );
                 }

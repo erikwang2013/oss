@@ -18,7 +18,7 @@ use super::{ObjectControlStore, ObjectControlTxn, TableId};
 
 pub(super) const META_PREFIX: &str = "@runstate/";
 
-pub(super) fn backend(e: xl_store::error::Error) -> ControlError {
+pub(crate) fn backend(e: xl_store::error::Error) -> ControlError {
     ControlError::Backend(e.to_string())
 }
 
@@ -26,11 +26,11 @@ fn codec(e: impl std::fmt::Display) -> ControlError {
     ControlError::Backend(format!("control row codec: {e}"))
 }
 
-pub(super) fn encode<T: Serialize>(row: &T) -> Result<Vec<u8>, ControlError> {
+pub(crate) fn encode<T: Serialize>(row: &T) -> Result<Vec<u8>, ControlError> {
     rmp_serde::to_vec_named(row).map_err(codec)
 }
 
-pub(super) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ControlError> {
+pub(crate) fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ControlError> {
     rmp_serde::from_slice(bytes).map_err(codec)
 }
 
@@ -101,7 +101,7 @@ pub(super) async fn get_store(
     }
 }
 
-pub(super) async fn scan_txn(
+pub(crate) async fn scan_txn(
     txn: &ObjectControlTxn,
     table: TableId,
 ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ControlError> {

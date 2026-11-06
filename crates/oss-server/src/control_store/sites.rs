@@ -3,7 +3,10 @@
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 use xl_store::control_store::ControlError;
-use xl_store::control_store::sites::{SiteCredentialsRow, SiteIdentityRow, SitePeerRow, SiteStore};
+use xl_store::control_store::sites::{
+    SiteChangelogRow, SiteCredentialsRow, SiteEntityClockRow, SiteIdentityRow, SitePeerRow,
+    SiteStore,
+};
 
 use super::SqliteControlStore;
 
@@ -126,5 +129,61 @@ impl SiteStore for SqliteControlStore {
         .fetch_one(&self.pool)
         .await
         .map_err(super::backend)
+    }
+
+    async fn site_changelog_after(&self, seq: i64) -> Result<Vec<SiteChangelogRow>, ControlError> {
+        let rows = sqlx::query(
+            "SELECT seq, origin_site_id, entity, entity_id, op, payload, priority, ts, \
+             created_at FROM site_changelog WHERE seq > ? ORDER BY seq",
+        )
+        .bind(seq)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(super::backend)?;
+        Ok(rows
+            .iter()
+            .map(|r| SiteChangelogRow {
+                seq: r.get("seq"),
+                origin_site_id: r.get("origin_site_id"),
+                entity: r.get("entity"),
+                entity_id: r.get("entity_id"),
+                op: r.get("op"),
+                payload: r.get("payload"),
+                priority: r.get("priority"),
+                ts: r.get("ts"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
+    async fn site_changelog_max_seq(&self) -> Result<i64, ControlError> {
+        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM site_changelog")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(super::backend)
+    }
+
+    async fn site_clock(
+        &self,
+        entity: &str,
+        entity_id: &str,
+    ) -> Result<Option<SiteEntityClockRow>, ControlError> {
+        let r = sqlx::query(
+            "SELECT entity, entity_id, ts, priority, origin_site_id, seq \
+             FROM site_entity_clock WHERE entity = ? AND entity_id = ?",
+        )
+        .bind(entity)
+        .bind(entity_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(super::backend)?;
+        Ok(r.map(|r| SiteEntityClockRow {
+            entity: r.get("entity"),
+            entity_id: r.get("entity_id"),
+            ts: r.get("ts"),
+            priority: r.get("priority"),
+            origin_site_id: r.get("origin_site_id"),
+            seq: r.get("seq"),
+        }))
     }
 }

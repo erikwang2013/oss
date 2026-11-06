@@ -23,7 +23,7 @@ mod iam_txn;
 mod iam_write;
 mod inventory;
 mod inventory_txn;
-mod jobs;
+pub(crate) mod jobs;
 mod jobs_claim;
 mod jobs_read;
 mod jobs_snapshot;
@@ -52,15 +52,18 @@ pub use ap_olap::{AccessPointStore, AccessPointTxn};
 // domain modules themselves stay private.
 pub(crate) use account::{AccountRow, LedgerRow, MemberRow};
 pub(crate) use account_write::{install_member, put_account};
-pub(crate) use bucket::BucketRow;
+pub(crate) use bucket::{BucketRow, decode_row, encode_row, key1};
 pub(crate) use bucket_write::bucket_clear_owner;
-pub(crate) use iam::{AccessKeyRow, PermissionStorageRow, UserRow};
+pub(crate) use iam::{
+    AccessKeyRow, PermissionStorageRow, UserRow, permission_key, scan_permissions, scan_users,
+};
 pub use inventory::BucketDomainCleanup;
 pub(crate) use migrate_support::{StoredDeleteIntent, StoredWriteIntent};
 pub use origin::WriteOrigin;
 #[cfg(test)]
 pub(crate) use root_io::{CRASH_AFTER_ROOT_CAS, CRASH_BEFORE_ROOT_CAS, CrashIo};
 pub use root_io::{PinnedRoot, RootIo};
+pub(crate) use site::{SiteEntityClockRow, clock_key};
 pub use table::{KNOWN_TABLES, TableId, known_table_ids};
 pub use txn::{CachePublish, CommitStamp, ObjectControlStore, ObjectControlTxn};
 pub use vpc::{VpcStore, VpcTxn};

@@ -22,7 +22,6 @@ use xl_store::control_store::OwnerRef;
 use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry};
 use xl_store::control_store::event_outbox::{EventOutboxStore, EventOutboxTxn};
 use xl_store::control_store::repl_outbox::ReplOutboxStore;
-use xl_store::control_store::sites::SiteStore;
 use xl_store::store::VersioningMode;
 
 use crate::control_store::{SqliteControlStore, SqliteControlTxn};
@@ -4906,32 +4905,47 @@ async fn site_status(
         return StatusCode::NOT_FOUND.into_response();
     };
     let pool = state.db.pool();
-    let max_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq),0) FROM site_changelog")
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-    let store = SqliteControlStore::new(pool.clone());
-    let cursor: i64 = store
+    let control = state.db.control_store();
+    let max_seq = control.site_changelog_max_seq().await.unwrap_or(0);
+    let cursor: i64 = control
         .site_cursor(&peer_id)
         .await
         .ok()
         .flatten()
         .unwrap_or(0);
-    let pending: i64 = store
-        .repl_site_state_count(&peer_id, "pending")
-        .await
-        .unwrap_or(0);
-    let sending: i64 = store
-        .repl_site_state_count(&peer_id, "sending")
-        .await
-        .unwrap_or(0);
-    let dead_objs: i64 = store
-        .repl_site_state_count(&peer_id, "dead")
-        .await
-        .unwrap_or(0);
-    let dead_ctrl = crate::site::dead_count(pool, &peer.remote_site_id)
-        .await
-        .unwrap_or(0);
+    // The SQLite site outbox counts are M6 object replication state; the object
+    // control backend does not expose the same counters yet.
+    let (pending, sending, dead_objs) = if state.db.object_control().is_some() {
+        (0, 0, 0)
+    } else {
+        let store = SqliteControlStore::new(pool.clone());
+        (
+            store
+                .repl_site_state_count(&peer_id, "pending")
+                .await
+                .unwrap_or(0),
+            store
+                .repl_site_state_count(&peer_id, "sending")
+                .await
+                .unwrap_or(0),
+            store
+                .repl_site_state_count(&peer_id, "dead")
+                .await
+                .unwrap_or(0),
+        )
+    };
+    let dead_ctrl: i64 = match state.db.object_control() {
+        Some(object) => object
+            .control
+            .local_store()
+            .ok()
+            .and_then(|local| local.dead(&peer.remote_site_id).ok())
+            .and_then(|dead| dead.count().ok())
+            .unwrap_or(0) as i64,
+        None => crate::site::dead_count(pool, &peer.remote_site_id)
+            .await
+            .unwrap_or(0),
+    };
     Json(serde_json::json!({
         "peer_id": peer.peer_id,
         "remote_site_id": peer.remote_site_id,
@@ -5162,11 +5176,7 @@ async fn site_changelog(
     }
     // L8：token 不能脱离“当前配对关系”单独生效——解配后旧 token 立即失效；
     // 每条 origin 必须是当前唯一 peer 的 remote_site_id（禁止伪造归属）。
-    let remote: Option<String> = match SqliteControlStore::new(state.db.pool().clone())
-        .first_site_remote_id()
-        .await
-        .map_err(crate::control_store::to_sqlx)
-    {
+    let remote: Option<String> = match state.db.control_store().first_site_remote_id().await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "读站点对失败");

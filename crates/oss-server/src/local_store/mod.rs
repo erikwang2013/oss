@@ -39,7 +39,7 @@ pub mod uploads;
 pub use audit::{AuditLog, AuditRecord};
 pub use kv::{KvEntry, LocalKv};
 pub use queue::{Claim, LocalQueue, QueueEntry, QueueStatus};
-pub use site::{Cursor, CursorFile};
+pub use site::{Cursor, CursorFile, DeadFile, DeadLetter};
 pub use uploads::{UploadRecord, UploadStore};
 
 /// On-disk format major. Bump when framing or payload encoding changes.
@@ -53,6 +53,7 @@ pub(crate) const KIND_KV: u8 = 1;
 pub(crate) const KIND_QUEUE: u8 = 2;
 pub(crate) const KIND_AUDIT: u8 = 3;
 pub(crate) const KIND_CURSOR: u8 = 4;
+pub(crate) const KIND_DEAD: u8 = 5;
 
 pub type Result<T> = io::Result<T>;
 
@@ -103,6 +104,11 @@ impl LocalStore {
     /// Atomic per-peer cursor used by site shipping.
     pub fn cursor(&self, peer_id: &str) -> Result<CursorFile> {
         CursorFile::open(self.root.join("site").join("cursors"), peer_id)
+    }
+
+    /// Append-only per-peer site dead letters (deduped by `seq`).
+    pub fn dead(&self, peer_id: &str) -> Result<DeadFile> {
+        DeadFile::open(self.root.join("site").join("dead"), peer_id)
     }
 
     /// Multipart upload records keyed by `saved_path`.
