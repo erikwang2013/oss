@@ -219,6 +219,155 @@ mod stretch_startup_tests {
     }
 }
 
+mod object_admin_tests {
+    use super::*;
+    use crate::control_backend::ObjectControl;
+    use xl_store::control_state::root::Mode;
+    use xl_store::store::{Store, StoreConfig};
+
+    async fn attach_db(store: Arc<Store>) -> Db {
+        let object = ObjectControl::open(store, Mode::Standalone, None)
+            .await
+            .unwrap();
+        let db = Db::connect_object().await.unwrap();
+        db.attach_object_control(object).unwrap();
+        db
+    }
+
+    async fn object_db(dir: &std::path::Path) -> (Db, Arc<Store>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let mut cfg = StoreConfig::new(dir);
+        cfg.fsync = false;
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let db = attach_db(Arc::clone(&store)).await;
+        (db, store)
+    }
+
+    #[tokio::test]
+    async fn fresh_object_root_seeds_env_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _store) = object_db(&dir.path().join("data")).await;
+        assert!(
+            ensure_object_admin(&db, "env-admin", "env-pw-123456")
+                .await
+                .unwrap()
+        );
+        let uid = db
+            .verify_user("env-admin", "env-pw-123456")
+            .await
+            .unwrap()
+            .expect("环境管理员必须能登录");
+        assert_eq!(
+            db.get_user(uid).await.unwrap(),
+            Some(("env-admin".into(), true, true))
+        );
+        assert_eq!(
+            db.schema_meta("admin_username").await.unwrap().as_deref(),
+            Some("env-admin"),
+            "配对/身份用的 admin_username 须写入"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_admin_and_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let (db, store) = object_db(&root).await;
+        assert!(
+            ensure_object_admin(&db, "env-admin", "env-pw-123456")
+                .await
+                .unwrap()
+        );
+        let uid = db
+            .verify_user("env-admin", "env-pw-123456")
+            .await
+            .unwrap()
+            .unwrap();
+        db.set_password(uid, "changed-pw-123").await.unwrap();
+        drop(db);
+
+        // 重启：同一对象根重新装配（admin_username marker 已存在 → 不再建号/改密）。
+        let db = attach_db(store).await;
+        assert!(
+            !ensure_object_admin(&db, "env-admin", "env-pw-123456")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            db.verify_user("env-admin", "changed-pw-123").await.unwrap(),
+            Some(uid)
+        );
+        assert_eq!(
+            db.verify_user("env-admin", "env-pw-123456").await.unwrap(),
+            None,
+            "环境口令不得覆盖已有账号口令"
+        );
+        assert_eq!(db.count_admins().await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn deleted_env_admin_is_not_resurrected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("data");
+        let (db, store) = object_db(&root).await;
+        assert!(
+            ensure_object_admin(&db, "env-admin", "env-pw-123456")
+                .await
+                .unwrap()
+        );
+        let uid = db
+            .verify_user("env-admin", "env-pw-123456")
+            .await
+            .unwrap()
+            .unwrap();
+        db.create_user("second-admin", "second-pw-123", true)
+            .await
+            .unwrap();
+        assert!(db.delete_user(uid).await.unwrap());
+        assert!(!db.user_exists("env-admin").await.unwrap());
+        drop(db);
+
+        let db = attach_db(store).await;
+        assert!(
+            !ensure_object_admin(&db, "env-admin", "env-pw-123456")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.user_exists("env-admin").await.unwrap(),
+            "有意删除的管理员不得在重启时复活"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_non_admin_is_not_promoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, _store) = object_db(&dir.path().join("data")).await;
+        db.create_user("env-admin", "user-pw-123456", false)
+            .await
+            .unwrap();
+        assert!(
+            !ensure_object_admin(&db, "env-admin", "env-pw-123456")
+                .await
+                .unwrap()
+        );
+        let uid = db
+            .verify_user("env-admin", "user-pw-123456")
+            .await
+            .unwrap()
+            .expect("已存在账号保持原口令");
+        assert_eq!(
+            db.get_user(uid).await.unwrap(),
+            Some(("env-admin".into(), false, true)),
+            "同名非管理员不得被提升"
+        );
+        assert_eq!(
+            db.verify_user("env-admin", "env-pw-123456").await.unwrap(),
+            None
+        );
+    }
+}
+
 mod ap_endpoint_registry_tests {
     use super::*;
     use crate::config::{ApToml, ApVpcEndpointToml};

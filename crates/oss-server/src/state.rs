@@ -661,39 +661,46 @@ impl AppState {
         // 口令来源：OSS_ADMIN_PASSWORD 非空优先；空/缺时用密钥文件解析值（配了
         // OSS_SECRETS_FILE 才可能有——docker 栈即此路径，口令随文件落盘）。
         // 空凭据一律拒绝建号：空口令账号会被空口令登录命中。
-        // M1：SQLite 后端的首管引导 / groups 回填 / 初始化标记（对象后端由 E 收口
-        // 账户与会话门面；B4 阶段不写占位库，避免“看起来成功”的空账号）。
-        if !object_backend {
-            match (
-                std::env::var("OSS_ADMIN_USER")
-                    .ok()
-                    .filter(|u| !u.is_empty()),
-                std::env::var("OSS_ADMIN_PASSWORD")
-                    .ok()
-                    .filter(|p| !p.is_empty())
-                    .or_else(|| secrets.admin_password.clone()),
-            ) {
-                (Some(user), Some(pass)) => {
-                    // 已存在的同名账号一律不覆盖（含口令不同的情况）
-                    if !db.user_exists(&user).await? {
-                        db.create_user(&user, &pass, true).await?;
-                        tracing::info!(
-                            user = %user,
-                            secrets_file = ?secrets.secrets_file,
-                            "创建管理员账号（口令取自环境变量或密钥文件）"
-                        );
-                    }
-                    // M9 N8：identity/配对使用首个管理员名；已写入不覆盖。
-                    db.schema_meta_set_if_absent("admin_username", &user)
-                        .await?;
-                }
-                (Some(_), None) => {
-                    tracing::warn!(
-                        "OSS_ADMIN_USER 已设但无可用口令（环境与密钥文件都没有），跳过管理员引导"
+        // 对象后端（standalone 与 Raft 同路径）：在 Raft 启动前把管理员写进本地根；
+        // 快照不带管理员行，安装只清非管理员，因此按快照加入的新节点仍能登录。
+        match (
+            std::env::var("OSS_ADMIN_USER")
+                .ok()
+                .filter(|u| !u.is_empty()),
+            std::env::var("OSS_ADMIN_PASSWORD")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .or_else(|| secrets.admin_password.clone()),
+        ) {
+            (Some(user), Some(pass)) if object_backend => {
+                if ensure_object_admin(&db, &user, &pass).await? {
+                    tracing::info!(
+                        user = %user,
+                        secrets_file = ?secrets.secrets_file,
+                        "创建管理员账号（口令取自环境变量或密钥文件）"
                     );
                 }
-                _ => {}
             }
+            (Some(user), Some(pass)) => {
+                // 已存在的同名账号一律不覆盖（含口令不同的情况）
+                if !db.user_exists(&user).await? {
+                    db.create_user(&user, &pass, true).await?;
+                    tracing::info!(
+                        user = %user,
+                        secrets_file = ?secrets.secrets_file,
+                        "创建管理员账号（口令取自环境变量或密钥文件）"
+                    );
+                }
+                // M9 N8：identity/配对使用首个管理员名；已写入不覆盖。
+                db.schema_meta_set_if_absent("admin_username", &user)
+                    .await?;
+            }
+            (Some(_), None) => {
+                tracing::warn!(
+                    "OSS_ADMIN_USER 已设但无可用口令（环境与密钥文件都没有），跳过管理员引导"
+                );
+            }
+            _ => {}
         }
 
         // 每个上传分组对应的桶，启动时确保存在（内核 + 控制面各一份记录）。
@@ -1286,6 +1293,25 @@ async fn stretch_startup_check(db: &Db, drives: &[PathBuf]) -> Result<bool, Stri
         }
     }
     Ok(true)
+}
+
+/// 对象根的一次性管理员引导（standalone/Raft 同路径）。
+///
+/// `admin_username` marker 兼作「本节点已引导」标记：它在节点本地根里、快照
+/// 安装不清除，所以只在该标记缺失时建号——有意删除环境管理员后重启不会复活。
+/// 同名已存在账号（含非管理员）一律不覆盖，与 SQLite 引导语义一致。
+async fn ensure_object_admin(db: &Db, user: &str, pass: &str) -> Result<bool, sqlx::Error> {
+    if db.schema_meta("admin_username").await?.is_some() {
+        return Ok(false);
+    }
+    let created = if db.user_exists(user).await? {
+        false
+    } else {
+        db.create_user(user, pass, true).await?;
+        true
+    };
+    db.schema_meta_set_if_absent("admin_username", user).await?;
+    Ok(created)
 }
 
 #[cfg(test)]

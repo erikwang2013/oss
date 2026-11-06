@@ -333,6 +333,55 @@ async fn install_preserves_admin_and_set_id_and_clears_non_admin_state() {
     assert_eq!(owner_of("bob-upload"), None);
 }
 
+/// A fresh node seeds its env admin into the local root before Raft spawn; a
+/// snapshot carries no admin rows, so install must leave that local admin (and
+/// its password hash) login-capable. This is the node-joins-by-snapshot path.
+#[tokio::test]
+async fn admin_seeded_before_install_stays_login_capable() {
+    let mut om = object_machine(3, 4 << 20).await;
+    let hash = crate::db::hash_password("env-admin-pw");
+    let mut txn = om
+        .sm
+        .store
+        .begin(WriteOrigin::local("admin-bootstrap"))
+        .await
+        .unwrap();
+    let uid = txn
+        .user_create_default_status("env-admin", &hash, true, 1)
+        .await
+        .unwrap();
+    // Written by the startup bootstrap; gates the one-shot seed on this node.
+    txn.set_marker("admin_username", "env-admin");
+    txn.commit().await.unwrap();
+
+    let bytes = golden::load("snapshots/export_ossctl1.bin");
+    install(&mut om.sm, &meta(None, StoredMembership::default()), &bytes)
+        .await
+        .unwrap();
+    let sm = om.sm;
+    let login = sm
+        .store
+        .login_user("env-admin")
+        .await
+        .unwrap()
+        .expect("本地管理员必须在快照安装后仍在册");
+    assert_eq!(login.uid, uid);
+    assert!(
+        crate::db::verify_password("env-admin-pw", &login.password_hash),
+        "管理员口令哈希必须在快照安装后仍可校验"
+    );
+    let txn = sm
+        .store
+        .begin(WriteOrigin::snapshot_install())
+        .await
+        .unwrap();
+    assert_eq!(
+        txn.meta().markers.get("admin_username").map(String::as_str),
+        Some("env-admin"),
+        "一次性引导标记必须随快照安装保留，否则已删管理员会在重启后复活"
+    );
+}
+
 /// An OLAP module above the 128 KiB blob threshold must round-trip through the
 /// chunked content-addressed object path byte-identically.
 #[tokio::test]
