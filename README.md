@@ -10,7 +10,7 @@
 
 S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多盘纠删码 8+4、跨节点 gRPC mesh、版本控制、生命周期、桶策略与审计、SSE 三模式与对象锁、STS 临时凭据、事件通知/Kafka、S3 Select、桶复制与多站点复制、访问点/Object Lambda、Batch/Inventory/tier、sync 桶与 3-voter Raft 控制面。`aws-cli`/`rclone` 的默认大文件路径（≥8 MiB 自动 multipart）与断点习惯直接可用，浏览器控制台可分块上传并管理。
 
-**最新发布：v1.31.0（2026-11-06）。** v1.31 交付对象控制存储后端（opt-in `[server].control_backend = "objects"`）：控制面按表存为节点本地 COW B+tree，单根 CAS 作为提交点，盘级多数派 quorum、启动 flock、Root/RootMeta/分配器与内容寻址 blob 全部落 `.oss.sys`；IAM/账户/桶/策略/作业/outbox/站点/审计/上传/秒传索引等 27 张控制表均有对象适配器，读侧热视图按 root generation 无锁切换并只重建脏域。Raft 控制面使用文件日志/元数据/快照（`<db_path>.d/`），witness 只存元数据；站点复制的 LWW apply/ship/配对统一走缝，游标与死信落节点本地文件；账户用量热路径落本地缓存，复制账本由采样器校准。离线 `control-migrate` 保留逐字节校验与回滚窗口，A8 goldens 作为对象后端的永久 oracle。性能：10 万行快照导入 8.3s、导出 1.5s（此前导入超时），并修复元数据型提交导致热视图全量重载的问题。SQLite 仍为默认后端，对象后端为 opt-in；无 API、Wire/OSSCTL 或数据格式变更，下一步删除 SQLite。
+**最新发布：v1.31.0（2026-11-06）。** v1.31 交付对象控制存储后端（opt-in）：27 张控制表的节点本地 COW B+tree、单根 CAS、盘级多数派 quorum，文件 Raft 日志/元数据/快照与 witness，站点复制 LWW apply/ship/配对走缝；10 万行快照导入 8.3s、导出 1.5s。**下一版本 v1.32.0 移除 SQLite，对象控制根成为唯一后端**：根对象 `control/state/root` 的 CAS 是唯一提交点，节点与大值按内容寻址存于 `<data_dir>/.oss.sys/control/state/{node,blob}/`，节点本地运行态（uploads/审计/outbox/游标/用量缓存）在 `<data_dir>/.oss.sys/local/`，Raft 日志/元数据/快照在 `<raft.db_path>.d/`；`sqlx`/SQLite、`migrations/`、`[cluster]`/`[stretch]` 与 `database_url` 全部移除。升级是一次性单向割接：停全部节点，冷备 `oss.db`、`raft.db` 与数据盘，用归档在 GitHub Release v1.31.0 的 `oss-server-v1.31.0-linux-x86_64`（sha256 `fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`）执行 `oss-server control-migrate --from <oss.db> --state-dir <data_dir> --raft-db <raft.db> --dry-run|--apply`，校验报告后启动 v1.32 二进制；首次新写入后没有反向写入器，回滚只能恢复备份并丢弃割接后的写入（详见 `docs/superpowers/runbooks/2026-11-05-object-control-cutover.md`）。已知控制写 p99 仍高于原预算（debug 单机约 0.64s；目标 ≤20ms/≤50ms），需在 release build 重测并记录偏差，不宣称达标。
 
 ## 功能
 
@@ -22,7 +22,7 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 | 安全 | SSE-S3/KMS/C、密钥库、对象锁与保留期、STS、桶策略与审计（异步批量队列）、TLS/mTLS、子账户三档权限、Argon2id、账户软/硬字节与对象数配额 |
 | 数据流 | 事件通知/Kafka、S3 Select、桶复制（Prefix/Tag/And 过滤）、多站点复制 |
 | 控制面 | 访问点、Object Lambda、Batch Operations、Inventory、作业引擎与终态保留（JobPurge）、恢复后续状态/调度租约复制（feature 7）、硬配额/VPC 端点命令（feature 8）、复制用量账本（feature 9）、控制台页面 |
-| 强一致 | sync 桶、stretch 2×6、3-voter Raft（witness）、能力级别 1..9 |
+| 强一致 | sync 桶、多站点（`[site]` + `[raft]`）、3-voter Raft（witness）、能力级别 1..9 |
 | 运维 | `fsck` / `heal` / `scrub` / `clean` / `rebalance` / `cluster-shrink plan/apply/verify/commit/rollback` |
 | 客户端 | `aws-cli` / `rclone`；React 控制台（分块、断线续传、秒传） |
 
@@ -45,10 +45,10 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 | crate / 目录 | 职责 |
 |---|---|
 | `crates/xl-store` | 存储内核：盘布局与键校验（`__XLDIR__` 展平）、`xl.meta` 编解码（版本链 / 加密记录 / 锁记录 / 标签 / storage_class / tier）、提交协议、EC 编解码、多盘分发与 quorum、对象/桶锁与 flock、密钥库（`kms.rs`）与块对齐信封加密（`crypto.rs`） |
-| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查 SQLite `access_keys`）、SSE 与对象锁头解析/响应装配；含访问点路由（`ap.rs`）、Object Lambda（`olap.rs`）、Restore/生命周期（`restore.rs`/`lifecycle.rs`）、TierGc/删桶清理契约 |
+| `crates/xl-s3` | s3s 的 `S3` trait 实现：DTO 翻译、错误映射、SigV4 认证（AK → SK 查对象控制根 `access_keys` 热视图）、SSE 与对象锁头解析/响应装配；含访问点路由（`ap.rs`）、Object Lambda（`olap.rs`）、Restore/生命周期（`restore.rs`/`lifecycle.rs`）、TierGc/删桶清理契约 |
 | `crates/xl-proto` | 节点间 gRPC 协议：`oss.proto` 消息与 service 定义（prost + tonic-build 全量生成） |
 | `crates/xl-client` | mesh 的 tonic 实现：`TonicMesh` 客户端（懒连接 / 超时 / token 拦截器 + traceparent 注入）与服务端 handler（令牌校验，只操作本节点本地槽） |
-| `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI；含作业引擎（`jobs.rs`）、Batch（`job_actions*.rs`）、访问点/OLAP（`access_points_api.rs`）、Inventory（`inventory*.rs`）、分层/恢复（`tier*.rs`）与 0003 迁移 |
+| `crates/oss-server` | ecat + axum 组装：控制台 API（JWT）、aetherupload 接线、S3 fallback、运维 CLI；含作业引擎（`jobs.rs`）、Batch（`job_actions*.rs`）、访问点/OLAP（`access_points_api.rs`）、Inventory（`inventory*.rs`）、分层/恢复（`tier*.rs`）与对象控制根装配 |
 | `web` | 控制台前端：React 19 + antd + Vite，Playwright e2e；含访问点/作业/分层/清单/通知/审计/设置页面 |
 
 磁盘布局速记（多盘）：每个盘各持一份**完整命名空间**——`<盘>/<桶>/<展平键>/` 下是
@@ -58,9 +58,9 @@ S3 兼容的自研分布式对象存储（MinIO 的等价实现）。支持多�
 `xl.meta`、不落数据文件。启用加密后数据文件存的是**密文分片**（先加密后 EC），
 包裹的 DEK 与 `key_id` 记在 `xl.meta` 内（元数据本身不含密钥明文）。临时区在每盘
 `.oss.sys/{tmp, trash, locks}`，盘身份标识 `drive-id` 防插错盘。
-控制面元数据（用户/密钥/桶/上传记录/秒传索引）在 SQLite。
+控制面元数据（用户/密钥/桶/上传记录/秒传索引）在节点本地对象控制根（`.oss.sys/control/`），运行态文件在 `.oss.sys/local/`；不再使用 SQLite。
 
-**技术栈**：Rust 2024 · ecat 7.0 · s3s 0.17 · aetherupload-rust 3.0.0 · axum 0.8 · sqlx / SQLite · serde + rmp-serde。
+**技术栈**：Rust 2024 · ecat 7.0 · s3s 0.17 · aetherupload-rust 3.0.0 · axum 0.8 · 对象控制根（COW B+tree）· serde + rmp-serde。
 
 ## 请求周期
 
@@ -135,15 +135,10 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 docker compose up --build        # 控制台 http://localhost:8080 · S3/API http://localhost:9000
 ```
 
-集群（4 节点 × 3 盘 = 12 槽；服务名即节点地址）：
+> **v1.32.0 移除静态 `[cluster]`/`[stretch]` 拓扑。** `docker-compose.cluster.yml` 与 `docker/cluster/n{1..4}/oss.toml` 仅作为历史示例保留，不再构成受支持的部署；多站点/Raft 部署使用 `[site]` + `[raft]`（对象控制根 + `<raft.db_path>.d/`），见安装文档与割接 runbook。
 
-```bash
-docker compose -f docker-compose.cluster.yml up --build
-# S3/控制面入口：n1:9000 · n2:9001 · n3:9002 · n4:9003（任意节点等价）；控制台 :8080 反代 n1
-```
-
-- 配置：单机 `docker/oss.toml`；集群 `docker/cluster/n{1..4}/oss.toml`（静态拓扑，注释在文件里）。
-- `jwt_secret` / 集群 `secret` / 管理员口令未填时首次启动自动生成，落盘
+- 配置：单机 `docker/oss.toml`；`docker/cluster/n{1..4}/oss.toml` 已标记退役，仅归档参考。
+- `jwt_secret` / `[site].token` / `[raft].cluster_token` / 管理员口令未填时首次启动自动生成，落盘
   `./docker/secrets/generated.env`（容器内权限 **0600**、属主 `oss`，目录 0700）；轮换 = 删除
   该文件重启。查看口令：`docker compose exec oss cat /secrets/generated.env`（集群用
   `docker compose -f docker-compose.cluster.yml exec n1 cat /secrets/generated.env`）；
@@ -198,6 +193,8 @@ aws --endpoint-url $E s3 rm s3://photos/cover.jpg
 5. 切流；备份继续保留。
 6. 回滚 = 停新二进制、还原冷备、起旧二进制；仅当未发生新格式/CMK 写入时有效，否则按下方 CMK 迁移处理或保持新二进制。
 
+**v1.32.0 的 SQLite 移除是单向割接（与上面的数据面蓝绿不是一回事）。** 停全部节点（Raft voter/witness 一起），冷备 `oss.db`、`raft.db` 与数据盘并记录 sha256；从 GitHub Release v1.31.0 下载归档的 `oss-server-v1.31.0-linux-x86_64`，核对 sha256 `fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`；每节点先 `--dry-run` 后 `--apply` 执行 `control-migrate --from <oss.db> --state-dir <data_dir> --raft-db <raft.db> --json`，确认源库字节未变、报告计数/哈希一致、对象根与 `<raft.db_path>.d/` 已生成；再启动 v1.32 二进制并做 auth/console/S3/site/snapshot 冒烟。首次新写入后没有反向写入器，回滚只能在首次写入前恢复备份并启动旧/归档二进制；之后只能恢复备份并接受割接后写入丢失。完整步骤见 `docs/superpowers/runbooks/2026-11-05-object-control-cutover.md`。
+
 `scripts/blue-green-preflight.sh` 把同一流程的检查做成只读闸门：`--data-dir`、`--backup`、`--config`、`--health-json`、`--health-url`、`--new-binary`、`--min-version`、`--strict`、`--json`；它只检查、不修改数据、不停止服务。
 
 **只读排空（Level C）。** 顶层 `read_only = true` 让节点从客户端写路径摘除：写请求返回 503 并带 `x-oss-read-only: 1`；GET/HEAD/OPTIONS、精确匹配的 `POST /api/v1/login`、健康/指标与 Raft RPC 保持可用，`/health/cluster` 暴露 `read_only`。旧二进制没有此开关，混版窗口内必须把旧节点从客户端 LB 移除，不能依赖只读开关约束旧节点。
@@ -206,7 +203,7 @@ aws --endpoint-url $E s3 rm s3://photos/cover.jpg
 
 **升级 e2e。** `tests/e2e_blue_green.sh` 用真实 v1.26.0 → 当前二进制在同一数据目录切换并验证冷备回滚（22/22 PASS）；`tests/e2e_single_to_cluster_real.sh` 用两个回环服务器跑 plan/copy/verify/resume（6/6 PASS）；`scripts/mpu-drain.sh` 自检 43/0。
 
-**CMK 激活是不归点。** DARE 的 AAD 绑定 `key_id`，只改元数据无法让 pre-CMK 二进制读 CMK 数据；仓库不提供明文/不安全降级。`oss-server cmk rewrap` 默认只在**同一个 CMK** 内把旧版本重加密到该 CMK 当前版本；v1.28.0 起加 `--to-legacy sse-s3|sse-kms --apply` 可把引用该 CMK 的对象**逐版本全量重加密**为 pre-CMK provider（`sse-s3` 的 file key，或 `sse-kms` 默认环当前 `k<n>`），完成后旧 CMK 引用归零，pre-CMK 二进制可读。迁移在扫描/写入前 fail-closed：仍有在途 MPU、桶默认加密指向该 CMK、或目标 provider 未配置都会被拒绝；每个版本独立重加密，单版本失败不影响其他版本；迁移绝不自动删除 CMK。若已有 CMK 对象而必须回到 pre-CMK 二进制：先停写，逐节点跑 `oss-server cmk scan --name <cmk> --json` 核对 `references`/`mpu_references`/`bucket_defaults`，Complete/Abort 所有 MPU 并把桶默认加密切到目标 provider，再执行 `oss-server cmk rewrap --name <cmk> --to-legacy <sse-s3|sse-kms> --apply`；`[cluster]`/`[stretch]` 部署的离线 rewrap 会拒绝（分片放置需在线拓扑），当前不支持在线 legacy 迁移。全部节点引用归零后可 `oss-server cmk delete --name <cmk> --yes`（集群需在全站逐节点核实后加 `--force`），或迁移到新集群（如 `scripts/single-to-cluster.sh` 的离线重新灌入，只迁当前版本）。**绝不能删除 CMK 来「强制」降级**；meta-only 降级仍不可能，迁移完成前回滚只能退回仍能读 CMK 的新二进制。
+**CMK 激活是不归点。** DARE 的 AAD 绑定 `key_id`，只改元数据无法让 pre-CMK 二进制读 CMK 数据；仓库不提供明文/不安全降级。`oss-server cmk rewrap` 默认只在**同一个 CMK** 内把旧版本重加密到该 CMK 当前版本；v1.28.0 起加 `--to-legacy sse-s3|sse-kms --apply` 可把引用该 CMK 的对象**逐版本全量重加密**为 pre-CMK provider（`sse-s3` 的 file key，或 `sse-kms` 默认环当前 `k<n>`），完成后旧 CMK 引用归零，pre-CMK 二进制可读。迁移在扫描/写入前 fail-closed：仍有在途 MPU、桶默认加密指向该 CMK、或目标 provider 未配置都会被拒绝；每个版本独立重加密，单版本失败不影响其他版本；迁移绝不自动删除 CMK。若已有 CMK 对象而必须回到 pre-CMK 二进制：先停写，逐节点跑 `oss-server cmk scan --name <cmk> --json` 核对 `references`/`mpu_references`/`bucket_defaults`，Complete/Abort 所有 MPU 并把桶默认加密切到目标 provider，再执行 `oss-server cmk rewrap --name <cmk> --to-legacy <sse-s3|sse-kms> --apply`；多站点/Raft（`[site]`/`[raft]`）部署的离线 rewrap 会拒绝（分片放置需在线拓扑），当前不支持在线 legacy 迁移。全部节点引用归零后可 `oss-server cmk delete --name <cmk> --yes`（集群需在全站逐节点核实后加 `--force`），或迁移到新集群（如 `scripts/single-to-cluster.sh` 的离线重新灌入，只迁当前版本）。**绝不能删除 CMK 来「强制」降级**；meta-only 降级仍不可能，迁移完成前回滚只能退回仍能读 CMK 的新二进制。
 
 **跨版本 MPU。** 跨节点 UploadPart 转发支持 v1.16+（wire 1 有界回退）与本版 wire 2 流式；≤v1.15 没有 MPU RPC，无法支持。升级/降级前必须 Complete/Abort/排空所有在途 MPU，并用 `upgrade-preflight.sh --require-no-mpu --health-json` 强制门槛（`data_wire_version >= 2`、`data_plane_compatible: true`）。v1.28.0 提供 `scripts/mpu-drain.sh` 列出/中止在途 MPU（只处理未完成上传，绝不删除已提交对象）。
 

@@ -1,8 +1,10 @@
 # Object control store — final no-database gate record
 
-Status: **DRAFT / H2 template, rehearsed on the pre-H1 tree (2026-11-06)**. Default mode records
-known pre-H1 gaps as `PENDING-H1`; `STRICT_NO_DB=1` (or `--require-no-sqlite`) enforces every item.
-The signed record is generated at execution after H1
+Status: **DRAFT / H2 template; H1 implemented on branch at `9a187d3`, verification pending
+(2026-11-07)**. The branch drops the `sqlx` dependency and the SQLite source/migration paths; the H2
+record below still contains the 2026-11-06 pre-H1 rehearsal until the strict gate and signed record
+are produced at execution. Default mode records known pre-H1 gaps as `PENDING-H1`; `STRICT_NO_DB=1`
+(or `--require-no-sqlite`) enforces every item
 (`docs/superpowers/specs/2026-11-05-object-control-store-design.md` §9; implementation plan §8 H2).
 
 ## Gate identity
@@ -10,7 +12,7 @@ The signed record is generated at execution after H1
 | Field | Value |
 |-------|-------|
 | Gate | H2 final no-database acceptance |
-| Candidate commit | `ef41301` (v1.31.0) + H2 gate artifacts; commit to be filled at execution |
+| Candidate commit | `9a187d3` (H1 branch) + H2 gate artifacts; signed commit to be filled at execution |
 | Dirty-worktree snapshot | H2 artifacts only (`git status --porcelain`: CI workflow, guard script, e2e, helpers, doc) |
 | Binary | `target/debug/oss-server` sha256 `2c3578fb0da806a9ccb55ca6c13873db4d9c9467f885acff9d51e2172831685d` |
 | Reference host | Linux 6.6.155-amd64-desktop-hwe x86_64, 8 vCPU, debug build, local single disk |
@@ -24,13 +26,13 @@ candidate commit. Current values are the pre-H1 rehearsal, not the signed result
 
 | # | Gate | Evidence (command / artifact) | Current status | Misses / notes |
 |---|------|-------------------------------|----------------|----------------|
-| 1 | No SQLite startup state | `tests/e2e_no_db.sh` sections 1-4: fresh standalone, site, 3-node Raft + witness; migrated standalone, site pair, 3-node Raft + witness; `*.db*` find + `/proc/<pid>/fd` scan | **PASS (default mode)** | `database_url` points at a never-created directory; no `sqlite`/`etilqs` fds. The object backend still uses a `sqlite::memory:` placeholder pool, so unported raw-SQL writes fail with "no such table"; see known gaps. |
-| 2 | Dependency and symbol removal | `scripts/check_no_db.sh`; `cargo tree -i sqlx` | PENDING-H1 | Guard: 5,074 matches (see evidence). `cargo tree -i sqlx` still succeeds. `STRICT_NO_DB=1` fails by design. |
-| 3 | Full suite + crash matrix | `cargo test --workspace --locked --no-fail-fast`; `tests/e2e_no_db.sh`; kill9 matrix | PENDING-H1 (full suite), PASS (kill9 smoke) | Default e2e restarts a migrated standalone and a Raft voter after `kill -9`; full seven-gate suite and the 100-iteration commit-phase crash matrix run at execution. |
-| 4 | Golden parity | frozen goldens from the last-SQLite commit; OSSCTL1/2/3 and `m8.runstate` byte equality | PENDING-H1 | 16 `control_store_*_diff.rs` suites must convert to frozen goldens; object-backend snapshot parity is already covered by F1/F3 tests. |
-| 5 | Concurrency | two writers one key; apply vs local facade; stale fence; `Indeterminate` re-read | PENDING-H1 | Owned by E2/F1 suites; no H2-specific regression expected. |
-| 6 | Performance budgets | `scripts/bench_control_store.sh` (G3 run, debug binary) | PARTIAL / known misses | See benchmark table. |
-| 7 | Security and operability | `.oss.sys` not readable/listable via S3/console; backup/restore and migration runbook rehearsed; metrics/alarms; no plaintext secrets | PENDING-H1 | Runbook `docs/superpowers/runbooks/2026-11-05-object-control-cutover.md` still to be written. |
+| 1 | No SQLite startup state | `tests/e2e_no_db.sh` sections 1-4: fresh standalone, site, 3-node Raft + witness; migrated standalone, site pair, 3-node Raft + witness; `*.db*` find + `/proc/<pid>/fd` scan | Implemented on branch; verification pending (strict) | Pre-H1 default-mode rehearsal was PASS. Re-run on the H1 branch; expect 0 `*.db*` and 0 SQLite fds. |
+| 2 | Dependency and symbol removal | `scripts/check_no_db.sh`; `cargo tree -i sqlx --offline` | Implemented on branch; verification pending | At `9a187d3`: guard exits 1 with 599 matches (dependency check OK; remaining matches are comments, stale test fixtures/config, and guard self-matches), and `cargo tree -i sqlx` exits 101 "did not match any packages" (empty). `STRICT_NO_DB=1` still fails by design until comments/fixtures are cleaned. |
+| 3 | Full suite + crash matrix | `cargo test --workspace --locked --no-fail-fast`; `tests/e2e_no_db.sh`; kill9 matrix | Implemented on branch; verification pending (full suite), PASS (kill9 smoke) | Default e2e restarts a migrated standalone and a Raft voter after `kill -9`; full seven-gate suite and the 100-iteration commit-phase crash matrix run at execution. |
+| 4 | Golden parity | frozen goldens from the last-SQLite commit; OSSCTL1/2/3 and `m8.runstate` byte equality | Implemented on branch; verification pending | 16 `control_store_*_diff.rs` suites must convert to frozen goldens; object-backend snapshot parity is already covered by F1/F3 tests. |
+| 5 | Concurrency | two writers one key; apply vs local facade; stale fence; `Indeterminate` re-read | Implemented on branch; verification pending | Owned by E2/F1 suites; no H2-specific regression expected. |
+| 6 | Performance budgets | `scripts/bench_control_store.sh` (G3 run, debug binary) | Implemented on branch; release-build measurement pending | See benchmark table; both current misses remain. |
+| 7 | Security and operability | `.oss.sys` not readable/listable via S3/console; backup/restore and migration runbook rehearsed; metrics/alarms; no plaintext secrets | Implemented on branch; verification pending | Runbook written at `docs/superpowers/runbooks/2026-11-05-object-control-cutover.md`; backup/restore and cutover rehearsal still pending. |
 
 ## Acceptance matrix (design §9)
 
@@ -96,8 +98,10 @@ weakened to make this table green.
 
 ## Rollback
 
-- Archive the **pre-removal binary** before H1: `archive/pre-h1/oss-server` (outside the workspace
-  guard's scan). It is the only binary that still links SQLite and can read `oss.db`/`raft.db`.
+- The archived **pre-removal binary** is the GitHub Release v1.31.0 asset
+  `oss-server-v1.31.0-linux-x86_64` (sha256
+  `fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`). It is the only binary that
+  still links SQLite and can read `oss.db`/`raft.db`; download and verify it before migration.
 - **Before the first post-cutover write:** rollback = stop all nodes, restore the pre-cutover
   `oss.db`, `raft.db` and data-dir backup, start the archived binary. The object root is ignored.
 - **After the first post-cutover write:** rollback = restore that backup and accept loss of writes
@@ -108,20 +112,36 @@ weakened to make this table green.
 
 ## H1 checklist (from the SQLite audit)
 
-| Area | Current footprint | Required change |
-|------|-------------------|-----------------|
-| `xl-s3` SQL | `auth.rs` 30 + `access.rs` 117 + `sts.rs` 18 + `ap.rs` 5 `sqlx` refs / pools; bucket-versioning write also raw SQL | Replace `SqlitePool` plumbing with the backend-neutral auth view and control seam; no `sqlx` in `xl-s3`. |
-| DB façade | `crates/oss-server/src/db.rs` 7,287 lines, 229 `sqlx::` refs; `create_access_key` raw `SqliteControlTxn` | Delete SQL bodies; keep backend-neutral façade types/method names; remove `apply_ctx`/`raft_apply_ctx` remnants. |
-| Control-store adapters | `SqliteControlStore`, `SqliteControlTxn`, `SqliteControlBackend`, `SqliteQuota`; 563 refs incl. 16 diff tests | Delete the SQLite adapters; rename backend-neutral façade types so no `Sqlite*` symbol survives. |
-| Site hooks | Object `site_hook_*` handlers implemented but not called by production write paths | Call the hooks from object bucket/user/access-key/policy writes inside the root CAS. |
-| Raft SQLite stores | `raft/store.rs` `SqliteLogStore`/`SqliteStateMachine` (80 refs), `raft/runstate/store.rs` (6 `sqlx`), `identity.rs`, `compat.rs`, `cutover/`, `apply/quota.rs`, `apply/tier_restore.rs` | Use the file log/object state machine on every path; delete SQLite stores and one-shot compat readers. |
-| Raft applied LogId | Migrated object state machine reports `T1-N0-*` applied vs `T1-N1-*` committed; snapshot before a live write panics | Persist/repair the real applied LogId and add a migration regression test. |
-| Admin bootstrap | `state.rs` seeds `OSS_ADMIN_USER` only when `!object_backend` | Object-native bootstrap (env or first-run command) and a SQLite-free e2e seed. |
-| Migrations | `crates/oss-server/migrations/` (12 `.sql` files) and `include_str!` sites in `db.rs` | Delete the directory and the includes. |
-| Tests | 16 `crates/oss-server/tests/control_store_*_diff.rs`; SQLite fixtures (`raft_s71`, `raft_quota_ledger`, migrator fixtures) | Convert differential suites to frozen goldens captured from the last-SQLite commit; convert or delete SQLite-fixture tests; keep the `raft_guard` source auditor. |
-| Cargo | workspace `Cargo.toml:72`, `crates/oss-server/Cargo.toml:49`, `crates/xl-s3/Cargo.toml:23`, `Cargo.lock` | Remove `sqlx`; regenerate the lock; `cargo tree -i sqlx` empty. |
-| Guard / CI | `scripts/check_no_db.sh`, `.github/workflows/ci.yml` `no-db-guard` job (continue-on-error) | Guard exits 0; remove continue-on-error/TODO, require the job, re-enable push/PR triggers. |
-| Archive / rollback | `archive/pre-h1/oss-server` not yet present | Archive the pre-removal binary and rehearse restore before H1. |
+Statuses below mean **implemented on branch, verification pending**: the code is present at
+`9a187d3`, but the strict gate and signed record are not produced. Do not treat a row as accepted
+until its evidence is recorded at execution.
+
+| Area | Current footprint | Required change | Status |
+|------|-------------------|-----------------|--------|
+| `xl-s3` SQL | `auth.rs` 30 + `access.rs` 117 + `sts.rs` 18 + `ap.rs` 5 `sqlx` refs / pools; bucket-versioning write also raw SQL | Replace `SqlitePool` plumbing with the backend-neutral auth view and control seam; no `sqlx` in `xl-s3`. | Implemented on branch, verification pending |
+| DB façade | `crates/oss-server/src/db.rs` 7,287 lines, 229 `sqlx::` refs; `create_access_key` raw `SqliteControlTxn` | Delete SQL bodies; keep backend-neutral façade types/method names; remove `apply_ctx`/`raft_apply_ctx` remnants. | Implemented on branch, verification pending |
+| Control-store adapters | `SqliteControlStore`, `SqliteControlTxn`, `SqliteControlBackend`, `SqliteQuota`; 563 refs incl. 16 diff tests | Delete the SQLite adapters; rename backend-neutral façade types so no `Sqlite*` symbol survives. | Implemented on branch, verification pending |
+| Site hooks | Object `site_hook_*` handlers implemented but not called by production write paths | Call the hooks from object bucket/user/access-key/policy writes inside the root CAS. | Implemented on branch, verification pending |
+| Raft SQLite stores | `raft/store.rs` `SqliteLogStore`/`SqliteStateMachine` (80 refs), `raft/runstate/store.rs` (6 `sqlx`), `identity.rs`, `compat.rs`, `cutover/`, `apply/quota.rs`, `apply/tier_restore.rs` | Use the file log/object state machine on every path; delete SQLite stores and one-shot compat readers. | Implemented on branch, verification pending |
+| Raft applied LogId | Migrated object state machine reports `T1-N0-*` applied vs `T1-N1-*` committed; snapshot before a live write panics | Persist/repair the real applied LogId and add a migration regression test. | Implemented on branch, verification pending |
+| Admin bootstrap | `state.rs` seeds `OSS_ADMIN_USER` only when `!object_backend` | Object-native bootstrap (env or first-run command) and a SQLite-free e2e seed. | Implemented on branch, verification pending |
+| Migrations | `crates/oss-server/migrations/` (12 `.sql` files) and `include_str!` sites in `db.rs` | Delete the directory and the includes. | Implemented on branch, verification pending |
+| Tests | 16 `crates/oss-server/tests/control_store_*_diff.rs`; SQLite fixtures (`raft_s71`, `raft_quota_ledger`, migrator fixtures) | Convert differential suites to frozen goldens captured from the last-SQLite commit; convert or delete SQLite-fixture tests; keep the `raft_guard` source auditor. | Implemented on branch, verification pending |
+| Cargo | workspace `Cargo.toml:72`, `crates/oss-server/Cargo.toml:49`, `crates/xl-s3/Cargo.toml:23`, `Cargo.lock` | Remove `sqlx`; regenerate the lock; `cargo tree -i sqlx` empty. | Implemented on branch, verification pending |
+| Guard / CI | `scripts/check_no_db.sh`, `.github/workflows/ci.yml` `no-db-guard` job (continue-on-error) | Guard exits 0; remove continue-on-error/TODO, require the job, re-enable push/PR triggers. | Implemented on branch, verification pending |
+| Archive / rollback | GitHub Release v1.31.0 asset `oss-server-v1.31.0-linux-x86_64`, sha256 above; runbook written | Use the archived asset (not an in-tree build) and rehearse restore before H1. | Implemented on branch, verification pending |
+
+### H1 guard status (2026-11-07, `9a187d3`)
+
+- `scripts/check_no_db.sh`: **exit 1**, 599 matches. Dependency check passes (`sqlx` /
+  `libsqlite3-sys` / `rusqlite` absent) and the migrations directory is absent. Remaining matches:
+  16 `sqlx` references (comments, fixtures, guard self-match), 408 `sqlite` references (comments and
+  stale test/config text), 171 DB filenames (`raft.db` test paths and `oss.db` negative assertions),
+  1 `SqliteControl*` guard self-match, 3 `migrations/` guard self-matches.
+- `cargo tree -i sqlx --offline`: **exit 101**, `package ID specification 'sqlx' did not match any
+  packages` — the dependency graph is empty for `sqlx`.
+- Both guards are recorded as **implemented on branch, verification pending**; the strict run must
+  clean or whitelist the comment/fixture/self-matches before `STRICT_NO_DB=1` can pass.
 
 ## Sign-off
 

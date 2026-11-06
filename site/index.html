@@ -130,7 +130,7 @@
           <div><strong>5 个 crate</strong><span>oss-server · xl-s3 · xl-store · xl-client · xl-proto</span></div>
           <div><strong>EC 8+4</strong><span>多盘分片、quorum 写与读时修复</span></div>
           <div><strong>3 voters</strong><span>A/B 数据站点 + C control witness</span></div>
-          <div><strong>v1.31.0 控制面读写缝全覆盖</strong><span>2026-11-06 · AP/OLAP · lifecycle/inventory/tier · buckets</span></div>
+          <div><strong>v1.31.0 对象控制根（opt-in）</strong><span>2026-11-06 · 单根 CAS · 文件 Raft · v1.32 移除 SQLite</span></div>
         </div>
       </div>
 
@@ -140,7 +140,7 @@
             <h2>项目介绍</h2>
             <p class="intro-lede">吞吞（oss）是一块自己养大的对象存储：Rust 2024 编写，S3 兼容，从单盘一直长到跨站点强一致。</p>
             <p>它不是只把文件存进去的薄壳，而是把存储内核、纠删码、集群 mesh、多站点复制、控制面和安全能力放在同一套代码里。你可以只跑一个进程做本地备份，也可以配置 3 个 voter 和 witness，让控制面在站点故障时继续工作。</p>
-            <p>项目从单盘切片开始，依次完成可用性、分布式、运维与 IAM、安全、数据流、多站点、控制面，走到 sync 桶与 Raft 强一致。2026-10-23 的能力边界清零补齐了 S3 协议细节、全链路 TLS、控制面作业/清单/分层/访问点与滚动升级；2026-10-24 的 v1.15.0 完成 AP/账户、TLS/CMK、tier 流式与多站点复制等硬化收口，v1.16.0 又补上 WebIdentity、MPU 跨节点、OSSCTL2、Batch 抢占与 M8 leader 门控等 backlog，v1.17.0 继续推进账户 MVP、DP-0 数据面握手、M7 对账与 M8 运行态 fencing；2026-10-25 的 v1.18.0 精简 README 并更新英文 README 与站点，无功能变更；2026-10-26 的 v1.19.0 完成 Wave1 地基：DP-1 数据面混版门控、能力级别 1..3 与 OSSCTL3、租户与 M8 运行态快照、维护模式与缩容只读规划；2026-10-27 的 v1.20.0 修复 Wave2 缺口：mesh gRPC 入站 TLS 物料热轮换、账户写路径改走 Raft、缩容 topology v4 与离线 apply/verify/commit/rollback，并补上真实滚动 e2e；2026-10-28 的 v1.20.1 补上账户软字节配额告警、缩容 4→3 真进程 loopback e2e，并修复 v1.20.0 源码归档的 Cargo.lock 错误；同日的 v1.21.0 补上控制台一致读、账户管理员 UI、tier 归档/直读摘要绑定与 AP 端点 registry，并修复 Raft follower 滞后导致的成员操作误 404；2026-10-29 的 v1.21.1 同步文档与站点；同日的 v1.22.0 修复桶配额并发与 follower 权限误 403，并补 tier-audit 与升级/迁移脚本；2026-10-30 的 v1.23.0 把 jobs/job_tasks 与 Restore 受理行纳入 Raft 复制（feature level 4），并修复任务重试抖动；同日的 v1.24.0 把 inventory 三表与 lifecycle 游标纳入复制（feature level 5）；2026-10-31 的 v1.25.0 完成全对象 GET 流式直出、列举键缓存、分片并行写、异步审计与 feature level 6 作业保留；同日的 v1.26.0 交付 feature level 7 的恢复后续状态/调度租约复制、账户硬配额与规范化 worker，并补齐流式批量读与复制过滤；同日的 v1.27.0 交付 feature level 8 的硬配额配置/动态 VPC 端点命令、跨版本 MPU 有界回退、Level C Ext 能力协商、AP attested-proxy、Raft 快照分块与日志压缩/分段，以及停写蓝绿 preflight 与单机→集群工具化；2026-11-01 的 v1.28.0 加固 Raft 日志格式标记与旧区间压缩、M8 follower restore fencing、AP 直连 mTLS/AWS PrivateLink API 身份、CMK→legacy 离线全量迁移、Level C 只读排空与 JWT 多密钥轮换，并交付 feature level 9 的 opt-in 复制用量账本（严格硬配额），同时补上真实 v1.26.0 蓝绿、MPU 排空与单机→集群 e2e；2026-11-01 的 v1.28.1 为补丁版：CI 安装 protoc、修复最小配额夹具、收紧 AWS 端点测试与 mixed-MPU 脚本、裁剪历史计划文档；v1.28.2 修复其 CI 暴露的桶配额并发测试夹具；v1.28.3 修复 OLAP 变换流式输入超限的错误映射（400 而非 500）；v1.28.4 仅稳定测试（等待异步缓存重载），无功能变更；v1.28.5 做性能与 CI 加固：DeleteObjects 请求级授权预加载、对象/版本列表批量并发读与 peer fan-out、健康探测并发、复制/审计索引、aether ingest 限流、sync 流式 tee，以及 CI 构建缓存与发布脚本；无 API/配置/Wire/数据格式变更；2026-11-03 的 v1.29.0 交付控制面去数据库化第一阶段：xl-store 系统命名空间 .oss.sys、控制对象 CAS/单调 fencing/持久化锁 token/提交证书与 quorum 读，vpc_endpoints 迁移到 ControlStore/ControlTxn 缝，SQLite 仍为默认后端，无外部行为变更；2026-11-05 的 v1.30.0 继续控制面去数据库化：访问点/OLAP、lifecycle/inventory/tier、buckets/bucket_policies/event_configs/replication_rules 的读写、快照与桶删除级联迁移到 ControlStore/ControlTxn 缝，并加入集群遗留控制对象重认证工具（只读 ReadControlRaw、canonical 分组、fenced 标记、CLI dry-run/apply），同时修复策略覆盖写的 SQLite UPSERT 触发器误报。2026-11-06 的 v1.31.0 交付对象控制存储后端：27 张控制表的节点本地 COW B+tree、单根 CAS 与盘级多数派 quorum，文件 Raft 日志/元数据/快照与 witness，站点 LWW apply/ship/配对走缝，账户用量本地缓存，10 万行快照导入 8.3s；SQLite 仍为默认后端，对象后端 opt-in，无 API/配置/Wire/数据格式变更。每个阶段都有可运行的 e2e、验收记录和对应文档。</p>
+            <p>项目从单盘切片开始，依次完成可用性、分布式、运维与 IAM、安全、数据流、多站点、控制面，走到 sync 桶与 Raft 强一致。2026-10-23 的能力边界清零补齐了 S3 协议细节、全链路 TLS、控制面作业/清单/分层/访问点与滚动升级；2026-10-24 的 v1.15.0 完成 AP/账户、TLS/CMK、tier 流式与多站点复制等硬化收口，v1.16.0 又补上 WebIdentity、MPU 跨节点、OSSCTL2、Batch 抢占与 M8 leader 门控等 backlog，v1.17.0 继续推进账户 MVP、DP-0 数据面握手、M7 对账与 M8 运行态 fencing；2026-10-25 的 v1.18.0 精简 README 并更新英文 README 与站点，无功能变更；2026-10-26 的 v1.19.0 完成 Wave1 地基：DP-1 数据面混版门控、能力级别 1..3 与 OSSCTL3、租户与 M8 运行态快照、维护模式与缩容只读规划；2026-10-27 的 v1.20.0 修复 Wave2 缺口：mesh gRPC 入站 TLS 物料热轮换、账户写路径改走 Raft、缩容 topology v4 与离线 apply/verify/commit/rollback，并补上真实滚动 e2e；2026-10-28 的 v1.20.1 补上账户软字节配额告警、缩容 4→3 真进程 loopback e2e，并修复 v1.20.0 源码归档的 Cargo.lock 错误；同日的 v1.21.0 补上控制台一致读、账户管理员 UI、tier 归档/直读摘要绑定与 AP 端点 registry，并修复 Raft follower 滞后导致的成员操作误 404；2026-10-29 的 v1.21.1 同步文档与站点；同日的 v1.22.0 修复桶配额并发与 follower 权限误 403，并补 tier-audit 与升级/迁移脚本；2026-10-30 的 v1.23.0 把 jobs/job_tasks 与 Restore 受理行纳入 Raft 复制（feature level 4），并修复任务重试抖动；同日的 v1.24.0 把 inventory 三表与 lifecycle 游标纳入复制（feature level 5）；2026-10-31 的 v1.25.0 完成全对象 GET 流式直出、列举键缓存、分片并行写、异步审计与 feature level 6 作业保留；同日的 v1.26.0 交付 feature level 7 的恢复后续状态/调度租约复制、账户硬配额与规范化 worker，并补齐流式批量读与复制过滤；同日的 v1.27.0 交付 feature level 8 的硬配额配置/动态 VPC 端点命令、跨版本 MPU 有界回退、Level C Ext 能力协商、AP attested-proxy、Raft 快照分块与日志压缩/分段，以及停写蓝绿 preflight 与单机→集群工具化；2026-11-01 的 v1.28.0 加固 Raft 日志格式标记与旧区间压缩、M8 follower restore fencing、AP 直连 mTLS/AWS PrivateLink API 身份、CMK→legacy 离线全量迁移、Level C 只读排空与 JWT 多密钥轮换，并交付 feature level 9 的 opt-in 复制用量账本（严格硬配额），同时补上真实 v1.26.0 蓝绿、MPU 排空与单机→集群 e2e；2026-11-01 的 v1.28.1 为补丁版：CI 安装 protoc、修复最小配额夹具、收紧 AWS 端点测试与 mixed-MPU 脚本、裁剪历史计划文档；v1.28.2 修复其 CI 暴露的桶配额并发测试夹具；v1.28.3 修复 OLAP 变换流式输入超限的错误映射（400 而非 500）；v1.28.4 仅稳定测试（等待异步缓存重载），无功能变更；v1.28.5 做性能与 CI 加固：DeleteObjects 请求级授权预加载、对象/版本列表批量并发读与 peer fan-out、健康探测并发、复制/审计索引、aether ingest 限流、sync 流式 tee，以及 CI 构建缓存与发布脚本；无 API/配置/Wire/数据格式变更；2026-11-03 的 v1.29.0 交付控制面去数据库化第一阶段：xl-store 系统命名空间 .oss.sys、控制对象 CAS/单调 fencing/持久化锁 token/提交证书与 quorum 读，vpc_endpoints 迁移到 ControlStore/ControlTxn 缝，SQLite 仍为默认后端，无外部行为变更；2026-11-05 的 v1.30.0 继续控制面去数据库化：访问点/OLAP、lifecycle/inventory/tier、buckets/bucket_policies/event_configs/replication_rules 的读写、快照与桶删除级联迁移到 ControlStore/ControlTxn 缝，并加入集群遗留控制对象重认证工具（只读 ReadControlRaw、canonical 分组、fenced 标记、CLI dry-run/apply），同时修复策略覆盖写的 SQLite UPSERT 触发器误报。2026-11-06 的 v1.31.0 交付对象控制存储后端（opt-in）：27 张控制表的节点本地 COW B+tree、单根 CAS 与盘级多数派 quorum，文件 Raft 日志/元数据/快照与 witness，站点 LWW apply/ship/配对走缝，账户用量本地缓存，10 万行快照导入 8.3s。下一版本 v1.32.0 移除 SQLite，对象控制根成为唯一后端：根 <code>control/state/root</code> CAS 提交，节点/大值内容寻址存于 <code>.oss.sys/control/state/</code>，本地运行态在 <code>.oss.sys/local/</code>，Raft 文件在 <code>&lt;raft.db_path&gt;.d/</code>；<code>[cluster]</code>/<code>[stretch]</code> 与 <code>database_url</code> 移除。割接需停全部节点，用归档的 v1.31.0 二进制执行 <code>control-migrate</code>，首次新写入后无反向写入器。每个阶段都有可运行的 e2e、验收记录和对应文档。</p>
             <p>它适合想理解对象存储内部实现的人，也适合需要一套可自托管、可审计、能继续改的 S3 兼容服务的团队。代码是开放的，边界也写清楚了：能做什么，不能做什么，都在 README 和版本日志里。</p>
           </div>
           <aside class="project-facts" data-reveal aria-label="项目档案">
@@ -153,7 +153,7 @@
               <div><dt>实现语言</dt><dd>Rust 2024</dd></div>
               <div><dt>许可证</dt><dd>Apache-2.0</dd></div>
               <div><dt>当前版本</dt><dd>v1.31.0（最新发布）</dd></div>
-              <div><dt>最新发布</dt><dd>控制面迁移：AP/OLAP · lifecycle/inventory/tier · buckets（2026-11-06）</dd></div>
+              <div><dt>最新发布</dt><dd>v1.31 对象控制根已落地；v1.32.0 将移除 SQLite（2026-11-06）</dd></div>
               <div><dt>部署形态</dt><dd>单盘 / 多盘 EC / 多站点 / 3-voter Raft · 全链路 TLS</dd></div>
               <div><dt>源码</dt><dd><a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">github.com/erikwang2013/oss</a></dd></div>
             </dl>
@@ -203,7 +203,7 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
             </article>
             <article class="bento-card span-8" data-reveal>
               <h3>多站点与强一致控制面</h3>
-              <p>sync 桶 remote-first 写与删，stretch 2×6 数据面，3-voter Raft 控制面，witness、11 表快照、cutover 与 force recovery；控制面支持滚动升级窗口，数据面仍非滚动。图为多站点复制拓扑，强一致控制面在其上叠加 Raft 与 witness。</p>
+              <p>sync 桶 remote-first 写与删，多站点数据面，3-voter Raft 控制面（<code>[site]</code> + <code>[raft]</code>），witness、11 表快照与 force recovery；控制面支持滚动升级窗口，数据面仍非滚动。v1.32.0 起静态 <code>[cluster]</code>/<code>[stretch]</code> 拓扑移除。图为多站点复制拓扑，强一致控制面在其上叠加 Raft 与 witness。</p>
               <button class="image-zoom" type="button" data-image="assets/img/m7-sites.svg" data-title="多站点复制" aria-label="放大 多站点复制架构图">
                 <img src="assets/img/m7-sites.svg" width="720" height="360" alt="多站点复制图，两个单节点站点 A/B 的控制面与对象面复制" decoding="async">
               </button>
@@ -216,9 +216,9 @@ aws s3 cp ./backup.tar s3://backup/</code></pre>
               </button>
             </article>
             <article class="bento-card span-8" data-reveal>
-              <h3>v1.31 对象控制存储后端</h3>
-              <p>2026-11-06 发布 v1.31.0：opt-in <code>control_backend="objects"</code> 把 27 张控制表存为节点本地 COW B+tree，单根 CAS 提交、盘级多数派 quorum、启动 flock；Raft 使用文件日志/元数据/快照与元数据型 witness；站点 LWW apply/ship/配对、outbox、审计、上传与秒传索引全部走缝，游标/死信/用量缓存落节点本地；离线迁移保留逐字节校验与回滚窗口。10 万行快照导入 8.3s（此前超时）、导出 1.5s。SQLite 仍为默认后端；无 API、配置、Wire/数据格式变更。</p>
-              <div class="chip-row"><span>object control</span><span>27 tables</span><span>file Raft</span><span>site seam</span><span>goldens</span><span>no wire change</span></div>
+              <h3>对象控制根，v1.32 移除 SQLite</h3>
+              <p>v1.31.0 已把 27 张控制表存为节点本地 COW B+tree，单根 CAS 提交、盘级多数派 quorum、启动 flock；Raft 使用文件日志/元数据/快照与元数据型 witness。v1.32.0 让对象控制根成为唯一后端：<code>.oss.sys/control/state/{node,blob}/</code> 内容寻址、<code>.oss.sys/local/</code> 本地运行态、<code>&lt;raft.db_path&gt;.d/</code> 文件 Raft；<code>sqlx</code>/SQLite、<code>migrations/</code>、<code>[cluster]</code>/<code>[stretch]</code> 与 <code>database_url</code> 移除。升级为停全部节点的一次性单向割接：用归档的 <code>oss-server-v1.31.0-linux-x86_64</code>（sha256 <code>fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae</code>）先 <code>control-migrate --dry-run</code> 再 <code>--apply</code>，首次新写入后只能前进。10 万行快照导入 8.3s（此前超时）、导出 1.5s；控制写 p99 仍需 release build 重测，不宣称达标。</p>
+              <div class="chip-row"><span>object control</span><span>no SQLite</span><span>one-way cutover</span><span>file Raft</span><span>site seam</span><span>v1-32-0</span></div>
             </article>
             <article class="bento-card tint span-4" data-reveal>
               <h3>发布前四闸</h3>
@@ -400,8 +400,13 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
           </div>
           <div class="release-list">
             <article class="release-row" data-reveal>
+              <time datetime="2026-11-07">2026-11-07（计划）</time>
+              <div><strong>v1.32.0</strong><p>移除 SQLite，对象控制根成为唯一后端；根 <code>control/state/root</code> CAS、内容寻址节点/大值、本地运行态与文件 Raft；删除 <code>sqlx</code>/SQLite、<code>migrations/</code>、<code>[cluster]</code>/<code>[stretch]</code> 与 <code>database_url</code>。升级为停全部节点的一次性单向割接，使用归档的 v1.31.0 二进制与 sha256 校验；首次新写入后无反向写入器。</p></div>
+              <a href="changelog.html#v1-32-0">查看</a>
+            </article>
+            <article class="release-row" data-reveal>
               <time datetime="2026-11-06">2026-11-06</time>
-              <div><strong>v1.31.0</strong><p>对象控制存储后端（opt-in）：27 张控制表的节点本地 COW B+tree、单根 CAS、盘级多数派 quorum；文件 Raft 日志/元数据/快照与 witness；站点 LWW apply/ship/配对走缝；账户用量本地缓存；10 万行快照导入 8.3s、导出 1.5s。SQLite 仍为默认后端，无 API/配置/Wire/数据格式变更。</p></div>
+              <div><strong>v1.31.0</strong><p>对象控制存储根（opt-in）：27 张控制表的节点本地 COW B+tree、单根 CAS、盘级多数派 quorum；文件 Raft 日志/元数据/快照与 witness；站点 LWW apply/ship/配对走缝；账户用量本地缓存；10 万行快照导入 8.3s、导出 1.5s。v1.32.0 将移除 SQLite 并使其成为唯一后端。</p></div>
               <a href="changelog.html#v1-31-0">查看</a>
             </article>
             <article class="release-row" data-reveal>
@@ -569,7 +574,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
           <div class="download-band" data-reveal>
             <div>
               <h2>下载 v1.31.0</h2>
-              <p>Release 提供源码归档。当前没有预编译二进制，推荐用 Docker Compose 或按安装文档从源码构建。</p>
+              <p>Release 提供源码归档，以及用于 v1.32.0 割接的归档二进制 <a href="https://github.com/erikwang2013/oss/releases/download/v1.31.0/oss-server-v1.31.0-linux-x86_64"><code>oss-server-v1.31.0-linux-x86_64</code></a>（sha256 <code>fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae</code>）；割接步骤见 <a href="https://github.com/erikwang2013/oss/blob/main/docs/superpowers/runbooks/2026-11-05-object-control-cutover.md">runbook</a>。日常部署仍推荐 Docker Compose 或按安装文档从源码构建。</p>
             </div>
             <div class="download-actions">
               <a class="btn btn-primary btn-lg" href="https://github.com/erikwang2013/oss/releases/tag/v1.31.0" target="_blank" rel="noopener">打开 Release</a>

@@ -17,6 +17,13 @@
   mTLS 与 AWS PrivateLink API 验证、Level C 只读排空、feature 9 opt-in 复制用量账本
   （严格硬配额）、JWT 多密钥轮换、真实蓝绿/MPU 排空/单机→集群 e2e）与 §21–§22 的
   v1.27.0 内容
+- 下一版本：**v1.32.0** 移除 SQLite，对象控制根 `.oss.sys/control/` 成为唯一后端；
+  `sqlx`/SQLite、`migrations/`、`[cluster]`/`[stretch]` 与 `database_url` 移除。升级为停全部节点
+  的一次性单向割接，使用归档的 GitHub Release v1.31.0 二进制
+  `oss-server-v1.31.0-linux-x86_64`（sha256
+  `fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae`）执行
+  `control-migrate`；首次新写入后无反向写入器。历史章节中的 `[cluster]`/`[stretch]` 表述仅作
+  验收记录，不再构成受支持的部署。
 - 集成结果：已合并到 `main`（v1.14.0 能力代码 `86616eb`；v1.15.0 为 post-1.14 硬化集成；
   v1.16.0 为 §2–§4 backlog 第二轮；v1.17.0 为 §13 架构切片；v1.18.0 文档精简；
   v1.19.0 为 Wave1 地基；v1.20.0 为 §14 Wave2 缺口修复，三条工作流独立评审后合并）

@@ -133,6 +133,11 @@
 > witness；站点 LWW apply/ship/配对、outbox/审计/上传/秒传索引与用量缓存走缝；
 > 离线迁移与 goldens；SQLite 仍为默认后端，无接口或数据格式变更。
 >
+> **v1.32.0 移除 SQLite**：对象控制根成为唯一后端；`sqlx`/SQLite、`migrations/`、旧库读取、
+> `[cluster]`/`[stretch]` 与 `database_url` 移除。升级为停全部节点的一次性单向割接，使用归档的
+> v1.31.0 二进制执行 `control-migrate`；首次新写入后无反向写入器。本文历史章节中的 SQLite 与
+> `[cluster]`/`[stretch]` 表述仅适用于 v1.31 及更早版本。
+>
 > 基线：v1.17.0（2026-10-24），Wave2 切片见验收记录 §14（v1.20.0，2026-10-27）；非目标原文见
 > `docs/superpowers/specs/2026-10-23-capability-gaps-acceptance.md` §11.3。
 > 口径：每项给「现状证据 → 真正阻塞点 → 最小可行切片（MVP）→ 明确非目标 → 接口 →

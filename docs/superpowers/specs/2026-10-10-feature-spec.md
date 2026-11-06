@@ -12,6 +12,10 @@
   预留、M7 未映射 REPLICA 对账、OSSCTL2 激活级别导出、WebIdentity JWKS 热加载/
   `email_verified`/按 IP 限速、CMK 离线 CLI/桶默认引用/trash、mesh SSE-C TLS 强制与
   REPLICA 认证、Batch `preempted` UI、DP-0 数据面版本握手、M8 运行态 fencing。见验收 §13。
+- **v1.32.0（2026-11-07）口径**：SQLite 已移除，对象控制根成为唯一控制面后端；
+  `[cluster]`/`[stretch]` 与 `database_url` 不再支持。本文中 SQLite、`[stretch]` 等历史描述仅适用于
+  v1.31 及更早版本，当前行为与割接步骤以 README、v1.32.0 站点与
+  `docs/superpowers/runbooks/2026-11-05-object-control-cutover.md` 为准。
 
 ---
 

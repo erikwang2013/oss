@@ -243,6 +243,13 @@ struct TierState { state: Hot | Archived | RestorePending | Restored, restore_ex
 > 读写、快照导出/安装与桶删除级联迁到同一缝，并加入集群遗留控制对象重认证工具。
 > legacy raw SQL 双后端差分测试锁定行为。SQLite 仍为默认后端；最终切片将删除 sqlx、
 > 迁移目录与全部 SQL，控制面只使用对象后端。
+>
+> **v1.32.0 最终状态（2026-11-07）**：上述切片已收口，`sqlx`/SQLite、`migrations/`、旧库读取路径、
+> `[cluster]`/`[stretch]` 与 `database_url` 已移除；控制面唯一后端是对象控制根（`control/state/root`
+> CAS，节点/大值在 `<data_dir>/.oss.sys/control/state/{node,blob}/`，本地运行态在
+> `<data_dir>/.oss.sys/local/`，Raft 文件在 `<raft.db_path>.d/`）。本节及下文 SQL 表/触发器描述仅适用于
+> v1.31 及更早版本的历史实现，不再构成当前部署口径；割接见
+> `docs/superpowers/runbooks/2026-11-05-object-control-cutover.md`。
 
 | 表 | 用途 | 阶段 |
 |---|---|---|

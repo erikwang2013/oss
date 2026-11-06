@@ -1,3 +1,5 @@
+# RETIRED (v1.32.0): static [cluster]/[stretch] topology and database_url are removed.
+# Historical example only; do not deploy. Use [site] + [raft] instead.
 # M3 集群版：4 节点 × 3 盘 = 12 槽（EC 8+4）+ 控制台。
 #   docker compose -f docker-compose.cluster.yml up --build
 # S3/控制面入口：n1 :9000、n2 :9001、n3 :9002、n4 :9003（任意节点等价——AK 读扇出、

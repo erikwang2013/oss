@@ -1,3 +1,5 @@
+# RETIRED (v1.32.0): static [cluster] topology and database_url are removed.
+# Historical example only; do not deploy. Use [site] + [raft] instead.
 # M3 集群 · 节点 n4（静态拓扑：4 节点 × 3 盘 = 12 槽，EC 8+4）。
 # 临界口径见 README「集群模式」：停 1 节点=写零余量；停 2 节点=写拒且读不可达（500）。
 # addr 用 compose 服务名（主机名）：本节点按它解析绑定，对端按它拨号。
@@ -5,7 +7,6 @@ listen = "0.0.0.0:9000"
 data_dir = "/data/d0"
 data_dirs = ["/data/d0", "/data/d1", "/data/d2"]
 staging_dir = "/staging"
-database_url = "sqlite:///data/oss.db?mode=rwc"
 jwt_secret = ""
 max_put_bytes = 268435456
 

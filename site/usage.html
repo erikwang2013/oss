@@ -140,7 +140,7 @@ aws --endpoint-url $E s3api get-object --bucket photos --key big.bin \
           </ul>
           <div class="callout">
             <img src="assets/img/pet/cute.svg" data-static="assets/img/pet/static/cute.png" width="360" height="400" alt="" decoding="async">
-            <p>控制台里的桶模式、版本控制、生命周期与访问点操作，最终都会走同一套控制面命令。单机是本地 SQLite，强一致模式经 Raft 提交。</p>
+            <p>控制台里的桶模式、版本控制、生命周期与访问点操作，最终都会走同一套控制面命令。控制元数据落在节点本地的对象控制根（v1.32.0 起唯一后端），强一致模式的命令经 Raft 提交并在各节点本地应用。</p>
           </div>
 
           <h2 id="versioning">版本与生命周期</h2>
@@ -215,13 +215,12 @@ aws --endpoint-url $E s3api get-object-retention \
           </div>
 
           <h2 id="consistency">强一致</h2>
-          <p>强一致模式把控制面放到 Raft 上，并把跨站点数据面分成两种模式。两者互斥，按桶或按集群选择。</p>
+          <p>强一致模式把控制面放到 Raft 上，跨站点数据面使用 sync 桶。v1.32.0 起静态 <code>[cluster]</code>/<code>[stretch]</code> 拓扑配置移除，多站点部署使用 <code>[site]</code> + <code>[raft]</code>。</p>
           <div class="table-wrap">
             <table>
               <thead><tr><th>模式</th><th>写语义</th><th>适合</th></tr></thead>
               <tbody>
                 <tr><td>sync 桶</td><td>远端先确认，再提交本地；远端不可达返回 503，不静默降级</td><td>合规桶、小对象、跨站点强一致</td></tr>
-                <tr><td>stretch 2×6</td><td>两站点各 6 盘，EC 8+4，单站点 fail-closed</td><td>双站点数据面，不依赖 witness</td></tr>
                 <tr><td>3-voter Raft</td><td>A/B 数据站点 + C witness，quorum 2</td><td>控制面高可用、成员变更与恢复</td></tr>
               </tbody>
             </table>
@@ -236,7 +235,7 @@ aws --endpoint-url $E s3api get-object-retention \
           </div>
           <div class="callout">
             <img src="assets/img/pet/joy.svg" data-static="assets/img/pet/static/joy.png" width="360" height="400" alt="" decoding="async">
-            <p>强一致的成员变更、witness 部署、cutover 与 force recovery 是运维动作，按 README 的 runbook（随发布同步）执行。不要在运行中的集群手改 <code>raft.db</code>。</p>
+            <p>强一致的成员变更、witness 部署、cutover 与 force recovery 是运维动作，按 README 的 runbook（随发布同步）执行。不要在运行中的集群手改 <code>raft.db</code> 或 <code>&lt;raft.db_path&gt;.d/</code> 文件。</p>
           </div>
 
           <h2 id="upgrade">控制面滚动升级</h2>
@@ -246,6 +245,7 @@ aws --endpoint-url $E s3api get-object-retention \
             <li>成员 add/promote 会预检目标节点的 wire/feature 级别，混合版本时返回 409 并拒绝。</li>
             <li>数据面自 v1.19.0 起为 DP-1 混版门控（NodeHealth wire/epoch/hash；ListObjects V1 带 <code>x-oss-degraded: list-marker</code>、LMU 带 <code>mpu-union</code>，ListObjectVersions 与 MPU 转发对旧对端 fail-closed）；v1.20.0 起 mesh gRPC 入站支持 TLS 物料热轮换（新连接取新配置，旧连接保持旧物料），并已有同版本 3 节点与 v1.13.1 旧二进制的滚动 e2e 通过；生产升级仍需维护窗口。</li>
           </ul>
+          <p><strong>v1.32.0 的 SQLite 移除不支持滚动升级。</strong>所有 Raft voter/witness 必须同版本一起停机和割接。冷备 <code>oss.db</code>/<code>raft.db</code>/数据盘后，用归档的 <a href="https://github.com/erikwang2013/oss/releases/download/v1.31.0/oss-server-v1.31.0-linux-x86_64"><code>oss-server-v1.31.0-linux-x86_64</code></a>（sha256 <code>fc2e96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae</code>）逐节点执行 <code>control-migrate --from &lt;oss.db&gt; --state-dir &lt;data_dir&gt; --raft-db &lt;raft.db&gt; --dry-run</code> 再 <code>--apply</code>，校验报告后启动 v1.32 二进制并完成 auth/console/S3/site/snapshot 冒烟。首次新写入后无反向写入器；回滚只能在首次写入前恢复备份和旧二进制。完整步骤见 <a href="https://github.com/erikwang2013/oss/blob/main/docs/superpowers/runbooks/2026-11-05-object-control-cutover.md">割接 runbook</a>。</p>
 
           <h2 id="ops">运维命令</h2>
           <p>服务端二进制自带巡检、修复、扩容与清理命令。建议先用只读或 dry-run 看报告，再执行写操作。</p>

@@ -2,7 +2,7 @@
 listen = "0.0.0.0:9000"
 data_dir = "/data"
 staging_dir = "/staging"
-database_url = "sqlite:///data/oss.db?mode=rwc"
+# v1.32.0: SQLite removed; control metadata lives in .oss.sys/control/ (no database_url).
 jwt_secret = ""
 max_put_bytes = 268435456
 
