@@ -8,6 +8,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use xl_store::control_store::account::AccountTxn;
+use xl_store::control_store::bucket::BucketTxn;
+use xl_store::control_store::iam::IamTxn;
 use xl_store::store::Store;
 
 use super::apply::{self, SideEffect};
@@ -359,6 +362,69 @@ impl ControlPlane {
         match &self.inner {
             // S6b-d 路由闸：Local 仅供测试/兼容；HTTP handler 不得把 M7
             // 桶生命周期接进来（review I1）。
+            Inner::Local(db) if db.object_control().is_some() => {
+                let db = Arc::clone(db);
+                let object = db
+                    .object_control()
+                    .ok_or_else(|| internal("object control backend not attached"))?
+                    .clone();
+                let quota_cmd = cmd.clone();
+                let (applied, cleared_uid) = object
+                    .control
+                    .transaction(
+                        crate::control_store_obj::WriteOrigin::local("control-local"),
+                        |txn| {
+                            let cmd = quota_cmd.clone();
+                            Box::pin(async move {
+                                let out: Result<_, xl_store::control_store::ControlError> = async {
+                                    // Same atomicity as the SQLite BEGIN IMMEDIATE
+                                    // check: count and insert commit in one root CAS.
+                                    if let ControlCommand::BucketCreate { name, owner, .. } = &cmd
+                                        && !txn.bucket_exists(name).await?
+                                        && let Some(owner) = owner
+                                        && let Some(uid) = txn.user_uid(owner).await?
+                                        && txn.bucket_quota_reached(Some(uid)).await?
+                                    {
+                                        return Ok((None, None));
+                                    }
+                                    let (applied, uid) =
+                                        apply::apply_command_txn(txn, &cmd).await?;
+                                    if let Some(uid) = uid {
+                                        crate::control_store_obj::bucket_clear_owner(txn, uid)
+                                            .await?;
+                                        txn.user_delete(uid).await?;
+                                    }
+                                    Ok((Some(applied), uid))
+                                }
+                                .await;
+                                out.map_err(crate::control_backend::store_error)
+                            })
+                        },
+                    )
+                    .await
+                    .map_err(internal)?;
+                let Some(applied) = applied else {
+                    return Err(ControlError::QuotaExceeded);
+                };
+                // Local uploads are node-local files and cannot join the root CAS (D3).
+                if let Some(uid) = cleared_uid
+                    && let Ok(local) = object.control.local_store()
+                    && let Ok(uploads) = local.uploads()
+                {
+                    for mut record in uploads.all().unwrap_or_default() {
+                        if record.owner_uid == Some(uid) {
+                            record.owner_uid = None;
+                            if let Err(e) = uploads.put(&record) {
+                                tracing::warn!(error = %e, "清本地上传属主失败（下次启动对账）");
+                            }
+                        }
+                    }
+                }
+                if applied.response == ControlResponse::Ok {
+                    self.post.run(applied.effects).await;
+                }
+                Ok(applied.response)
+            }
             Inner::Local(db) => {
                 // AC-2：BucketCreate 的配额 count+insert 必须原子——先取写锁再读计数，
                 // 并发 Local 写只有一个能越过（Raft 路径的闸在 leader append 前）。
@@ -860,6 +926,158 @@ mod tests {
         post.run_one(SideEffect::BucketDirCreate("pcb2".into()))
             .await;
         assert!(store.bucket_exists("pcb2").await.unwrap());
+    }
+
+    async fn object_local_plane() -> (tempfile::TempDir, Arc<Db>, Arc<Store>, ControlPlane) {
+        use xl_store::control_state::root::Mode;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = xl_store::store::StoreConfig::new(dir.path().join("data"));
+        cfg.fsync = false;
+        let store = Arc::new(Store::open(cfg).await.unwrap());
+        let object =
+            crate::control_backend::ObjectControl::open(Arc::clone(&store), Mode::Standalone, None)
+                .await
+                .unwrap();
+        let db = Arc::new(Db::connect_object().await.unwrap());
+        db.attach_object_control(object).unwrap();
+        let plane = ControlPlane::local(
+            Arc::clone(&db),
+            Arc::clone(&store),
+            Arc::new(xl_s3::ap::ApCache::new()),
+            Arc::new(xl_s3::olap::OlapCache::new()),
+            "us-east-1".into(),
+        );
+        (dir, db, store, plane)
+    }
+
+    fn bucket_create(name: &str, owner: Option<&str>) -> ControlCommand {
+        ControlCommand::BucketCreate {
+            name: name.into(),
+            owner: owner.map(str::to_string),
+            created_at: 1,
+            replication_mode: "async".into(),
+            versioning: "Off".into(),
+            object_lock: false,
+            object_lock_default_mode: None,
+            object_lock_default_days: None,
+            default_encryption: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn object_local_control_write_commits_root_and_post_effects() {
+        let (_dir, db, store, plane) = object_local_plane().await;
+        assert_eq!(
+            plane.write(bucket_create("ob-bucket", None)).await.unwrap(),
+            ControlResponse::Ok
+        );
+        assert!(
+            db.control_store()
+                .bucket("ob-bucket")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.bucket_exists("ob-bucket").await.unwrap());
+        // Same name converges, but a replication-mode change conflicts.
+        let mut sync = bucket_create("ob-bucket", None);
+        if let ControlCommand::BucketCreate {
+            replication_mode, ..
+        } = &mut sync
+        {
+            *replication_mode = "sync".into();
+        }
+        assert_eq!(plane.write(sync).await.unwrap(), ControlResponse::Conflict);
+    }
+
+    #[tokio::test]
+    async fn object_local_bucket_quota_is_checked_in_the_commit() {
+        let (_dir, db, _store, plane) = object_local_plane().await;
+        let uid = db
+            .create_user("alice", "alice-pw-123", false)
+            .await
+            .unwrap();
+        let acct = xl_s3::access::account_id_of(uid).unwrap();
+        let ts = crate::db::now();
+        db.control_write("test-quota", move |txn| {
+            let acct = acct.clone();
+            Box::pin(async move { txn.account_set_bucket_quota(&acct, Some(1), ts).await })
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            plane
+                .write(bucket_create("first-bucket", Some("alice")))
+                .await
+                .unwrap(),
+            ControlResponse::Ok
+        );
+        assert!(matches!(
+            plane
+                .write(bucket_create("second-bucket", Some("alice")))
+                .await,
+            Err(ControlError::QuotaExceeded)
+        ));
+        assert!(
+            db.control_store()
+                .bucket("second-bucket")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn object_local_user_delete_clears_bucket_and_upload_owners() {
+        let (_dir, db, _store, plane) = object_local_plane().await;
+        let uid = db
+            .create_user("alice", "alice-pw-123", false)
+            .await
+            .unwrap();
+        plane
+            .write(bucket_create("owned-bucket", Some("alice")))
+            .await
+            .unwrap();
+        let local = db.object_control().unwrap().control.local_store().unwrap();
+        local
+            .uploads()
+            .unwrap()
+            .put(&crate::local_store::UploadRecord {
+                saved_path: "u1".into(),
+                bucket: "owned-bucket".into(),
+                key: "k".into(),
+                group_name: "g".into(),
+                size: 1,
+                etag: "e".into(),
+                original_name: None,
+                owner_uid: Some(uid),
+                created_at: 1,
+                expires_at: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            plane
+                .write(ControlCommand::UserDelete {
+                    username: "alice".into()
+                })
+                .await
+                .unwrap(),
+            ControlResponse::Ok
+        );
+        assert!(db.control_store().user("alice").await.unwrap().is_none());
+        assert_eq!(
+            db.control_store()
+                .bucket("owned-bucket")
+                .await
+                .unwrap()
+                .unwrap()
+                .owner_uid,
+            None
+        );
+        let uploads = local.uploads().unwrap();
+        assert_eq!(uploads.all().unwrap()[0].owner_uid, None);
     }
 
     /// 快照安装后 AP/OLAP 缓存按新控制表重建（seam 读路径）。

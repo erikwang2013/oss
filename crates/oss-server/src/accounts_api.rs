@@ -97,13 +97,7 @@ async fn create_account(
     let created_at = crate::db::now();
     // 与 db.rs 相同：id 冲突概率可忽略，最多重试 8 次（命令只带预生成 id）。
     for _ in 0..8 {
-        let id = match new_account_id(&state).await {
-            Ok(id) => id,
-            Err(e) => {
-                tracing::error!(error = %e, "生成账户 id 失败");
-                return internal_error();
-            }
-        };
+        let id = new_account_id();
         let cmd = ControlCommand::AccountCreate {
             id: id.clone(),
             name: name.to_string(),

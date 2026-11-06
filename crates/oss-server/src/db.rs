@@ -1123,6 +1123,30 @@ impl Db {
         now: i64,
     ) -> Result<bool> {
         let owner = self.owner_ref(owner_id).await?;
+        if self.object.get().is_some() {
+            let name = name.to_owned();
+            let bucket = bucket.to_owned();
+            let policy_json = policy_json.map(str::to_owned);
+            return self
+                .control_write("access-points", move |txn| {
+                    let name = name.clone();
+                    let bucket = bucket.clone();
+                    let policy_json = policy_json.clone();
+                    let owner = owner.clone();
+                    Box::pin(async move {
+                        txn.access_point_create(&AccessPointEntry {
+                            name,
+                            bucket,
+                            owner,
+                            policy_json,
+                            created_at: now,
+                            updated_at: now,
+                        })
+                        .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let created = {
             let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
@@ -1164,6 +1188,20 @@ impl Db {
         policy_json: Option<&str>,
         now: i64,
     ) -> Result<bool> {
+        if self.object.get().is_some() {
+            let name = name.to_owned();
+            let policy_json = policy_json.map(str::to_owned);
+            return self
+                .control_write("access-points", move |txn| {
+                    let name = name.clone();
+                    let policy_json = policy_json.clone();
+                    Box::pin(async move {
+                        txn.access_point_set_policy(&name, policy_json.as_deref(), now)
+                            .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let updated = {
             let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
@@ -1176,6 +1214,15 @@ impl Db {
     }
 
     pub async fn delete_access_point(&self, name: &str) -> Result<bool> {
+        if self.object.get().is_some() {
+            let name = name.to_owned();
+            return self
+                .control_write("access-points", move |txn| {
+                    let name = name.clone();
+                    Box::pin(async move { txn.access_point_delete(&name).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let deleted = {
             let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
@@ -1202,6 +1249,24 @@ impl Db {
         max_response_bytes: i64,
         now: i64,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let row = OlapConfigEntry {
+                access_point: name.to_string(),
+                kind: kind.to_string(),
+                endpoint: endpoint.map(str::to_string),
+                module: module.map(<[u8]>::to_vec),
+                module_sha256: module_sha256.map(str::to_string),
+                timeout_ms,
+                max_response_bytes,
+                updated_at: now,
+            };
+            return self
+                .control_write("olap", move |txn| {
+                    let row = row.clone();
+                    Box::pin(async move { txn.olap_config_upsert(&row).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         {
             let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
@@ -1227,6 +1292,19 @@ impl Db {
     /// 删桶后清理 M8 表（jobs 按审计保留）。S3/console/cluster 路径走这里；
     /// site apply 在既有事务内走 [`Db::clear_bucket_m8_tx`]。
     pub async fn clear_bucket_m8(&self, bucket: &str) -> Result<()> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            return self
+                .control_write("bucket-m8", move |txn| {
+                    let bucket = bucket.clone();
+                    Box::pin(async move {
+                        txn.delete_access_points_for_bucket(&bucket).await?;
+                        txn.delete_lifecycle_inventory_tier_for_bucket(&bucket)
+                            .await
+                    })
+                })
+                .await;
+        }
         let mut conn = self.pool.acquire().await?;
         Self::clear_bucket_m8_tx(&mut conn, bucket).await
     }
@@ -1547,6 +1625,18 @@ impl Db {
 
     /// 对象后端「本地域」写入（sync intent 等 `LocalKv`）：单次 begin + commit，
     /// **不做根 CAS 重试**——本地写已在调用时生效，重放会重复副作用。
+    /// Object-mode local upload store (D4); fails closed without the object backend.
+    fn object_uploads(&self) -> Result<crate::local_store::UploadStore> {
+        self.object
+            .get()
+            .ok_or_else(|| sqlx::Error::Protocol("对象控制面未装配".into()))?
+            .control
+            .local_store()
+            .map_err(|e| sqlx::Error::Protocol(format!("对象本地目录失败：{e}")))?
+            .uploads()
+            .map_err(sqlx::Error::Io)
+    }
+
     pub async fn object_local_write<T, F>(&self, actor: &str, f: F) -> Result<T>
     where
         T: Send,
@@ -2036,6 +2126,24 @@ impl Db {
         size: i64,
         etag: &str,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let uploads = self.object_uploads()?;
+            return uploads
+                .put_if_absent(&crate::local_store::UploadRecord {
+                    saved_path: saved_path.to_string(),
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    group_name: group.to_string(),
+                    size,
+                    etag: etag.to_string(),
+                    original_name: None,
+                    owner_uid: None,
+                    created_at: now(),
+                    expires_at: None,
+                })
+                .map(|_| ())
+                .map_err(sqlx::Error::Io);
+        }
         let mut conn = self.pool.acquire().await?;
         SqliteControlTxn::new(&mut conn)
             .upload_record(&NewUpload {
@@ -2063,6 +2171,19 @@ impl Db {
         owner_id: i64,
         is_admin: bool,
     ) -> Result<bool> {
+        if self.object.get().is_some() {
+            let uploads = self.object_uploads()?;
+            let Some(mut record) = uploads.get(saved_path).map_err(sqlx::Error::Io)? else {
+                return Ok(false);
+            };
+            if !is_admin && record.owner_uid.is_some_and(|owner| owner != owner_id) {
+                return Ok(false);
+            }
+            record.original_name = Some(original_name.to_string());
+            record.owner_uid = Some(owner_id);
+            uploads.put(&record).map_err(sqlx::Error::Io)?;
+            return Ok(true);
+        }
         let mut conn = self.pool.acquire().await?;
         SqliteControlTxn::new(&mut conn)
             .upload_register(saved_path, original_name, owner_id, is_admin)
@@ -2107,6 +2228,19 @@ impl Db {
         bucket: &str,
         algorithm: &str,
     ) -> Result<bool> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            let algorithm = algorithm.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let bucket = bucket.clone();
+                    let algorithm = algorithm.clone();
+                    Box::pin(
+                        async move { txn.bucket_set_default_encryption(&bucket, &algorithm).await },
+                    )
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let changed = crate::control_store::SqliteControlTxn::new(&mut tx)
             .bucket_set_default_encryption(bucket, algorithm)
@@ -2118,6 +2252,15 @@ impl Db {
 
     /// M8 缺口 C：清桶默认加密（幂等）。
     pub async fn clear_bucket_default_encryption(&self, bucket: &str) -> Result<bool> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let bucket = bucket.clone();
+                    Box::pin(async move { txn.bucket_clear_default_encryption(&bucket).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let changed = crate::control_store::SqliteControlTxn::new(&mut tx)
             .bucket_clear_default_encryption(bucket)
@@ -2777,6 +2920,14 @@ impl Db {
                 delete: p.delete,
             })
             .collect();
+        if self.object.get().is_some() {
+            return self
+                .control_write("iam", move |txn| {
+                    let rows = rows.clone();
+                    Box::pin(async move { txn.permissions_replace(uid, &rows).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .permissions_replace(uid, &rows)
@@ -2789,6 +2940,18 @@ impl Db {
     /// 上传归属登记：仅当该记录尚无归属时写入（`AND owner_id IS NULL`）。
     /// 返回是否写入（已归属/记录不存在 → false，调用方 best-effort 忽略）。
     pub async fn set_upload_owner(&self, saved_path: &str, uid: i64) -> Result<bool> {
+        if self.object.get().is_some() {
+            let uploads = self.object_uploads()?;
+            let Some(mut record) = uploads.get(saved_path).map_err(sqlx::Error::Io)? else {
+                return Ok(false);
+            };
+            if record.owner_uid.is_some() {
+                return Ok(false);
+            }
+            record.owner_uid = Some(uid);
+            uploads.put(&record).map_err(sqlx::Error::Io)?;
+            return Ok(true);
+        }
         let mut conn = self.pool.acquire().await?;
         SqliteControlTxn::new(&mut conn)
             .upload_claim(saved_path, uid)
@@ -4950,6 +5113,16 @@ impl Db {
         for r in &mut rows {
             r.updated_at = now;
         }
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            return self
+                .control_write("lifecycle", move |txn| {
+                    let bucket = bucket.clone();
+                    let rows = rows.clone();
+                    Box::pin(async move { txn.replace_lifecycle_rules(&bucket, &rows).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
         txn.replace_lifecycle_rules(bucket, &rows)
@@ -4984,6 +5157,40 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            let rule_id = rule_id.to_owned();
+            let stage = stage.to_owned();
+            let cursor = cursor.map(str::to_owned);
+            let (term, leader) = (fence.term_i64(), fence.leader_i64());
+            return self
+                .control_write("lifecycle", move |txn| {
+                    let bucket = bucket.clone();
+                    let rule_id = rule_id.clone();
+                    let stage = stage.clone();
+                    let row = cursor.as_ref().filter(|c| !c.is_empty()).map(|c| {
+                        xl_store::control_store::lifecycle::LifecycleCursorRow {
+                            bucket: bucket.clone(),
+                            rule_id: rule_id.clone(),
+                            stage: stage.clone(),
+                            cursor: c.clone(),
+                            updated_at: now,
+                            fence_term: term,
+                            fence_leader: leader,
+                        }
+                    });
+                    Box::pin(async move {
+                        match row {
+                            Some(row) => txn.lifecycle_cursor_upsert(&row).await.map(|_| ()),
+                            None => {
+                                txn.lifecycle_cursor_delete(&bucket, &rule_id, &stage, term)
+                                    .await
+                            }
+                        }
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
         match cursor {
@@ -5120,6 +5327,17 @@ impl Db {
 
     /// 建作业 + 任务（同一事务）。任务 `task_no` 从 1 起；作业初始 `queued`。
     pub async fn create_job(&self, spec: &JobSpec, now: i64) -> Result<i64> {
+        if self.object.get().is_some() {
+            let insert = job_insert(spec, now);
+            let tasks = new_tasks(spec, now);
+            return self
+                .control_write("jobs", move |txn| {
+                    let insert = insert.clone();
+                    let tasks = tasks.clone();
+                    Box::pin(async move { txn.job_create(&insert, &tasks).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let id = crate::control_store::SqliteControlTxn::new(&mut tx)
             .job_create(&job_insert(spec, now), &new_tasks(spec, now))
@@ -5132,6 +5350,17 @@ impl Db {
     /// 建带 dedupe 的作业：任务 `INSERT OR IGNORE`，一条都没插入（全被去重）→
     /// 整个事务回滚并返回 None（C7：不产生空作业）。
     pub async fn create_job_dedup(&self, spec: &JobSpec, now: i64) -> Result<Option<i64>> {
+        if self.object.get().is_some() {
+            let insert = job_insert(spec, now);
+            let tasks = new_tasks(spec, now);
+            return self
+                .control_write("jobs", move |txn| {
+                    let insert = insert.clone();
+                    let tasks = tasks.clone();
+                    Box::pin(async move { txn.job_create_dedup(&insert, &tasks).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let id = crate::control_store::SqliteControlTxn::new(&mut tx)
             .job_create_dedup(&job_insert(spec, now), &new_tasks(spec, now))
@@ -5163,6 +5392,40 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<(i64, bool)> {
+        if self.object.get().is_some() {
+            let insert = job_insert(spec, now);
+            let tasks = new_tasks(spec, now);
+            let bucket = bucket.to_owned();
+            let key = key.to_owned();
+            let version_id = version_id.to_owned();
+            let fence_term = fence.term_i64();
+            let fence_leader = fence.leader_i64();
+            return self
+                .control_write("jobs", move |txn| {
+                    let insert = insert.clone();
+                    let tasks = tasks.clone();
+                    let bucket = bucket.clone();
+                    let key = key.clone();
+                    let version_id = version_id.clone();
+                    Box::pin(async move {
+                        let (id, inserted) = txn.job_create_restore(&insert, &tasks).await?;
+                        txn.tier_restore_upsert(&TierRestoreRow {
+                            bucket,
+                            key,
+                            version_id,
+                            expires_at: 0,
+                            job_id: Some(id),
+                            state: "pending".into(),
+                            created_at: now,
+                            fence_term,
+                            fence_leader,
+                        })
+                        .await?;
+                        Ok((id, inserted))
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
         let (id, inserted) = txn
@@ -5243,6 +5506,33 @@ impl Db {
         expires_at: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            let key = key.to_owned();
+            let version_id = version_id.to_owned();
+            let state = state.to_owned();
+            let (term, leader) = (fence.term_i64(), fence.leader_i64());
+            return self
+                .control_write("tier-restore", move |txn| {
+                    let bucket = bucket.clone();
+                    let key = key.clone();
+                    let version_id = version_id.clone();
+                    let state = state.clone();
+                    Box::pin(async move {
+                        txn.tier_restore_set_state(
+                            &bucket,
+                            &key,
+                            &version_id,
+                            &state,
+                            expires_at,
+                            term,
+                            leader,
+                        )
+                        .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .tier_restore_set_state(
@@ -5274,6 +5564,23 @@ impl Db {
         version_id: &str,
         fence: FencingEpoch,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            let key = key.to_owned();
+            let version_id = version_id.to_owned();
+            let term = fence.term_i64();
+            return self
+                .control_write("tier-restore", move |txn| {
+                    let bucket = bucket.clone();
+                    let key = key.clone();
+                    let version_id = version_id.clone();
+                    Box::pin(async move {
+                        txn.tier_restore_delete(&bucket, &key, &version_id, term)
+                            .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .tier_restore_delete(bucket, key, version_id, fence.term_i64())
@@ -5971,6 +6278,14 @@ impl Db {
             config_json: config_json.to_string(),
             updated_at: now,
         };
+        if self.object.get().is_some() {
+            return self
+                .control_write("inventory", move |txn| {
+                    let row = row.clone();
+                    Box::pin(async move { txn.inventory_config_upsert(&row).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .inventory_config_upsert(&row)
@@ -5981,6 +6296,17 @@ impl Db {
     }
 
     pub async fn inventory_delete_config(&self, bucket: &str, id: &str) -> Result<bool> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            let id = id.to_owned();
+            return self
+                .control_write("inventory", move |txn| {
+                    let bucket = bucket.clone();
+                    let id = id.clone();
+                    Box::pin(async move { txn.inventory_config_delete(&bucket, &id).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let deleted = crate::control_store::SqliteControlTxn::new(&mut tx)
             .inventory_config_delete(bucket, id)
@@ -6008,6 +6334,33 @@ impl Db {
         enabled: bool,
         now: i64,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            let config_id = config_id.to_owned();
+            return self
+                .control_write("inventory", move |txn| {
+                    let bucket = bucket.clone();
+                    let config_id = config_id.clone();
+                    Box::pin(async move {
+                        if enabled {
+                            txn.inventory_incremental_upsert(&InventoryIncrementalRow {
+                                bucket: bucket.clone(),
+                                config_id: config_id.clone(),
+                                enabled: true,
+                                updated_at: now,
+                            })
+                            .await?;
+                        } else {
+                            txn.inventory_incremental_delete(&bucket, &config_id)
+                                .await?;
+                            txn.inventory_cursor_delete(&bucket, &config_id, None)
+                                .await?;
+                        }
+                        Ok(())
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         {
             let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
@@ -6060,6 +6413,39 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            let config_id = config_id.to_owned();
+            let cursor = cursor.map(str::to_owned);
+            let (term, leader) = (fence.term_i64(), fence.leader_i64());
+            return self
+                .control_write("inventory", move |txn| {
+                    let bucket = bucket.clone();
+                    let config_id = config_id.clone();
+                    let cursor = cursor.clone();
+                    Box::pin(async move {
+                        match cursor.as_deref().filter(|c| !c.is_empty()) {
+                            Some(c) => txn
+                                .inventory_cursor_upsert(&InventoryCursorRow {
+                                    bucket,
+                                    config_id,
+                                    cursor: c.to_string(),
+                                    config_updated_at,
+                                    updated_at: now,
+                                    fence_term: term,
+                                    fence_leader: leader,
+                                })
+                                .await
+                                .map(|_| ()),
+                            None => {
+                                txn.inventory_cursor_delete(&bucket, &config_id, Some(term))
+                                    .await
+                            }
+                        }
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         {
             let mut txn = crate::control_store::SqliteControlTxn::new(&mut tx);
@@ -6098,6 +6484,23 @@ impl Db {
         now: i64,
         fence: FencingEpoch,
     ) -> Result<Option<i64>> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            let config_id = config_id.to_owned();
+            let run_key = run_key.to_owned();
+            let (term, leader) = (fence.term_i64(), fence.leader_i64());
+            return self
+                .control_write("inventory", move |txn| {
+                    let bucket = bucket.clone();
+                    let config_id = config_id.clone();
+                    let run_key = run_key.clone();
+                    Box::pin(async move {
+                        txn.inventory_run_create(&bucket, &config_id, &run_key, now, term, leader)
+                            .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         let id = crate::control_store::SqliteControlTxn::new(&mut tx)
             .inventory_run_create(
@@ -6120,6 +6523,17 @@ impl Db {
         job_id: i64,
         fence: FencingEpoch,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let (term, leader) = (fence.term_i64(), fence.leader_i64());
+            return self
+                .control_write("inventory", move |txn| {
+                    Box::pin(async move {
+                        txn.inventory_run_set_job(run_id, job_id, term, leader)
+                            .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .inventory_run_set_job(run_id, job_id, fence.term_i64(), fence.leader_i64())
@@ -6139,6 +6553,16 @@ impl Db {
     ) -> Result<()> {
         // `started_at` 只在首次执行时写；更高 term 的重试要重标 token，旧执行器的收尾
         // 才会被 `fence_term <= ?` 拒绝。
+        if self.object.get().is_some() {
+            let (term, leader) = (fence.term_i64(), fence.leader_i64());
+            return self
+                .control_write("inventory", move |txn| {
+                    Box::pin(
+                        async move { txn.inventory_run_started(run_id, now, term, leader).await },
+                    )
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .inventory_run_started(run_id, now, fence.term_i64(), fence.leader_i64())
@@ -6169,6 +6593,30 @@ impl Db {
         error: Option<&str>,
         fence: FencingEpoch,
     ) -> Result<()> {
+        if self.object.get().is_some() {
+            let state = state.to_owned();
+            let manifest_key = manifest_key.map(str::to_owned);
+            let error = error.map(str::to_owned);
+            let (term, leader) = (fence.term_i64(), fence.leader_i64());
+            return self
+                .control_write("inventory", move |txn| {
+                    let state = state.clone();
+                    let manifest_key = manifest_key.clone();
+                    let error = error.clone();
+                    Box::pin(async move {
+                        txn.inventory_run_finish(
+                            run_id,
+                            &state,
+                            manifest_key.as_deref(),
+                            error.as_deref(),
+                            term,
+                            leader,
+                        )
+                        .await
+                    })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .inventory_run_finish(
@@ -6238,6 +6686,17 @@ impl Db {
 
     /// 写桶策略（全量替换）。
     pub async fn set_bucket_policy(&self, bucket: &str, json: &str, now: i64) -> Result<()> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            let json = json.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let bucket = bucket.clone();
+                    let json = json.clone();
+                    Box::pin(async move { txn.bucket_policy_set(&bucket, &json, now).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .bucket_policy_set(bucket, json, now)
@@ -6249,6 +6708,15 @@ impl Db {
 
     /// 清桶策略（删桶时连同清理——桶名可复用，S6-1 同款语义）。
     pub async fn clear_bucket_policy(&self, bucket: &str) -> Result<()> {
+        if self.object.get().is_some() {
+            let bucket = bucket.to_owned();
+            return self
+                .control_write("console", move |txn| {
+                    let bucket = bucket.clone();
+                    Box::pin(async move { txn.bucket_policy_delete(&bucket).await })
+                })
+                .await;
+        }
         let mut tx = self.pool.begin().await?;
         crate::control_store::SqliteControlTxn::new(&mut tx)
             .bucket_policy_delete(bucket)

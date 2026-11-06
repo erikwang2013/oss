@@ -188,10 +188,8 @@ pub(crate) fn bad(msg: &str) -> Response {
 }
 
 /// 12 位账户 id：与 `Db::create_account` 同分布；命令只携带算好的值。
-pub(crate) async fn new_account_id(state: &AppState) -> Result<String, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT printf('%012d', 100000000000 + ((random() & 0x7fffffffffffffff) % 900000000000))",
-    )
-    .fetch_one(state.db.pool())
-    .await
+/// Backend-neutral: no SQL engine is involved in object mode.
+pub(crate) fn new_account_id() -> String {
+    let n = uuid::Uuid::new_v4().as_u128() % 900_000_000_000 + 100_000_000_000;
+    format!("{n:012}")
 }
