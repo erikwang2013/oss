@@ -4,13 +4,56 @@
 
 use super::ObjectControlTxn;
 use super::iam::{
-    AccessKeyRow, UserRow, access_key_row, backend, enc, uid_key, user_row_by_uid,
-    user_row_by_username,
+    AccessKeyRow, PermissionStorageRow, UserRow, access_key_row, backend, enc, uid_key,
+    user_row_by_uid, user_row_by_username,
 };
+use super::site_apply::{AccessKeySiteRow, PermissionSiteRow, UserSiteRow};
 use super::table::TableId;
 use super::txn::RAFT_GUARD;
 use xl_store::control_state::root::Mode;
 use xl_store::control_store::ControlError;
+
+pub(crate) fn user_site_row(row: &UserRow) -> UserSiteRow {
+    UserSiteRow {
+        username: row.username.clone(),
+        password_hash: row.password_hash.clone(),
+        status: row.status.clone(),
+        created_at: row.created_at,
+        is_admin: row.is_admin,
+    }
+}
+
+pub(crate) async fn access_key_site_row(
+    txn: &ObjectControlTxn,
+    row: &AccessKeyRow,
+) -> Result<AccessKeySiteRow, ControlError> {
+    let owner = user_row_by_uid(txn, row.user_id).await?;
+    Ok(AccessKeySiteRow {
+        access_key: row.access_key.clone(),
+        secret_key: row.secret_key.clone(),
+        username: owner.as_ref().map(|u| u.username.clone()),
+        status: row.status.clone(),
+        expires_at: row.expires_at,
+        created_at: row.created_at,
+        kind: row.kind.clone(),
+        owner_is_admin: owner.as_ref().map(|u| u.is_admin),
+    })
+}
+
+pub(crate) async fn permission_site_row(
+    txn: &ObjectControlTxn,
+    row: &PermissionStorageRow,
+) -> Result<PermissionSiteRow, ControlError> {
+    let owner = user_row_by_uid(txn, row.user_id).await?;
+    Ok(PermissionSiteRow {
+        username: owner.as_ref().map(|u| u.username.clone()),
+        bucket: row.bucket.clone(),
+        can_read: row.can_read,
+        can_write: row.can_write,
+        can_delete: row.can_delete,
+        owner_is_admin: owner.as_ref().map(|u| u.is_admin),
+    })
+}
 
 /// True when the raft guard does not apply: standalone mode, or a replicated
 /// origin (Raft apply / snapshot install) is the writer.
@@ -103,6 +146,8 @@ pub(crate) async fn insert_user(
     txn.put(TableId::Users, &uid_key(uid), &enc(&row)?)
         .await
         .map_err(backend)?;
+    txn.site_hook_user(None, Some(&user_site_row(&row)), crate::db::now())
+        .await?;
     Ok(uid)
 }
 
@@ -118,5 +163,8 @@ pub(crate) async fn insert_access_key(
     guard_key_new(txn, &row.kind, row.user_id).await?;
     txn.put(TableId::AccessKeys, row.access_key.as_bytes(), &enc(row)?)
         .await
-        .map_err(backend)
+        .map_err(backend)?;
+    let site = access_key_site_row(txn, row).await?;
+    txn.site_hook_access_key(None, Some(&site), crate::db::now())
+        .await
 }

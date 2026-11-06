@@ -4,10 +4,61 @@ use xl_store::control_store::bucket::{BucketCreateOutcome, BucketEntry, BucketTx
 use xl_store::control_store::{ControlError, OwnerRef};
 
 use super::bucket::{
-    BucketRow, CResult, admin_uid, backend, decode_row, encode_row, key1, txn_scan_all,
+    BucketRow, CResult, UserLookup, admin_uid, backend, decode_row, encode_row, key1, txn_scan_all,
     user_by_name,
 };
+use super::site_apply::{BucketSiteRow, PolicySiteRow};
 use super::{ObjectControlTxn, TableId};
+
+async fn bucket_site_row(txn: &ObjectControlTxn, row: &BucketRow) -> CResult<BucketSiteRow> {
+    let owner_username = match row.owner_uid {
+        Some(uid) => UserLookup::user_by_uid(txn, uid).await?.map(|u| u.username),
+        None => None,
+    };
+    Ok(BucketSiteRow {
+        name: row.name.clone(),
+        owner_uid: row.owner_uid,
+        owner_username,
+        creation_date: row.creation_date,
+        versioning: row.versioning.clone(),
+        object_lock: row.object_lock,
+    })
+}
+
+/// M7 trigger `site_log_bucket_{ins,upd,del}` (update only for
+/// versioning/owner/object-lock — the hook applies that predicate).
+async fn emit_bucket(
+    txn: &mut ObjectControlTxn,
+    old: Option<&BucketRow>,
+    new: Option<&BucketRow>,
+) -> CResult<()> {
+    let old = match old {
+        Some(row) => Some(bucket_site_row(txn, row).await?),
+        None => None,
+    };
+    let new = match new {
+        Some(row) => Some(bucket_site_row(txn, row).await?),
+        None => None,
+    };
+    txn.site_hook_bucket(old.as_ref(), new.as_ref(), crate::db::now())
+        .await
+}
+
+async fn policy_site_row(txn: &ObjectControlTxn, bucket: &str) -> CResult<Option<PolicySiteRow>> {
+    let Some(bytes) = txn
+        .get(TableId::BucketPolicies, &key1(bucket))
+        .await
+        .map_err(backend)?
+    else {
+        return Ok(None);
+    };
+    let row: xl_store::control_store::bucket::BucketPolicyEntry = decode_row(&bytes)?;
+    Ok(Some(PolicySiteRow {
+        bucket: row.bucket,
+        policy_json: row.policy_json,
+        updated_at: row.updated_at,
+    }))
+}
 
 async fn get_bucket(txn: &ObjectControlTxn, name: &str) -> CResult<Option<BucketRow>> {
     let row = txn
@@ -46,8 +97,10 @@ pub(crate) async fn bucket_clear_owner(txn: &mut ObjectControlTxn, uid: i64) -> 
     for (_, value) in txn_scan_all(txn, TableId::Buckets).await? {
         let mut row: BucketRow = decode_row(&value)?;
         if row.owner_uid == Some(uid) {
+            let old = row.clone();
             row.owner_uid = None;
             put_bucket(txn, &row).await?;
+            emit_bucket(txn, Some(&old), Some(&row)).await?;
         }
     }
     Ok(())
@@ -61,8 +114,10 @@ async fn mutate_bucket(
     let Some(mut row) = get_bucket(txn, name).await? else {
         return Ok(false);
     };
+    let old = row.clone();
     f(&mut row);
     put_bucket(txn, &row).await?;
+    emit_bucket(txn, Some(&old), Some(&row)).await?;
     Ok(true)
 }
 
@@ -79,6 +134,7 @@ impl BucketTxn for ObjectControlTxn {
             if existing.replication_mode != row.replication_mode {
                 return Ok(BucketCreateOutcome::ModeConflict);
             }
+            let old = existing.clone();
             existing.owner_uid = owner_uid;
             existing.versioning = row.versioning.clone();
             existing.object_lock = row.object_lock;
@@ -88,18 +144,26 @@ impl BucketTxn for ObjectControlTxn {
             existing.replication_mode = row.replication_mode.clone();
             existing.deleting = false;
             put_bucket(self, &existing).await?;
+            emit_bucket(self, Some(&old), Some(&existing)).await?;
             return Ok(BucketCreateOutcome::Updated);
         }
         let mut created = BucketRow::new(row, owner_uid, 0);
         created.deleting = false;
         put_bucket(self, &created).await?;
+        emit_bucket(self, None, Some(&created)).await?;
         Ok(BucketCreateOutcome::Created)
     }
 
     async fn bucket_delete(&mut self, name: &str) -> CResult<bool> {
-        self.delete(TableId::Buckets, &key1(name))
+        let old = get_bucket(self, name).await?;
+        let deleted = self
+            .delete(TableId::Buckets, &key1(name))
             .await
-            .map_err(backend)
+            .map_err(backend)?;
+        if deleted && let Some(old) = old {
+            emit_bucket(self, Some(&old), None).await?;
+        }
+        Ok(deleted)
     }
 
     async fn bucket_set_deleting(&mut self, name: &str, deleting: bool) -> CResult<bool> {
@@ -146,6 +210,7 @@ impl BucketTxn for ObjectControlTxn {
         policy_json: &str,
         updated_at: i64,
     ) -> CResult<()> {
+        let old = policy_site_row(self, bucket).await?;
         let mut row = match self
             .get(TableId::BucketPolicies, &key1(bucket))
             .await
@@ -163,13 +228,25 @@ impl BucketTxn for ObjectControlTxn {
         let bytes = encode_row(&row)?;
         self.put(TableId::BucketPolicies, &key1(bucket), &bytes)
             .await
-            .map_err(backend)
+            .map_err(backend)?;
+        let new = PolicySiteRow {
+            bucket: row.bucket,
+            policy_json: row.policy_json,
+            updated_at: row.updated_at,
+        };
+        self.site_hook_policy(old.as_ref(), Some(&new), crate::db::now())
+            .await
     }
 
     async fn bucket_policy_delete(&mut self, bucket: &str) -> CResult<()> {
+        let old = policy_site_row(self, bucket).await?;
         self.delete(TableId::BucketPolicies, &key1(bucket))
             .await
             .map_err(backend)?;
+        if let Some(old) = old {
+            self.site_hook_policy(Some(&old), None, crate::db::now())
+                .await?;
+        }
         Ok(())
     }
 
@@ -230,12 +307,19 @@ impl BucketTxn for ObjectControlTxn {
     }
 
     async fn delete_bucket_configs_for_bucket(&mut self, bucket: &str) -> CResult<()> {
+        // Only bucket_policies is a site-replicated entity; the trigger emits a
+        // delete for an existing row.
+        let old = policy_site_row(self, bucket).await?;
         for table in [
             TableId::BucketPolicies,
             TableId::EventConfigs,
             TableId::ReplicationRules,
         ] {
             self.delete(table, &key1(bucket)).await.map_err(backend)?;
+        }
+        if let Some(old) = old {
+            self.site_hook_policy(Some(&old), None, crate::db::now())
+                .await?;
         }
         Ok(())
     }
@@ -268,7 +352,8 @@ impl BucketTxn for ObjectControlTxn {
             replication_mode: replication_mode.into(),
             deleting: false,
         };
-        put_bucket(self, &row).await
+        put_bucket(self, &row).await?;
+        emit_bucket(self, None, Some(&row)).await
     }
 
     async fn bucket_upsert_owner_set_mode(
@@ -279,7 +364,8 @@ impl BucketTxn for ObjectControlTxn {
         replication_mode: &str,
         creation_date: i64,
     ) -> CResult<()> {
-        let mut row = match get_bucket(self, name).await? {
+        let old = get_bucket(self, name).await?;
+        let mut row = match old.clone() {
             Some(row) => row,
             None => BucketRow {
                 name: name.into(),
@@ -309,7 +395,8 @@ impl BucketTxn for ObjectControlTxn {
         row.default_encryption = None;
         row.replication_mode = replication_mode.into();
         row.deleting = false;
-        put_bucket(self, &row).await
+        put_bucket(self, &row).await?;
+        emit_bucket(self, old.as_ref(), Some(&row)).await
     }
 
     async fn bucket_upsert_set(

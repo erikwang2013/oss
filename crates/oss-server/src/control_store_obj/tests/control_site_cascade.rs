@@ -5,21 +5,21 @@ use serde_json::json;
 use xl_store::control_store::OwnerRef;
 use xl_store::control_store::bucket::{BucketEntry, BucketTxn};
 use xl_store::control_store::iam::{IamTxn, UserEntry};
+use xl_store::control_store::sites::SiteTxn;
 
-use super::control_site_triggers::{
-    PASSWORD_HASH, USER, clock_rows, obj_rows, standalone_site, user,
-};
+use super::control_site_triggers::{PASSWORD_HASH, SITE_ID, USER, clock_rows, obj_rows};
 use super::golden;
-use super::site_common::{now, se};
+use super::site_common::se;
 use super::support;
-use crate::control_store_obj::bucket::{BucketRow, decode_row, encode_row, key1};
-use crate::control_store_obj::site_apply::{AccessKeySiteRow, BucketSiteRow, PermissionSiteRow};
+use crate::control_store_obj::bucket::{BucketRow, decode_row, key1};
 use crate::control_store_obj::{TableId, WriteOrigin};
 use crate::local_store::UploadRecord;
 
 #[tokio::test]
 async fn user_delete_cascade_matches_golden() {
-    let real = standalone_site().await;
+    // The SQLite capture pairs the peer after seeding the rows, so setup writes
+    // do not emit changelog entries; mirror that ordering.
+    let real = support::object_store(xl_store::control_state::root::Mode::Standalone).await;
     let uid = support::object_iam(&real.control, WriteOrigin::local("seed"), |t| {
         Box::pin(async move {
             t.user_create(&UserEntry {
@@ -77,63 +77,46 @@ async fn user_delete_cascade_matches_golden() {
         })
         .unwrap();
 
-    let ts = now();
+    // Pair after the fixture rows exist (same as the SQLite capture).
+    let peer = xl_store::control_store::sites::SitePeerRow {
+        peer_id: "peer-b".into(),
+        remote_site_id: "remote-b".into(),
+        name: "b".into(),
+        endpoint: "http://127.0.0.1:9".into(),
+        region: "us-east-1".into(),
+        priority: 0,
+        s3_access_key: "ak".into(),
+        s3_secret_key: "sk".into(),
+        peer_site_token: "tok".into(),
+        created_at: 0,
+        last_seen: None,
+        last_error: None,
+        raft_node_id: None,
+        reconcile_required: false,
+    };
+    real.control
+        .transaction(WriteOrigin::local("seed"), |txn| {
+            let peer = peer.clone();
+            Box::pin(async move {
+                txn.site_config_seed(SITE_ID, "tok", 1).await.map_err(se)?;
+                txn.site_config_apply(None, None, Some(7), None)
+                    .await
+                    .map_err(se)?;
+                txn.site_insert(&peer, 1).await.map_err(se)?;
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
     real.control
         .transaction(WriteOrigin::local("test"), |txn| {
             Box::pin(async move {
-                let ak = AccessKeySiteRow {
-                    access_key: "AKCASCADE-GOLDEN".into(),
-                    secret_key: "SK-CAS".into(),
-                    username: Some(USER.into()),
-                    status: "active".into(),
-                    expires_at: None,
-                    created_at: 559,
-                    kind: "long-term".into(),
-                    owner_is_admin: Some(false),
-                };
-                txn.site_hook_access_key(Some(&ak), None, ts)
-                    .await
-                    .map_err(se)?;
                 txn.access_key_delete("AKCASCADE-GOLDEN")
                     .await
                     .map_err(se)?;
-                let perm = PermissionSiteRow {
-                    username: Some(USER.into()),
-                    bucket: "cascade-b".into(),
-                    can_read: true,
-                    can_write: true,
-                    can_delete: true,
-                    owner_is_admin: Some(false),
-                };
-                txn.site_hook_permission(Some(&perm), None, ts)
-                    .await
-                    .map_err(se)?;
                 txn.permission_delete(uid, "cascade-b").await.map_err(se)?;
-                let old = BucketSiteRow {
-                    name: "cascade-b".into(),
-                    owner_uid: Some(uid),
-                    owner_username: Some(USER.into()),
-                    creation_date: 1,
-                    versioning: "Off".into(),
-                    object_lock: false,
-                };
-                let new = BucketSiteRow {
-                    owner_uid: None,
-                    owner_username: None,
-                    ..old.clone()
-                };
-                txn.site_hook_bucket(Some(&old), Some(&new), ts)
-                    .await
-                    .map_err(se)?;
-                let key = key1("cascade-b");
-                let bytes = txn.get(TableId::Buckets, &key).await?.unwrap();
-                let mut row: BucketRow = decode_row(&bytes).map_err(se)?;
-                row.owner_uid = None;
-                let bytes = encode_row(&row).map_err(se)?;
-                txn.put(TableId::Buckets, &key, &bytes).await?;
-                txn.site_hook_user(Some(&user("active")), None, ts)
-                    .await
-                    .map_err(se)?;
+                txn.bucket_clear_owner(uid).await.map_err(se)?;
                 txn.user_delete(uid).await.map_err(se)?;
                 Ok(())
             })
@@ -154,7 +137,7 @@ async fn user_delete_cascade_matches_golden() {
     let changelog: Vec<_> = rows
         .iter()
         .map(|r| {
-            assert!(r.ts > 0 && r.ts == ts && r.created_at == ts);
+            assert!(r.ts > 0 && r.created_at == r.ts);
             json!({
                 "seq": r.seq,
                 "origin_site_id": &r.origin_site_id,

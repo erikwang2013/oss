@@ -13,7 +13,8 @@ use super::iam::{
     user_uid_by_username, users_missing_accounts,
 };
 use super::iam_write::{
-    guard_key_old, guard_permission, guard_user_old, insert_access_key, insert_user, owner_is_admin,
+    access_key_site_row, guard_key_old, guard_permission, guard_user_old, insert_access_key,
+    insert_user, owner_is_admin, permission_site_row, user_site_row,
 };
 use super::table::TableId;
 
@@ -113,17 +114,23 @@ impl IamTxn for ObjectControlTxn {
         for row in scan_access_keys(self).await? {
             if row.user_id == uid {
                 guard_key_old(self, Some(&row)).await?;
+                let site = access_key_site_row(self, &row).await?;
                 self.delete(TableId::AccessKeys, row.access_key.as_bytes())
                     .await
                     .map_err(backend)?;
+                self.site_hook_access_key(Some(&site), None, crate::db::now())
+                    .await?;
             }
         }
         for row in scan_permissions(self).await? {
             if row.user_id == uid {
                 guard_permission(self, row.user_id).await?;
+                let site = permission_site_row(self, &row).await?;
                 self.delete(TableId::Permissions, &permission_key(uid, &row.bucket))
                     .await
                     .map_err(backend)?;
+                self.site_hook_permission(Some(&site), None, crate::db::now())
+                    .await?;
             }
         }
         Ok(())
@@ -134,9 +141,12 @@ impl IamTxn for ObjectControlTxn {
             return Ok(false);
         };
         guard_user_old(self, Some(&row)).await?;
+        let site = user_site_row(&row);
         self.delete(TableId::Users, &uid_key(uid))
             .await
             .map_err(backend)?;
+        self.site_hook_user(Some(&site), None, crate::db::now())
+            .await?;
         on_user_deleted(self, uid).await?;
         Ok(true)
     }
@@ -150,10 +160,13 @@ impl IamTxn for ObjectControlTxn {
             return Ok(false);
         };
         guard_user_old(self, Some(&row)).await?;
+        let old = user_site_row(&row);
         row.password_hash = password_hash.to_owned();
         self.put(TableId::Users, &uid_key(uid), &enc(&row)?)
             .await
             .map_err(backend)?;
+        self.site_hook_user(Some(&old), Some(&user_site_row(&row)), crate::db::now())
+            .await?;
         Ok(true)
     }
 
@@ -172,10 +185,13 @@ impl IamTxn for ObjectControlTxn {
             }
         }
         guard_user_old(self, Some(&row)).await?;
+        let old = user_site_row(&row);
         row.status = if active { "active" } else { "disabled" }.into();
         self.put(TableId::Users, &uid_key(uid), &enc(&row)?)
             .await
             .map_err(backend)?;
+        self.site_hook_user(Some(&old), Some(&user_site_row(&row)), crate::db::now())
+            .await?;
         Ok(true)
     }
 
@@ -188,10 +204,13 @@ impl IamTxn for ObjectControlTxn {
             return Ok(false);
         };
         guard_user_old(self, Some(&row)).await?;
+        let old = user_site_row(&row);
         row.status = status.to_owned();
         self.put(TableId::Users, &uid_key(uid), &enc(&row)?)
             .await
             .map_err(backend)?;
+        self.site_hook_user(Some(&old), Some(&user_site_row(&row)), crate::db::now())
+            .await?;
         Ok(true)
     }
 
@@ -203,9 +222,12 @@ impl IamTxn for ObjectControlTxn {
         for row in scan_permissions(self).await? {
             if row.user_id == uid {
                 guard_permission(self, uid).await?;
+                let site = permission_site_row(self, &row).await?;
                 self.delete(TableId::Permissions, &permission_key(uid, &row.bucket))
                     .await
                     .map_err(backend)?;
+                self.site_hook_permission(Some(&site), None, crate::db::now())
+                    .await?;
             }
         }
         for p in rows {
@@ -224,6 +246,9 @@ impl IamTxn for ObjectControlTxn {
             )
             .await
             .map_err(backend)?;
+            let site = permission_site_row(self, &row).await?;
+            self.site_hook_permission(None, Some(&site), crate::db::now())
+                .await?;
         }
         Ok(())
     }
@@ -244,6 +269,7 @@ impl IamTxn for ObjectControlTxn {
             .transpose()?
         {
             guard_permission(self, row.user_id).await?;
+            let old = permission_site_row(self, &row).await?;
             row.can_read = read;
             row.can_write = write;
             row.can_delete = delete;
@@ -254,6 +280,9 @@ impl IamTxn for ObjectControlTxn {
             )
             .await
             .map_err(backend)?;
+            let new = permission_site_row(self, &row).await?;
+            self.site_hook_permission(Some(&old), Some(&new), crate::db::now())
+                .await?;
         } else {
             guard_permission(self, uid).await?;
             let row = PermissionStorageRow {
@@ -270,22 +299,28 @@ impl IamTxn for ObjectControlTxn {
             )
             .await
             .map_err(backend)?;
+            let site = permission_site_row(self, &row).await?;
+            self.site_hook_permission(None, Some(&site), crate::db::now())
+                .await?;
         }
         Ok(())
     }
 
     async fn permission_delete(&mut self, uid: i64, bucket: &str) -> Result<(), ControlError> {
         let key = permission_key(uid, bucket);
-        if self
+        if let Some(bytes) = self
             .get(TableId::Permissions, &key)
             .await
             .map_err(backend)?
-            .is_some()
         {
+            let row: PermissionStorageRow = dec(&bytes)?;
             guard_permission(self, uid).await?;
+            let site = permission_site_row(self, &row).await?;
             self.delete(TableId::Permissions, &key)
                 .await
                 .map_err(backend)?;
+            self.site_hook_permission(Some(&site), None, crate::db::now())
+                .await?;
         }
         Ok(())
     }
@@ -294,9 +329,12 @@ impl IamTxn for ObjectControlTxn {
         for row in scan_permissions(self).await? {
             if row.bucket == bucket {
                 guard_permission(self, row.user_id).await?;
+                let site = permission_site_row(self, &row).await?;
                 self.delete(TableId::Permissions, &permission_key(row.user_id, bucket))
                     .await
                     .map_err(backend)?;
+                self.site_hook_permission(Some(&site), None, crate::db::now())
+                    .await?;
             }
         }
         Ok(())
@@ -359,9 +397,12 @@ impl IamTxn for ObjectControlTxn {
             return Ok(false);
         };
         guard_key_old(self, Some(&row)).await?;
+        let site = access_key_site_row(self, &row).await?;
         self.delete(TableId::AccessKeys, access_key.as_bytes())
             .await
             .map_err(backend)?;
+        self.site_hook_access_key(Some(&site), None, crate::db::now())
+            .await?;
         Ok(true)
     }
 
@@ -374,10 +415,14 @@ impl IamTxn for ObjectControlTxn {
             return Ok(false);
         };
         guard_key_old(self, Some(&row)).await?;
+        let old = access_key_site_row(self, &row).await?;
         row.status = status.to_owned();
         self.put(TableId::AccessKeys, access_key.as_bytes(), &enc(&row)?)
             .await
             .map_err(backend)?;
+        let new = access_key_site_row(self, &row).await?;
+        self.site_hook_access_key(Some(&old), Some(&new), crate::db::now())
+            .await?;
         Ok(true)
     }
 
@@ -414,9 +459,12 @@ impl IamTxn for ObjectControlTxn {
         match access_key_row(self, access_key).await? {
             Some(row) if row.kind == "long-term" => {
                 guard_key_old(self, Some(&row)).await?;
+                let site = access_key_site_row(self, &row).await?;
                 self.delete(TableId::AccessKeys, access_key.as_bytes())
                     .await
                     .map_err(backend)?;
+                self.site_hook_access_key(Some(&site), None, crate::db::now())
+                    .await?;
                 Ok(true)
             }
             _ => Ok(false),
@@ -434,6 +482,7 @@ impl IamTxn for ObjectControlTxn {
     ) -> Result<(), ControlError> {
         if let Some(mut row) = access_key_row(self, access_key).await? {
             guard_key_old(self, Some(&row)).await?;
+            let old = access_key_site_row(self, &row).await?;
             row.secret_key = secret_key.to_owned();
             row.user_id = uid;
             row.status = status.to_owned();
@@ -441,6 +490,9 @@ impl IamTxn for ObjectControlTxn {
             self.put(TableId::AccessKeys, access_key.as_bytes(), &enc(&row)?)
                 .await
                 .map_err(backend)?;
+            let new = access_key_site_row(self, &row).await?;
+            self.site_hook_access_key(Some(&old), Some(&new), crate::db::now())
+                .await?;
         } else {
             insert_access_key(
                 self,

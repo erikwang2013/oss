@@ -20,6 +20,7 @@ mod db_object;
 mod golden;
 mod hooks_cascade;
 mod hooks_iam;
+mod hooks_wired;
 mod iam;
 mod iam_guard;
 mod iam_snapshot;
