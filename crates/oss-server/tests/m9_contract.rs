@@ -460,7 +460,7 @@ async fn m9_stretch_identity_drive_count_and_no_secret() {
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();
     let store = Store::open(StoreConfig::new(&cfg.data_dir)).await.unwrap();
     let db = Db::connect_raft(&cfg.database_url).await.unwrap();
-    let st = AppState::new(cfg, db, store).await;
+    let st = AppState::new(cfg, db, std::sync::Arc::new(store)).await;
     st.db.create_user("erik", "pw", true).await.unwrap();
     let base = serve(build_router(st).unwrap()).await;
     let token = login(&base).await;

@@ -5681,7 +5681,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlparser",
- "sqlx",
  "tempfile",
  "time",
  "tokio",

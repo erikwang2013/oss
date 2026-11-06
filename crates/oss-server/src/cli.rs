@@ -1650,8 +1650,8 @@ async fn replica_reconcile_cmd(
     let store = xl_store::store::Store::open(sc).await?;
     let tier_gc =
         crate::tier::S3TierGc::new(Arc::new(crate::tier::TierBackends::from_config(&cfg.tiers)));
-    // 离线 CLI 无 JWT：本机文件系统访问即管理员；审计以 uid=0 哨兵落行。
-    let audit = xl_s3::access::Acl::with_mesh(db.pool().clone(), None);
+    // 离线 CLI 无 JWT：本机文件系统访问即管理员；对象后端无同步审计 sink（best-effort）。
+    let audit = xl_s3::access::Acl::new();
     if delete.is_empty() {
         let rows = crate::replication::list_unmapped_replicas(&store, &bucket, &key)
             .await

@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use sqlx::sqlite::SqlitePool;
 use xl_s3::access::{Acl, BucketRecordOutcome};
 use xl_s3::control::{ControlAuth, KeyLookup};
 use xl_store::control_store::bucket::{BucketStore, BucketTxn};
@@ -33,38 +32,25 @@ struct Fixture {
     _dir: tempfile::TempDir,
     control: Arc<ObjectControlStore>,
     acl: Acl,
-    pool: SqlitePool,
 }
 
 async fn fixture() -> Fixture {
     let real = real_store().await;
-    let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
     let writes = ObjectControlWrites::new(Arc::clone(&real.control));
-    let acl = Acl::new(pool.clone()).with_writes(Some(Arc::new(writes)));
+    let acl = Acl::new().with_writes(Some(Arc::new(writes)));
     Fixture {
         _dir: real._dir,
         control: real.control,
         acl,
-        pool,
     }
 }
 
 #[tokio::test]
-async fn sqlite_fallback_fails_on_placeholder_pool() {
-    let fx = fixture().await;
-    // The pool object mode hands to `xl-s3` has no schema at all.
+async fn missing_write_seam_fails_closed() {
+    let acl = Acl::new();
     assert!(
-        sqlx::query("SELECT 1 FROM buckets")
-            .fetch_optional(&fx.pool)
-            .await
-            .is_err()
-    );
-    let sqlite_only = Acl::new(fx.pool.clone());
-    assert!(
-        sqlite_only
-            .set_bucket_versioning("b", "Enabled")
-            .await
-            .is_err()
+        acl.set_bucket_versioning("b", "Enabled").await.is_err(),
+        "无写缝必须失败，不得静默返回成功"
     );
 }
 
@@ -412,11 +398,4 @@ async fn sts_session_lands_in_root_with_parent_chain_and_expiry() {
         KeyLookup::Invalid
     );
 
-    // The placeholder pool was never touched.
-    assert!(
-        sqlx::query("SELECT 1 FROM access_keys")
-            .fetch_optional(&fx.pool)
-            .await
-            .is_err()
-    );
 }

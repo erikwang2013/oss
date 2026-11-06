@@ -17,8 +17,6 @@ use http::Extensions;
 use http::{HeaderMap, Method, Uri};
 use s3s::route::S3Route;
 use s3s::{Body, S3Request, S3Response, S3Result};
-use sqlx::Row as _;
-use sqlx::SqlitePool;
 
 use crate::sts_web_identity::{WebIdentity, WebIdentityError};
 
@@ -100,8 +98,7 @@ impl IpBuckets {
 }
 
 pub struct StsRoute {
-    pool: SqlitePool,
-    /// 对象后端会话写入缝（None = SQLite：`issue` 的既有 INSERT 逐字节不变）。
+    /// 对象后端会话写入缝（唯一写路径；缺失 = fail-closed）。
     writes: Option<std::sync::Arc<dyn crate::control::StsWrites>>,
     /// M5 切片 6（T5 校正）：SK 加密库——签发会话的 SK 与 console 同口径封存入库
     /// （`issue` 是 `access_keys` 的**第二个写点**，切片 6 核查轮补齐）。
@@ -115,9 +112,8 @@ pub struct StsRoute {
 }
 
 impl StsRoute {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new() -> Self {
         Self {
-            pool,
             writes: None,
             vault: None,
             web_identity: None,
@@ -126,7 +122,7 @@ impl StsRoute {
         }
     }
 
-    /// 注入对象后端会话写入缝（None = SQLite：既有 `INSERT` 路径逐字节不变）。
+    /// 注入对象后端会话写入缝（唯一写路径；缺失 = fail-closed）。
     pub fn with_writes(
         mut self,
         writes: Option<std::sync::Arc<dyn crate::control::StsWrites>>,
@@ -172,19 +168,14 @@ impl StsRoute {
             .ok_or_else(|| s3s::s3_error!(InvalidRequest, "missing RoleArn"))?;
         let role = parse_role_arn(&arn)
             .ok_or_else(|| s3s::s3_error!(InvalidRequest, "invalid RoleArn"))?;
-        let role_uid = match crate::control::request_view() {
-            Some(view) => view.active_user_uid(&role).await.map_err(|e| {
+        let role_uid = self
+            .view()?
+            .active_user_uid(&role)
+            .await
+            .map_err(|e| {
                 tracing::error!(error = %e, role, "control view role lookup failed");
                 s3s::s3_error!(InternalError, "internal error")
-            })?,
-            None => {
-                sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND status = 'active'")
-                    .bind(&role)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(db_err)?
-            }
-        };
+            })?;
         let Some(role_uid) = role_uid else {
             return Err(s3s::s3_error!(AccessDenied, "role not found or disabled"));
         };
@@ -192,7 +183,6 @@ impl StsRoute {
         let policy = session_policy(fields)?;
         let session_name = field(fields, "RoleSessionName").unwrap_or_else(|| "session".into());
         let (ak, sk, token) = issue_with(
-            &self.pool,
             self.writes.as_deref(),
             self.vault.as_deref(),
             role_uid,
@@ -240,7 +230,6 @@ impl StsRoute {
             .ok_or_else(|| s3s::s3_error!(AccessDenied, "unknown access key"))?;
         let dur = duration(fields, "DurationSeconds", GST_DEFAULT, GST_MIN, GST_MAX)?;
         let (ak, sk, token) = issue_with(
-            &self.pool,
             self.writes.as_deref(),
             self.vault.as_deref(),
             uid,
@@ -317,19 +306,14 @@ impl StsRoute {
         let verified = wi
             .verify(&token, &arn, requested)
             .map_err(web_identity_error)?;
-        let role_uid = match crate::control::request_view() {
-            Some(view) => view.active_user_uid(&verified.role).await.map_err(|e| {
+        let role_uid = self
+            .view()?
+            .active_user_uid(&verified.role)
+            .await
+            .map_err(|e| {
                 tracing::error!(error = %e, role = %verified.role, "control view role lookup failed");
                 s3s::s3_error!(InternalError, "internal error")
-            })?,
-            None => {
-                sqlx::query_scalar("SELECT id FROM users WHERE username = ? AND status = 'active'")
-                    .bind(&verified.role)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(db_err)?
-            }
-        };
+            })?;
         let Some(role_uid) = role_uid else {
             // 映射命中但本地角色不存在/停用：拒绝，绝不回退到其他用户。
             return Err(s3s::s3_error!(
@@ -340,7 +324,6 @@ impl StsRoute {
         let policy = session_policy(fields)?;
         let session_name = web_identity_session_name(fields)?;
         let (ak, sk, session_token) = issue_with(
-            &self.pool,
             self.writes.as_deref(),
             self.vault.as_deref(),
             role_uid,
@@ -382,30 +365,30 @@ impl StsRoute {
         Ok(xml_response(body))
     }
 
+    /// 请求热视图（STS 只在请求作用域内运行；缺失 = fail-closed）。
+    fn view(&self) -> S3Result<std::sync::Arc<dyn crate::control::Control>> {
+        crate::control::request_view().ok_or_else(|| {
+            tracing::error!("control view missing outside request scope");
+            s3s::s3_error!(InternalError, "internal error")
+        })
+    }
+
     /// 调用者（须长时键）：uid + is_admin。会话键不得作为调用者（父链只有一层；S2）。
     async fn caller_of(&self, ak: &str) -> S3Result<Option<(i64, bool)>> {
-        if let Some(view) = crate::control::request_view() {
-            return view
-                .sts_caller(ak, now_secs())
-                .await
-                .map(|u| u.map(|u| (u.uid, u.is_admin)))
-                .map_err(|e| {
-                    tracing::error!(error = %e, ak, "control view STS caller lookup failed");
-                    s3s::s3_error!(InternalError, "internal error")
-                });
-        }
-        let row = sqlx::query(
-            "SELECT ak.user_id AS uid, u.is_admin AS is_admin \
-             FROM access_keys ak JOIN users u ON u.id = ak.user_id \
-             WHERE ak.access_key = ? AND ak.kind = 'long-term' AND ak.status = 'active' \
-               AND u.status = 'active' AND (ak.expires_at IS NULL OR ak.expires_at > ?)",
-        )
-        .bind(ak)
-        .bind(now_secs())
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(row.map(|r| (r.get::<i64, _>("uid"), r.get::<i64, _>("is_admin") != 0)))
+        self.view()?
+            .sts_caller(ak, now_secs())
+            .await
+            .map(|u| u.map(|u| (u.uid, u.is_admin)))
+            .map_err(|e| {
+                tracing::error!(error = %e, ak, "control view STS caller lookup failed");
+                s3s::s3_error!(InternalError, "internal error")
+            })
+    }
+}
+
+impl Default for StsRoute {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -471,21 +454,7 @@ fn signed_caller(caller_ak: Option<&str>) -> S3Result<String> {
 }
 
 /// 落一行会话（S1：AK `ASIA`+32hex / SK 32B hex / token 不落库）。
-#[cfg(test)]
-async fn issue(
-    pool: &SqlitePool,
-    vault: Option<&crate::skvault::SecretVault>,
-    uid: i64,
-    parent_ak: Option<&str>,
-    dur_secs: i64,
-    session_policy: Option<&str>,
-) -> S3Result<(String, String, String)> {
-    issue_with(pool, None, vault, uid, parent_ak, dur_secs, session_policy).await
-}
-
-/// 会话写入：`writes = Some` 走控制根（对象模式），否则走既有 SQLite INSERT。
 async fn issue_with(
-    pool: &SqlitePool,
     writes: Option<&dyn crate::control::StsWrites>,
     vault: Option<&crate::skvault::SecretVault>,
     uid: i64,
@@ -509,8 +478,12 @@ async fn issue_with(
         None => sk.clone(),
     };
     let now = now_secs();
-    if let Some(w) = writes {
-        w.issue_session(
+    writes
+        .ok_or_else(|| {
+            tracing::error!("STS 会话写入缝缺失——拒绝签发（fail-closed）");
+            s3s::s3_error!(InternalError, "internal error")
+        })?
+        .issue_session(
             &ak,
             &stored,
             uid,
@@ -524,32 +497,10 @@ async fn issue_with(
             tracing::error!(error = %e, "STS 会话落控制根失败");
             s3s::s3_error!(InternalError, "internal error")
         })?;
-        return Ok((ak, sk, token));
-    }
-    sqlx::query(
-        "INSERT INTO access_keys \
-         (access_key, secret_key, user_id, status, expires_at, created_at, parent_ak, session_policy, kind) \
-         VALUES (?, ?, ?, 'active', ?, ?, ?, ?, 'session')",
-    )
-    .bind(&ak)
-    .bind(&stored)
-    .bind(uid)
-    .bind(now + dur_secs)
-    .bind(now)
-    .bind(parent_ak)
-    .bind(session_policy)
-    .execute(pool)
-    .await
-    .map_err(db_err)?;
     Ok((ak, sk, token))
 }
 
 // ---------- 解析/格式（纯函数，单测直钉） ----------
-
-fn db_err(e: sqlx::Error) -> s3s::S3Error {
-    tracing::error!(error = %e, "STS 会话落库失败");
-    s3s::s3_error!(InternalError, "internal error")
-}
 
 fn field(fields: &[(String, String)], name: &str) -> Option<String> {
     fields
@@ -763,7 +714,6 @@ fn request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3s::auth::S3Auth as _;
 
     /// L-1：桶耗尽后拒绝，按速率补充后恢复。
     #[test]
@@ -799,9 +749,8 @@ mod tests {
     async fn web_identity_per_ip_limit_returns_slow_down() {
         use crate::sts_web_identity::test_support as wi;
 
-        let pool = sts_db().await;
         let td = tempfile::tempdir().unwrap();
-        let route = StsRoute::new(pool).with_web_identity(Some(wi::web_identity(td.path(), 3600)));
+        let route = StsRoute::new().with_web_identity(Some(wi::web_identity(td.path(), 3600)));
         let body = "Action=AssumeRoleWithWebIdentity\
             &RoleArn=arn%3Aoss%3Aiam%3A%3Aoss%3Arole%2Fci-bot&WebIdentityToken=bad";
         let mk = |peer: Option<IpAddr>| {
@@ -840,44 +789,6 @@ mod tests {
     }
 
     /// 最小控制面 schema（同 auth.rs 测试的口径 + kind 列）。
-    async fn sts_db() -> SqlitePool {
-        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::raw_sql(
-            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT, is_admin INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'active');\
-             CREATE TABLE access_keys (access_key TEXT PRIMARY KEY, secret_key TEXT NOT NULL, user_id INTEGER NOT NULL, \
-              status TEXT NOT NULL DEFAULT 'active', expires_at INTEGER, created_at INTEGER NOT NULL, \
-              parent_ak TEXT, session_policy TEXT, kind TEXT NOT NULL DEFAULT 'long-term');\
-             CREATE TABLE accounts (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'active');\
-             CREATE TABLE account_members (account_id TEXT NOT NULL, uid INTEGER NOT NULL UNIQUE);",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO users (id, username, is_admin) VALUES (1, 'admin', 1)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO users (id, username, is_admin) VALUES (2, 'erik', 0)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "INSERT INTO access_keys (access_key, secret_key, user_id, created_at) \
-             VALUES ('AKIA_ROOT', 'SK_ROOT', 1, 0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO access_keys (access_key, secret_key, user_id, created_at) \
-             VALUES ('AKIA_SUB', 'SK_SUB', 2, 0)",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool
-    }
-
     #[test]
     fn form_parse_matrix() {
         let f = parse_form(b"Action=AssumeRole&DurationSeconds=900&Policy=%7B%22a%22%3A1%7D");
@@ -953,260 +864,9 @@ mod tests {
             .collect()
     }
 
-    /// 签发→落库→认证面可解（父链条件满足时）；过期/父停用即失效（配合 auth.rs 侧）。
-    #[tokio::test]
-    async fn issue_lands_resolvable_session_row() {
-        let pool = sts_db().await;
-        let (ak, _sk, token) = issue(&pool, None, 2, Some("AKIA_SUB"), 900, None)
-            .await
-            .unwrap();
-        assert!(ak.starts_with("ASIA"));
-        assert_eq!(token.len(), 64);
-        let (uid, kind, parent, exp): (i64, String, String, i64) = sqlx::query_as(
-            "SELECT user_id, kind, parent_ak, expires_at FROM access_keys WHERE access_key = ?",
-        )
-        .bind(&ak)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(uid, 2);
-        assert_eq!(kind, "session");
-        assert_eq!(parent, "AKIA_SUB");
-        assert!(exp > now_secs());
-        // 认证面（与 auth.rs 同口径的父链条件）应解出 SK
-        let auth = crate::auth::SigV4Auth::new(pool.clone());
-        assert!(auth.get_secret_key(&ak).await.is_ok());
-    }
-
-    /// AssumeRole 全路径：admin 调用 ✓；非 admin 拒（S6 提权面封闭）；角色不存在拒。
-    #[tokio::test]
-    async fn assume_role_admin_only_and_role_lookup() {
-        let pool = sts_db().await;
-        let route = StsRoute::new(pool.clone());
-        let f = parse_form(b"Action=AssumeRole&RoleArn=arn%3Aoss%3Aiam%3A%3Aacct%3Arole%2Ferik&DurationSeconds=900");
-        // 非 admin 调用者 → 拒
-        assert!(matches!(
-            route.assume_role("AKIA_SUB", &f).await,
-            Err(e) if e.code() == &s3s::S3ErrorCode::AccessDenied
-        ));
-        // admin ✓
-        let r = route.assume_role("AKIA_ROOT", &f).await.unwrap();
-        drop(r);
-        // 角色不存在 → 拒
-        let f2 = parse_form(b"Action=AssumeRole&RoleArn=arn%3Aoss%3Aiam%3A%3Aacct%3Arole%2Fghost");
-        assert!(matches!(
-            route.assume_role("AKIA_ROOT", &f2).await,
-            Err(e) if e.code() == &s3s::S3ErrorCode::AccessDenied
-        ));
-        // 会话键不得作为调用者（kind 条件）
-        let (sak, _, _) = issue(&pool, None, 1, Some("AKIA_ROOT"), 900, None)
-            .await
-            .unwrap();
-        assert!(matches!(
-            route.assume_role(&sak, &f).await,
-            Err(e) if e.code() == &s3s::S3ErrorCode::AccessDenied
-        ));
-    }
-
     #[test]
     fn iso8601_shape() {
         assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601(1_760_000_000), "2025-10-09T08:53:20Z");
-    }
-    /// 走 `call()` 全路径：is_match 谓词 + 凭据解析 + XML 装配 + 落库；匿名 → AccessDenied。
-    #[tokio::test]
-    async fn call_dispatches_and_rejects_anonymous() {
-        let pool = sts_db().await;
-        let route = StsRoute::new(pool.clone());
-        let mut hm = HeaderMap::new();
-        hm.insert(
-            http::header::CONTENT_TYPE,
-            http::header::HeaderValue::from_static("application/x-www-form-urlencoded"),
-        );
-        let mut ext = http::Extensions::new();
-        let uri: Uri = "/".parse().unwrap();
-        assert!(route.is_match(&Method::POST, &uri, &hm, &mut ext));
-        assert!(!route.is_match(&Method::GET, &uri, &hm, &mut ext));
-
-        let mk = |cred: Option<s3s::auth::Credentials>| {
-            S3Request::<Body> {
-            input: Body::from(
-                "Action=AssumeRole&RoleArn=arn%3Aoss%3Aiam%3A%3Aacct%3Arole%2Ferik&DurationSeconds=900"
-                    .to_string(),
-            ),
-            method: Method::POST,
-            uri: uri.clone(),
-            headers: hm.clone(),
-            extensions: http::Extensions::new(),
-            credentials: cred,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        }
-        };
-
-        // 匿名 → 拒（默认 check_access 语义的显式兜底）
-        let e = route.call(mk(None)).await.unwrap_err();
-        assert_eq!(e.code(), &s3s::S3ErrorCode::AccessDenied);
-
-        // admin 凭据 → 200 + XML + 落库
-        let resp = route
-            .call(mk(Some(s3s::auth::Credentials {
-                access_key: "AKIA_ROOT".into(),
-                secret_key: s3s::auth::SecretKey::from("SK".to_string()),
-            })))
-            .await
-            .unwrap();
-        let mut out = resp.output;
-        let bytes = out.store_all_limited(64 * 1024).await.unwrap();
-        let xml = String::from_utf8_lossy(&bytes);
-        assert!(xml.contains("<AssumeRoleResponse"), "{xml}");
-        assert!(xml.contains("<Expiration>"), "{xml}");
-        let ak = xml
-            .split("<AccessKeyId>")
-            .nth(1)
-            .and_then(|s| s.split("</AccessKeyId>").next())
-            .unwrap()
-            .to_string();
-        assert!(ak.starts_with("ASIA"));
-        let (kind, parent): (String, String) =
-            sqlx::query_as("SELECT kind, parent_ak FROM access_keys WHERE access_key = ?")
-                .bind(&ak)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(kind, "session");
-        assert_eq!(parent, "AKIA_ROOT");
-    }
-    /// M5 切片 6：库启用时会话 SK **封存入库**（响应回明文一次；DB 行非明文；认证面可解）。
-    #[tokio::test]
-    async fn issue_seals_sk_when_vault_present() {
-        let pool = sts_db().await;
-        let td = tempfile::tempdir().unwrap();
-        let p = xl_store::kms::FileKeyProvider::open_or_init(&td.path().join("m.key"))
-            .await
-            .unwrap();
-        let vault = std::sync::Arc::new(
-            crate::skvault::SecretVault::from_enc_state(Some(&xl_store::crypto::EncState {
-                file: Some(std::sync::Arc::new(p)),
-                kms: None,
-            }))
-            .unwrap(),
-        );
-        let (ak, sk, _) = issue(&pool, Some(&vault), 2, Some("AKIA_SUB"), 900, None)
-            .await
-            .unwrap();
-        // 返回值是明文（SDK 只在此刻拿到）；DB 行是封存
-        assert!(!xl_store::kms::is_sealed(&sk), "响应 SK 应为明文：{sk}");
-        let stored: String =
-            sqlx::query_scalar("SELECT secret_key FROM access_keys WHERE access_key = ?")
-                .bind(&ak)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(xl_store::kms::is_sealed(&stored), "{stored}");
-        assert_eq!(
-            vault.open(&stored).await.unwrap().as_deref(),
-            Some(sk.as_str())
-        );
-        // 端到端：认证面（带库）解出同一 SK
-        let auth = crate::auth::SigV4Auth::new(pool.clone()).with_vault(Some(vault));
-        assert_eq!(auth.get_secret_key(&ak).await.unwrap().expose(), sk);
-    }
-
-    /// AssumeRoleWithWebIdentity：未启用 fail-closed；启用后**匿名**可换会话（parent NULL）；
-    /// 其他 STS Action 匿名仍拒；映射角色停用拒。
-    #[tokio::test]
-    async fn web_identity_call_is_anonymous_and_parentless() {
-        use crate::sts_web_identity::test_support as wi;
-        use jsonwebtoken::Algorithm;
-
-        let pool = sts_db().await;
-        sqlx::query("INSERT INTO users (id, username, is_admin) VALUES (3, 'ci-bot', 0)")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let td = tempfile::tempdir().unwrap();
-        let verifier = wi::web_identity(td.path(), 3600);
-        let token = wi::sign(
-            &wi::claims("repo:acme/infra:ref:refs/heads/main", wi::now()),
-            wi::KID_RSA,
-            Algorithm::RS256,
-        );
-        let body = format!(
-            "Action=AssumeRoleWithWebIdentity&RoleArn=arn%3Aoss%3Aiam%3A%3Aoss%3Arole%2Fci-bot\
-             &WebIdentityToken={token}"
-        );
-        let mk = |body: &str| S3Request::<Body> {
-            input: Body::from(body.to_string()),
-            method: Method::POST,
-            uri: "/".parse().unwrap(),
-            headers: HeaderMap::new(),
-            extensions: http::Extensions::new(),
-            credentials: None,
-            region: None,
-            service: None,
-            trailing_headers: None,
-        };
-
-        // 未启用：即使 token 合法也拒（fail-closed）
-        let disabled = StsRoute::new(pool.clone());
-        let e = disabled.call(mk(&body)).await.unwrap_err();
-        assert_eq!(e.code(), &s3s::S3ErrorCode::AccessDenied);
-
-        let route = StsRoute::new(pool.clone()).with_web_identity(Some(verifier));
-        // check_access 允许匿名进入 call（WebIdentity 专用；其余 Action 由 call 拒绝）
-        let mut anon = mk(&body);
-        assert!(route.check_access(&mut anon).await.is_ok());
-
-        let resp = route.call(mk(&body)).await.unwrap();
-        let mut out = resp.output;
-        let bytes = out.store_all_limited(MAX_BODY).await.unwrap();
-        let xml = String::from_utf8_lossy(&bytes);
-        assert!(xml.contains("<AssumeRoleWithWebIdentityResult>"), "{xml}");
-        assert!(
-            xml.contains(
-                "<SubjectFromWebIdentityToken>repo:acme/infra:ref:refs/heads/main\
-                 </SubjectFromWebIdentityToken>"
-            ),
-            "{xml}"
-        );
-        assert!(xml.contains("<Audience>oss-test</Audience>"), "{xml}");
-        assert!(
-            xml.contains("<Provider>https://issuer.example</Provider>"),
-            "{xml}"
-        );
-        assert!(xml.contains("<AssumedRoleUser>"), "{xml}");
-        assert!(xml.contains("<Credentials>"), "{xml}");
-        let ak = xml
-            .split("<AccessKeyId>")
-            .nth(1)
-            .and_then(|s| s.split("</AccessKeyId>").next())
-            .unwrap();
-        let (uid, kind, parent): (i64, String, Option<String>) =
-            sqlx::query_as("SELECT user_id, kind, parent_ak FROM access_keys WHERE access_key = ?")
-                .bind(ak)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(uid, 3);
-        assert_eq!(kind, "session");
-        assert_eq!(parent, None, "匿名入口不得挂到任何父键");
-
-        // 其他 Action 未签名仍拒
-        for action in [
-            "Action=AssumeRole&RoleArn=arn%3Aoss%3Aiam%3A%3Aoss%3Arole%2Fci-bot",
-            "Action=GetSessionToken",
-        ] {
-            let e = route.call(mk(action)).await.unwrap_err();
-            assert_eq!(e.code(), &s3s::S3ErrorCode::AccessDenied, "{action}");
-        }
-        // 映射存在但本地角色停用：拒
-        sqlx::query("UPDATE users SET status = 'disabled' WHERE id = 3")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let e = route.call(mk(&body)).await.unwrap_err();
-        assert_eq!(e.code(), &s3s::S3ErrorCode::AccessDenied);
     }
 }

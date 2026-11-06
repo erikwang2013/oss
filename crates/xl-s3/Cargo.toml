@@ -20,7 +20,6 @@ serde.workspace = true
 serde_json.workspace = true
 s3s.workspace = true
 tokio.workspace = true
-sqlx = { workspace = true }
 tracing.workspace = true
 # M6 切片 2：S3 Select（SQL AST + GZIP/BZIP2）
 sqlparser.workspace = true

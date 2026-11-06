@@ -207,9 +207,7 @@ pub fn build_router_with_trust(
         s3_config,
     ))));
     s3_builder.set_auth(
-        SigV4Auth::with_mesh(state.db.pool().clone(), state.control_mesh())
-            .with_vault(state.vault.clone()) // M5 切片 6：SK 解密/透明重写
-            .with_raft_mode(state.control.is_raft()), // M9 S6b H2：Raft 下禁止 apply 外重封
+        SigV4Auth::new().with_vault(state.vault.clone()), // M5 切片 6：SK 解密
     );
     s3_builder.set_access(acl.clone());
     // STS：[sts.web_identity] 缺省关闭；启用时 AppConfig::load 已校验，这里构建验证器
@@ -221,7 +219,7 @@ pub fn build_router_with_trust(
         .map_err(|e| format!("[sts.web_identity] 配置非法：{e}"))?;
     // M8 S1（N2）：AP 与 STS 共用一个 route 槽：先 AP，未命中委托 STS。
     let sts: Arc<dyn s3s::route::S3Route> = Arc::new(
-        xl_s3::sts::StsRoute::new(state.db.pool().clone())
+        xl_s3::sts::StsRoute::new()
             .with_vault(state.vault.clone())
             .with_web_identity(web_identity)
             .with_writes(state.sts_writes()),

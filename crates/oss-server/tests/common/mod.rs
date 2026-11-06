@@ -138,7 +138,7 @@ async fn state_with_db_url(
     database_url: String,
     jwt_previous_secrets: Vec<String>,
 ) -> AppState {
-    let cfg = AppConfig {
+    let mut cfg = AppConfig {
         listen: "127.0.0.1:0".into(),
         data_dir: dir.join("data"),
         data_dirs: None,
@@ -172,7 +172,17 @@ async fn state_with_db_url(
     };
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();
-    let store = Store::open(StoreConfig::new(&cfg.data_dir)).await.unwrap();
-    let db = Db::connect(&cfg.database_url).await.unwrap();
+    // H1：对象控制面是唯一后端；测试统一跑对象根（`database_url` 仅为兼容字段保留）。
+    cfg.server.control_backend = oss_server::config::ControlBackend::Objects;
+    let store = Arc::new(Store::open(StoreConfig::new(&cfg.data_dir)).await.unwrap());
+    let db = Db::connect_object().await.unwrap();
+    let object = oss_server::control_backend::ObjectControl::open(
+        Arc::clone(&store),
+        oss_server::control_backend::expected_mode(false),
+        None,
+    )
+    .await
+    .unwrap();
+    db.attach_object_control(object).unwrap();
     AppState::new(cfg, db, store).await
 }

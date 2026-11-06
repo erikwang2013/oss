@@ -92,24 +92,6 @@ pub struct AppState {
     pub control_view: Option<Arc<crate::control_view::ViewCache>>,
 }
 
-fn mesh_of(store: &Store) -> Option<xl_s3::access::ControlMesh> {
-    store.cluster().map(|c| {
-        let self_id = c.sets.flat.self_node().id.clone();
-        xl_s3::access::ControlMesh {
-            transport: c.transport.clone(),
-            peers: c
-                .sets
-                .flat
-                .nodes
-                .iter()
-                .filter(|n| n.id != self_id)
-                .map(|n| n.id.clone())
-                .collect(),
-            self_id,
-        }
-    })
-}
-
 /// M8 S0/S1：删桶清理的跨 crate 实现（Db 清表 + AP 缓存失效）。
 pub struct SqlBucketCleanup {
     db: Arc<Db>,
@@ -456,36 +438,13 @@ impl AppState {
                     local,
                     xl_store::mesh_gate::DEFAULT_TTL,
                 ));
-            // M4 切片 8：多 set 注入 SetResolver（单 set 由 Store 侧短路——零新增查询）；
-            // 扇出面 = 除本机外的去重节点并集（verifier 口径 b）
-            let resolver: Option<Arc<dyn xl_store::mesh::SetResolver>> = (sets.sets.len() > 1)
-                .then(|| {
-                    let peers: Vec<String> = sets
-                        .flat
-                        .nodes
-                        .iter()
-                        .filter(|n| n.id != cl.node_id)
-                        .map(|n| n.id.clone())
-                        .collect();
-                    let transport: Arc<dyn xl_store::mesh::MeshTransport> = mesh.clone();
-                    Arc::new(crate::cluster_control::DbSetResolver::new(
-                        db.pool().clone(),
-                        peers,
-                        transport,
-                    )) as Arc<dyn xl_store::mesh::SetResolver>
-                });
             store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
                 sets,
                 transport: mesh,
                 placement_v2,
-                resolver,
+                resolver: None,
                 stretch: false,
             }));
-            // Task 9：控制面读扇出的本节点执行器（判权复用 xl-s3::Acl；只查本地 DB）
-            store_cfg.control = Some(Arc::new(
-                crate::cluster_control::SqliteControlBackend::new(db.pool().clone())
-                    .with_bucket_cleanup(Some(Arc::clone(&bucket_cleanup))),
-            ));
         } else if let Some(st) = cfg.stretch.as_ref() {
             // M9 S4：2×6 stretch——拓扑由 `new_stretch` 规范排序（两端同槽序），
             // placement v2 固定、单 set 无需 SetResolver；数据面复用 TonicMesh。
@@ -840,12 +799,7 @@ impl AppState {
         Ok(state)
     }
 
-    /// 集群控制面扇出面（Task 9；None = 单节点——三面 Acl/SigV4Auth 共用此构造）。
-    pub fn control_mesh(&self) -> Option<xl_s3::access::ControlMesh> {
-        mesh_of(&self.store)
-    }
-
-    /// 对象后端的写缝（None = SQLite：`Acl`/`StsRoute` 的既有 SQL 路径不变）。
+    /// 对象后端的写缝（唯一写路径；缺失 = fail-closed）。
     fn object_writes(&self) -> Option<Arc<crate::control_writes::ObjectControlWrites>> {
         self.db.object_control().map(|object| {
             Arc::new(crate::control_writes::ObjectControlWrites::new(Arc::clone(
@@ -860,15 +814,15 @@ impl AppState {
         Some(writes)
     }
 
-    /// `StsRoute` 会话写入缝（对象模式 Some；SQLite 模式 None）。
+    /// `StsRoute` 会话写入缝（对象模式 Some；缺失 = fail-closed）。
     pub(crate) fn sts_writes(&self) -> Option<Arc<dyn xl_s3::control::StsWrites>> {
         let writes = self.object_writes()?;
         Some(writes)
     }
 
-    /// 三面共用的判权实例（Task 9：集群时自动带读扇出；SQL 唯一事实源在 xl-s3::Acl）。
+    /// 三面共用的判权实例（对象请求热视图 + 控制根写缝）。
     pub fn acl(&self) -> xl_s3::access::Acl {
-        let acl = xl_s3::access::Acl::with_mesh(self.db.pool().clone(), self.control_mesh())
+        let acl = xl_s3::access::Acl::new()
             .with_quota(Arc::clone(&self.quota))
             .with_writes(self.acl_writes());
         let sink = self
@@ -896,7 +850,7 @@ impl AppState {
         }
     }
 
-    pub async fn new(cfg: AppConfig, db: Db, store: Store) -> Self {
+    pub async fn new(cfg: AppConfig, db: Db, store: Arc<Store>) -> Self {
         let db = Arc::new(db);
         let ap_cache = Arc::new(xl_s3::ap::ApCache::new());
         let olap_cache = Arc::new(xl_s3::olap::OlapCache::new());
@@ -910,7 +864,7 @@ impl AppState {
         Self::new_with(
             cfg,
             db,
-            Arc::new(store),
+            store,
             ap_cache,
             olap_cache,
             bucket_cleanup,
@@ -1127,7 +1081,7 @@ impl AppState {
         let tier_gc: Arc<dyn xl_s3::tier_gc::TierGcSink> =
             Arc::new(crate::tier::S3TierGc::new(Arc::clone(&tiers)));
         // M8 S5：Inventory 配置存储与执行器（共用三面判权实例语义）。
-        let inv_acl = xl_s3::access::Acl::with_mesh(db.pool().clone(), mesh_of(&store));
+        let inv_acl = xl_s3::access::Acl::new();
         let inventory: Arc<dyn xl_s3::inventory::InventoryStore> = Arc::new(
             crate::inventory_store::SqlInventoryStore::new(Arc::clone(&db), inv_acl.clone())
                 .with_control(Arc::clone(&control)),

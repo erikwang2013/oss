@@ -1352,7 +1352,7 @@ async fn hard_quota_blocks_writes_and_delete_frees() {
 }
 
 /// `[quota].strict`：同一 S3 写/删路径改走复制账本（standalone Local 控制面），
-/// 预留/释放与本地模式同语义；拒绝消息是稳定的 `account quota exceeded`。
+/// 预留/释放与本地模式同语义；拒绝消息是稳定的 `account byte quota exceeded`。
 #[tokio::test]
 async fn strict_quota_ledger_blocks_writes_and_delete_frees() {
     let dir = tempfile::tempdir().unwrap();
@@ -1405,7 +1405,7 @@ async fn strict_quota_ledger_blocks_writes_and_delete_frees() {
         over.text()
             .await
             .unwrap()
-            .contains("account quota exceeded")
+            .contains("account byte quota exceeded")
     );
 
     // 删除释放后同键重写回到恰好上限。

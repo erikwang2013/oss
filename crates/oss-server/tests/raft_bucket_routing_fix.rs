@@ -137,7 +137,7 @@ async fn setup() -> H {
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();
     let store = Store::open(StoreConfig::new(&cfg.data_dir)).await.unwrap();
     let db = Db::connect_raft(&db_url).await.unwrap();
-    let st = AppState::new(cfg, db, store).await;
+    let st = AppState::new(cfg, db, std::sync::Arc::new(store)).await;
 
     let settings = RaftSettings {
         node_id: 1,

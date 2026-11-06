@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 
 use common::state;
 use oss_server::access_points_api::DbApSource;
-use oss_server::cluster_control::SqliteControlBackend;
 use oss_server::router::build_router;
 use oss_server::site::{Entry, apply_changelog};
 use oss_server::state::AppState;
@@ -20,7 +19,6 @@ use s3s::{S3, S3Request};
 use xl_s3::ap::{AccessPoint, ApSource};
 use xl_s3::bucket_cleanup::BucketCleanupSink;
 use xl_s3::service::OssS3;
-use xl_store::mesh::{ControlBackend, ControlWrite};
 
 const REGION: &str = "us-east-1";
 /// 五张按 bucket 列的 M8 表（olap_configs 按 access_point，单独断言）。
@@ -278,57 +276,4 @@ async fn path_site_apply_commit_failure_keeps_cache() {
             .unwrap()
             .is_some()
     );
-}
-
-/// ④ 集群控制面删桶行：注入清理时清表 + 失效缓存；`new(pool)` 无 sink 仍可删行。
-#[tokio::test]
-async fn path_cluster_control_clears_m8_and_cache() {
-    let dir = tempfile::tempdir().unwrap();
-    let st = state(dir.path()).await;
-    seed(&st, "clbkt", "cl-ap").await;
-    let backend = SqliteControlBackend::new(st.db.pool().clone())
-        .with_bucket_cleanup(Some(Arc::clone(&st.bucket_cleanup)));
-    backend
-        .control_write(ControlWrite::BucketRowSet {
-            bucket: "clbkt".into(),
-            set: None,
-        })
-        .await
-        .unwrap();
-    let rows = count(&st, "SELECT COUNT(*) FROM buckets WHERE name = ?", "clbkt").await;
-    assert_eq!(rows, 0, "桶行应已删除");
-    assert_cleared(&st, "clbkt", "cl-ap").await;
-
-    // 既有 `new(pool)` 无 sink：删行照常成功（清理为可选注入）。
-    st.db.insert_bucket("nobkt", None).await.unwrap();
-    SqliteControlBackend::new(st.db.pool().clone())
-        .control_write(ControlWrite::BucketRowSet {
-            bucket: "nobkt".into(),
-            set: None,
-        })
-        .await
-        .unwrap();
-    let rows = count(&st, "SELECT COUNT(*) FROM buckets WHERE name = ?", "nobkt").await;
-    assert_eq!(rows, 0);
-}
-
-/// ④ 清理失败：只告警，控制面写仍返回成功，缓存照常失效。
-#[tokio::test]
-async fn path_cluster_control_cleanup_failure_keeps_delete_result() {
-    let dir = tempfile::tempdir().unwrap();
-    let st = state(dir.path()).await;
-    st.db.insert_bucket("clfail", None).await.unwrap();
-    let sink = Arc::new(FailCleanup::default());
-    let backend = SqliteControlBackend::new(st.db.pool().clone())
-        .with_bucket_cleanup(Some(sink.clone() as Arc<dyn BucketCleanupSink>));
-    backend
-        .control_write(ControlWrite::BucketRowSet {
-            bucket: "clfail".into(),
-            set: None,
-        })
-        .await
-        .unwrap();
-    let rows = count(&st, "SELECT COUNT(*) FROM buckets WHERE name = ?", "clfail").await;
-    assert_eq!(rows, 0, "清理失败不得回滚/改写删行结果");
-    assert_eq!(*sink.invalidated.lock().unwrap(), ["clfail".to_string()]);
 }

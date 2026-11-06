@@ -9,7 +9,6 @@ pub mod ap_aws;
 mod ap_endpoints;
 pub mod audit_queue;
 pub mod cli;
-pub mod cluster_control;
 pub mod config;
 pub mod console;
 pub mod control_backend;

@@ -470,7 +470,7 @@ async fn env_inner(mode: Mode, sync_max: u64, site_enabled: bool) -> Env {
     std::fs::create_dir_all(&cfg.data_dir).unwrap();
     std::fs::create_dir_all(&cfg.staging_dir).unwrap();
     let db = Db::connect(&db_url).await.unwrap();
-    let mut st = AppState::new(cfg, db, store).await;
+    let mut st = AppState::new(cfg, db, std::sync::Arc::new(store)).await;
     // 与生产 `load` 同口径：/metrics 读的就是门里的同一份计数。
     st.sync_metrics = Arc::clone(&metrics);
     let uid = st.db.create_user("alice", "pw", false).await.unwrap();

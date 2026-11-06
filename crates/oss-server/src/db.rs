@@ -4112,13 +4112,6 @@ mod tests {
         assert!(users[0].is_admin);
         assert_eq!(users[1].permissions[0].bucket, "z");
 
-        // 删桶清授权（Acl::forget_bucket 是两处删桶路径的共用实现）
-        xl_s3::access::Acl::new(db.pool().clone())
-            .forget_bucket("z")
-            .await
-            .unwrap();
-        assert!(db.get_permissions(sub).await.unwrap().is_empty());
-
         // 上传归属：仅在无归属时写入
         db.record_upload("g_202610_x.txt", "files", "x.txt", "file", 1, "e")
             .await
