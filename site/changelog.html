@@ -9,7 +9,7 @@
     <meta property="og:locale" content="zh_CN">
     <meta name="color-scheme" content="light dark">
     <title>版本日志 | oss（吞吞）</title>
-    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.32.3，记录 v1.32.0 的 SQLite 移除；包含各阶段的功能迭代、修复与验收记录。">
+    <meta name="description" content="oss（吞吞）版本日志：从 v1.0.0 到 v1.32.4，记录 v1.32.0 的 SQLite 移除；包含各阶段的功能迭代、修复与验收记录。">
     <meta name="keywords" content="oss 版本日志,吞吞 release,S3 对象存储更新,Rust 对象存储,TLS,停写蓝绿升级,只读排空,JWT 轮换">
     <link rel="canonical" href="https://oss.erik.xyz/changelog.html">
     <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
@@ -18,12 +18,12 @@
     <meta property="og:type" content="article">
     <meta property="og:site_name" content="oss（吞吞）">
     <meta property="og:title" content="版本日志 | oss（吞吞）">
-    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.32.3 控制面基座；v1.32.0 已移除 SQLite，改用对象控制根。oss 的完整版本历史与最新变更。">
+    <meta property="og:description" content="从单盘到 3-voter 强一致，再到 v1.32.4 控制面基座；v1.32.0 已移除 SQLite，改用对象控制根。oss 的完整版本历史与最新变更。">
     <meta property="og:url" content="https://oss.erik.xyz/changelog.html">
     <meta property="og:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="版本日志 | oss（吞吞）">
-    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.32.3 控制面基座；v1.32.0 已移除 SQLite，改用对象控制根。oss 的完整版本历史。">
+    <meta name="twitter:description" content="从单盘到 3-voter 强一致，再到 v1.32.4 控制面基座；v1.32.0 已移除 SQLite，改用对象控制根。oss 的完整版本历史。">
     <meta name="twitter:image" content="https://oss.erik.xyz/assets/img/social-preview.png">
     <link rel="stylesheet" href="assets/css/site.css">
     <noscript><style>[data-reveal]{opacity:1;transform:none}</style></noscript>
@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.32.3</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.32.4</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -71,12 +71,13 @@
       <div class="doc-hero">
         <div class="wrap">
           <h1>版本日志</h1>
-          <p>从 v1.0.0 的单盘内核，到 v1.32.3 的控制面基座，并完成 v1.32.0 无 SQLite 的对象控制根。每个已发布版本都有对应的 tag 与 GitHub Release；v1.32.0 已发布，v1.32.1 修复了缺省配置启动。</p>
+          <p>从 v1.0.0 的单盘内核，到 v1.32.4 的控制面基座，并完成 v1.32.0 无 SQLite 的对象控制根。每个已发布版本都有对应的 tag 与 GitHub Release；v1.32.0 已发布，v1.32.1 修复了缺省配置启动。</p>
         </div>
       </div>
 
       <div class="wrap doc-layout">
         <aside class="doc-nav" aria-label="版本导航">
+          <a href="#v1-32-4">v1.32.4</a>
           <a href="#v1-32-3">v1.32.3</a>
           <a href="#v1-32-2">v1.32.2</a>
           <a href="#v1-32-1">v1.32.1</a>
@@ -118,10 +119,20 @@
         </aside>
 
         <article class="prose">
-          <p>当前最新发布：<strong>v1.32.3</strong>（2026-11-07）。v1.32.0 移除 SQLite，对象控制根成为唯一后端；v1.32.1 修复缺省配置仍选择已删除 SQLite 后端导致的启动 panic；v1.32.2 用 vendor 补丁清除 protobuf/lru/instant 告警；v1.32.3 更新依赖并移除不可达旧后端代码与失效示例。升级为停全部节点的一次性单向割接。</p>
+          <p>当前最新发布：<strong>v1.32.4</strong>（2026-11-07）。v1.32.0 移除 SQLite，对象控制根成为唯一后端；v1.32.1 修复缺省配置仍选择已删除 SQLite 后端导致的启动 panic；v1.32.2 用 vendor 补丁清除 protobuf/lru/instant 告警；v1.32.3 更新依赖并移除不可达旧后端代码与失效示例；v1.32.4 更新控制台基础镜像与 MSRV 元数据。升级为停全部节点的一次性单向割接。</p>
 
           <div class="changelog-list">
-            <details class="changelog-entry" id="v1-32-3" open>
+            <details class="changelog-entry" id="v1-32-4" open>
+              <summary><strong>v1.32.4</strong><time datetime="2026-11-07">2026-11-07</time><span>控制台基础镜像 · MSRV 元数据</span></summary>
+              <div class="entry-body">
+                <ul>
+                  <li><strong>控制台镜像</strong>：构建阶段 node 22→24-alpine，运行阶段 nginx 1.27→1.30-alpine；CI setup-node 同步到 24。本地 Docker 构建通过。</li>
+                  <li><strong>MSRV</strong>：workspace <code>rust-version</code> 1.89→1.96，与 s3s/s3s-sigv4 0.17.0 的声明一致；实际工具链 1.99。</li>
+                  <li><strong>兼容性</strong>：无 API、Wire、配置或数据格式变更；仅构建/镜像元数据更新。</li>
+                </ul>
+              </div>
+            </details>
+            <details class="changelog-entry" id="v1-32-3">
               <summary><strong>v1.32.3</strong><time datetime="2026-11-07">2026-11-07</time><span>依赖更新 · 死代码与失效文件清理</span></summary>
               <div class="entry-body">
                 <ul>
@@ -656,7 +667,7 @@
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.32.3</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.32.4</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>

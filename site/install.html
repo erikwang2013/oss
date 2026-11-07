@@ -62,7 +62,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.32.3</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.32.4</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -210,10 +210,10 @@ ca_cert = "/etc/oss/ca.crt"</code></pre>
           <p><strong>v1.32.0 的 SQLite 移除是停全部节点的一次性单向割接，不是停写蓝绿。</strong>冷备 <code>oss.db</code>/<code>raft.db</code>/数据盘并记录 sha256；从 v1.31.0 Release 下载归档的 <a href="https://github.com/erikwang2013/oss/releases/download/v1.31.0/oss-server-v1.31.0-linux-x86_64"><code>oss-server-v1.31.0-linux-x86_64</code></a>（sha256 <code>fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae</code>），每节点先 <code>control-migrate --from &lt;oss.db&gt; --state-dir &lt;data_dir&gt; --raft-db &lt;raft.db&gt; --dry-run</code>，核对报告后再 <code>--apply</code>；校验源库字节未变、对象根与 <code>&lt;raft.db_path&gt;.d/</code> 已生成，启动 v1.32 二进制并完成 auth/console/S3/site/snapshot 冒烟。首次新写入后没有反向写入器：回滚只能在首次写入前恢复备份与旧二进制；之后只能恢复备份并接受割接后的写入丢失。完整步骤见 <a href="https://github.com/erikwang2013/oss/blob/main/docs/superpowers/runbooks/2026-11-05-object-control-cutover.md">割接 runbook</a>。</p>
 
           <h2 id="download">下载与版本</h2>
-          <p>当前 Release 提供源码归档；除 v1.32.0 割接专用的归档二进制外，没有通用预编译包。推荐 Docker Compose 或按本文源码构建。当前最新发布 v1.32.3；v1.20.0 的源码归档因 <code>Cargo.lock</code> 错误（<code>either</code> 被标为 1.20.0）无法构建，请使用 v1.32.3（或 v1.27.0）。v1.32.0 割接需同时获取 v1.31.0 Release 的 <code>oss-server-v1.31.0-linux-x86_64</code> 并按上面的 runbook 校验 sha256。</p>
+          <p>当前 Release 提供源码归档；除 v1.32.0 割接专用的归档二进制外，没有通用预编译包。推荐 Docker Compose 或按本文源码构建。当前最新发布 v1.32.4；v1.20.0 的源码归档因 <code>Cargo.lock</code> 错误（<code>either</code> 被标为 1.20.0）无法构建，请使用 v1.32.4（或 v1.27.0）。v1.32.0 割接需同时获取 v1.31.0 Release 的 <code>oss-server-v1.31.0-linux-x86_64</code> 并按上面的 runbook 校验 sha256。</p>
           <p>
-            <a class="btn btn-primary" href="https://github.com/erikwang2013/oss/releases/tag/v1.32.3" target="_blank" rel="noopener">打开 v1.32.3 Release</a>
-            <a class="btn btn-ghost" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.32.3.tar.gz" target="_blank" rel="noopener">下载源码包</a>
+            <a class="btn btn-primary" href="https://github.com/erikwang2013/oss/releases/tag/v1.32.4" target="_blank" rel="noopener">打开 v1.32.4 Release</a>
+            <a class="btn btn-ghost" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.32.4.tar.gz" target="_blank" rel="noopener">下载源码包</a>
             <a class="btn btn-ghost" href="changelog.html">版本日志</a>
           </p>
         </article>
@@ -225,7 +225,7 @@ ca_cert = "/etc/oss/ca.crt"</code></pre>
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.32.3</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.32.4</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
