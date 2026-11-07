@@ -69,3 +69,8 @@ rustls-pemfile = "2"
 rustls-native-certs = "0.8"
 # mesh gRPC 双端 TLS（xl-client 服务端/客户端，oss-server 构造配置）。
 tonic = { version = "0.12", features = ["tls", "tls-native-roots"] }
+
+[patch.crates-io]
+# see vendor/README.md: advisory fixes without API/format changes
+ecat-metrics = { path = "vendor/ecat-metrics" }
+reed-solomon-erasure = { path = "vendor/reed-solomon-erasure" }

@@ -1,6 +1,6 @@
 # Object control store — final no-database gate record
 
-Status: **PASS (H1/H2 executed 2026-11-07; re-run for v1.32.1)**.
+Status: **PASS (H1/H2 executed 2026-11-07; re-run for v1.32.1 and v1.32.2)**.
 
 v1.32.0 shipped with the SQLite backend still selected by default, so a config without
 `[server].control_backend` panicked at startup. v1.32.1 makes `objects` the only accepted
@@ -32,7 +32,7 @@ uses the archived v1.31.0 binary (`oss-server-v1.31.0-linux-x86_64`, sha256
 | 4 | Golden parity | A8 goldens byte-identical versus the last-SQLite commit; F1/F3 snapshot export/install parity tests green | **PASS** |
 | 5 | Concurrency | E2/F1 conflict, fence and `Indeterminate` suites green | **PASS** |
 | 6 | Performance budgets | Release build, `fsync=true`, SATA SSD: 1 writer p99 9.2 ms; 8 writers median p99 12.7 ms (17.96/62.3/12.67/10.95/12.03 per round), 929–1466 commits/s; fresh-root startup 144–208 ms; snapshot import 8.3 s, export 1.5 s | **PASS** (single-writer and median multi-writer meet ≤20 ms; a loaded mechanical drive produced >20 ms tail spikes, so no any-load p99 claim) |
-| 7 | Security and operability | `.oss.sys` remains S3-invisible; cutover runbook written; v1.31 pre-removal binary archived and checksummed; fresh/migrated smoke and kill9 covered by the strict gate; `cargo audit --no-fetch` reviewed (1 advisory + 3 warnings, all in transitive deps with no reachable untrusted input; see below) | **PASS** (post-removal cutover was rehearsed on pre-H1 G3; the final binary cannot run the legacy migrator by design) |
+| 7 | Security and operability | `.oss.sys` remains S3-invisible; cutover runbook written; v1.31 pre-removal binary archived and checksummed; fresh/migrated smoke and kill9 covered by the strict gate; `cargo audit --no-fetch` exits 0 (protobuf/lru/instant fixed via `vendor/`; only the unmaintained `rustls-pemfile` warning remains; see below) | **PASS** (post-removal cutover was rehearsed on pre-H1 G3; the final binary cannot run the legacy migrator by design) |
 
 ## Acceptance matrix (design §9)
 
@@ -85,21 +85,37 @@ throughput exceeds ≥200/s. The HDD tail spikes come from host I/O contention, 
 code regression; this record does not claim any-load p99. The old debug-build 0.64 s number
 is superseded.
 
+### v1.32.2 re-run (2026-11-07)
+
+Dependency advisories were removed with the vendored path crates described below; only the
+unmaintained `rustls-pemfile` warning remains, and `cargo audit --no-fetch` exits 0. Re-run on
+the patched tree: strict e2e `PASS=115 FAIL=0 SKIP=0`; workspace `1405/0/3`; clippy `-D warnings`
+and fmt clean; guard PASS; A8 goldens unchanged. EC round-trip/repair tests and `/metrics`
+observability tests were run first and are green.
+
 ### Dependency audit (2026-11-07)
 
-`cargo audit --no-fetch`: no direct dependency changes; 1 vulnerability and 3 warnings remain
-in transitive crates:
+`cargo audit --no-fetch`: **exit 0**, one allowed warning. The two advisory
+findings that were reachable through the dependency graph are fixed by patched
+path crates in `vendor/` (wired through `[patch.crates-io]`; see
+`vendor/README.md`):
 
-- `protobuf 2.28.0` (RUSTSEC-2024-0437) via `prometheus 0.13.4` → `ecat-metrics` →
-  `ecat-transport-http`. The process only encodes Prometheus text; it never parses untrusted
-  protobuf. No current ecat release removes it: ecat 9.0.0 still uses ecat-metrics 9.0.0 →
-  prometheus 0.13.4 → protobuf 2.28.0. Removal needs upstream ecat-metrics to move to
-  prometheus 0.14 (protobuf 3.7.2) or a vendored patch, both out of scope for a patch release.
-- `lru 0.7.8` (RUSTSEC-2026-0253) via `reed-solomon-erasure 6.0.0`. The affected `pop()` path
-  stores integer-vector keys whose `Drop` cannot panic, so the UAF precondition is unreachable;
-  replacing the erasure-code implementation would risk on-disk encoding compatibility.
-- `instant` and `rustls-pemfile` are unmaintained warnings with no known vulnerability; both
-  are pulled by `reed-solomon-erasure` / `tonic` respectively.
+- `protobuf 2.28.0` (RUSTSEC-2024-0437) is gone. `ecat-metrics 7.0.0` is
+  vendored with `prometheus` `default-features = false`; the metrics surface
+  only uses `Registry`/`TextEncoder`, so no protobuf encoder is linked.
+- `lru 0.7.8` (RUSTSEC-2026-0253) is gone. `reed-solomon-erasure 6.0.0` is
+  vendored with `lru 0.18.5` and `parking_lot 0.12`; only
+  `LruCache::new(NonZeroUsize)` changed. The cache is not part of the encoded
+  format and the coding math is untouched.
+- `instant 0.1.13` (RUSTSEC-2024-0384) is gone with `parking_lot 0.11`.
+- `rustls-pemfile 2.2.0` (RUSTSEC-2025-0134, unmaintained, no patched version)
+  remains through `ecat-transport-http` and `tonic`; inputs are operator-owned
+  PEM files, not untrusted data. Accepted until upstream migrates to
+  `rustls-pki-types`.
+
+Verification: `cargo tree -i protobuf` / `-i instant` no package, `lru` at
+0.18.5, `cargo audit` exit 0; workspace tests, clippy/fmt, strict no-db e2e and
+A8 goldens re-run after the patches.
 
 ### Resolved since the first run (2026-11-06)
 

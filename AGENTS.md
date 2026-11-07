@@ -37,4 +37,4 @@ cargo test --workspace
 - 依赖版本锁在 workspace `Cargo.toml`；axum 必须全仓唯一 0.8.x（ecat 与 aetherupload 都锚定它）
 - **升级须整栈同版本**（分片 RPC 带分块字段）：不要滚动升级，先停后换或整栈重建
 - e2e：`tests/e2e_s3.sh`（需 aws-cli + rclone；`E2E_LONG=1` 门控长跑）、
-  `tests/e2e_m3_cluster.sh`（4 节点集群 + 混沌段）
+  `tests/e2e_no_db.sh`（strict no-db 门禁：standalone/site/Raft/witness）
