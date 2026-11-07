@@ -1,6 +1,6 @@
 [package]
 name = "xl-proto"
-version = "1.32.2"
+version = "1.32.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
