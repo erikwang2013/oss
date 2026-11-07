@@ -377,112 +377,6 @@ impl AppState {
                 Arc::clone(&ap_cache),
                 Arc::clone(&olap_cache),
             ));
-        // M3 集群（配了 [cluster] 才走）：静态拓扑 + 节点间传输注入存储内核。
-        // 单节点（None）行为与 v1.4.0 逐字节一致；拓扑与盘数的硬校验在
-        // ClusterTopology::new 与 Store::open（self 一致性）。
-        if let Some(cl) = cfg.cluster.as_ref() {
-            let sets_nodes = crate::config::sets_nodes_by_set(&cl.nodes)?;
-            // 拓扑 v3：显式槽表（epoch + [[cluster.slots]]）；未配置 = positional（旧行为）。
-            let slot_maps = cl.slot_maps(sets_nodes.len())?;
-            let sets = xl_store::store::ClusterSets::with_slot_maps(
-                &cl.node_id,
-                sets_nodes,
-                slot_maps,
-                &store_cfg.ec,
-            )?;
-            // 路由表用 flat 去重节点集（同 id 多 set 各出一条时不得重复注册）
-            let pairs: Vec<(String, String)> = sets
-                .flat
-                .nodes
-                .iter()
-                .map(|n| (n.id.clone(), n.addr.clone()))
-                .collect();
-            // 放置开关：只认 None/"v1"/"v2"——未知值 fail-closed（静默降级为 v1 会让
-            // 「以为开了 v2」的运维在 rebalance 里得到空跑报告）
-            let placement_v2 = match cl.placement.as_deref() {
-                None | Some("v1") => false,
-                Some("v2") => true,
-                Some(other) => {
-                    return Err(format!("cluster.placement 非法值 «{other}»（只认 v1/v2）").into());
-                }
-            };
-            // DP-0/DP-1：生产传输统一包数据面闸门（混版 RPC 在发出前按操作类判定；
-            // health/锁/控制面直通，保证诊断与鉴权不被连带阻断）。本机能力参与
-            // placement v2 的指纹一致性判定，必须与 Store::local_caps 同源。
-            let local = xl_store::mesh_gate::local_caps(
-                &sets,
-                &store_cfg.ec,
-                if placement_v2 { 2 } else { 1 },
-            );
-            let mesh: Arc<dyn xl_store::mesh::MeshTransport> =
-                Arc::new(xl_store::mesh_gate::GatedMesh::with_local(
-                    Arc::new(xl_client::TonicMesh::new_with_tls_watch(
-                        &cl.node_id,
-                        &cl.secret,
-                        &pairs,
-                        tls.peer_tls().then(|| tls.tonic_client_watch()),
-                    )?),
-                    local,
-                    xl_store::mesh_gate::DEFAULT_TTL,
-                ));
-            store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
-                sets,
-                transport: mesh,
-                placement_v2,
-                resolver: None,
-                stretch: false,
-            }));
-        } else if let Some(st) = cfg.stretch.as_ref() {
-            // M9 S4：2×6 stretch——拓扑由 `new_stretch` 规范排序（两端同槽序），
-            // placement v2 固定、单 set 无需 SetResolver；数据面复用 TonicMesh。
-            let self_addr =
-                crate::config::normalize_http_addr(&st.self_addr, "[stretch].self_addr")?;
-            let peer_addr =
-                crate::config::normalize_http_addr(&st.peer_addr, "[stretch].peer_addr")?;
-            let nodes = vec![
-                xl_store::store::NodeSpec {
-                    id: st.node_id.clone(),
-                    addr: self_addr,
-                    drive_count: 6,
-                },
-                xl_store::store::NodeSpec {
-                    id: st.peer_node_id.clone(),
-                    addr: peer_addr,
-                    drive_count: st.peer_drives,
-                },
-            ];
-            let sets =
-                xl_store::store::ClusterSets::new_stretch(&st.node_id, nodes, &store_cfg.ec)?;
-            let pairs: Vec<(String, String)> = sets
-                .flat
-                .nodes
-                .iter()
-                .map(|n| (n.id.clone(), n.addr.clone()))
-                .collect();
-            // DP-0/DP-1：同 cluster 分支——stretch 是 placement v2，必须过混版闸门；
-            // 本机能力参与指纹判定。
-            let local = xl_store::mesh_gate::local_caps(&sets, &store_cfg.ec, 2);
-            let mesh: Arc<dyn xl_store::mesh::MeshTransport> =
-                Arc::new(xl_store::mesh_gate::GatedMesh::with_local(
-                    Arc::new(xl_client::TonicMesh::new_with_timeouts_tls_watch(
-                        &st.node_id,
-                        &st.mesh_secret,
-                        &pairs,
-                        std::time::Duration::from_secs(1),
-                        std::time::Duration::from_millis(st.mesh_timeout_ms),
-                        tls.peer_tls().then(|| tls.tonic_client_watch()),
-                    )?),
-                    local,
-                    xl_store::mesh_gate::DEFAULT_TTL,
-                ));
-            store_cfg.cluster = Some(Arc::new(xl_store::store::ClusterConfig {
-                sets,
-                transport: mesh,
-                placement_v2: true,
-                resolver: None,
-                stretch: true,
-            }));
-        }
         let store = Arc::new(Store::open(store_cfg).await?);
         // B4：对象后端的控制根必须在任何控制面读（new_with 的 site/AP/OLAP 预加载）
         // 之前装配完成；启动锁守卫随 `ObjectControl` 存活到进程结束。
@@ -611,11 +505,6 @@ impl AppState {
         // 或删桶副作用失败留下的 row/dir 不一致在此修复；只读行、不追加日志。
         if raft.is_some() {
             match db.list_bucket_rows().await {
-                // 未配对 stretch（本地无行）：不隔离盘上目录，否则会把对端站点拥有的桶
-                // 目录当孤儿搬走。普通 Raft 空站点仍对账（清理真正孤儿）。
-                Ok(rows) if rows.is_empty() && cfg.stretch.is_some() => {
-                    tracing::info!("stretch 启动对账跳过：本地无桶行（未配对站点）")
-                }
                 Ok(rows) => store.reconcile_bucket_dirs(&rows).await,
                 Err(e) => tracing::warn!(error = %e, "Raft 启动对账：列举桶行失败（跳过本轮）"),
             }
@@ -899,8 +788,6 @@ impl AppState {
         );
         let repl_sink = Arc::new(
             crate::replication::SqlReplSink::new(Arc::clone(&db), Arc::clone(&store))
-                // M9 S4：stretch 关闭 M7 异步站点对象复制（EC 双站点数据面已承担）。
-                .with_site_data_replication(cfg.stretch.is_none())
                 // 4.19：仅配置 site_token 的远端具备同源 id（版本删除可定点）。
                 .with_versioned_remotes(
                     cfg.remotes

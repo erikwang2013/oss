@@ -186,10 +186,6 @@ async fn send_inner(
     Ok((status, Bytes::from(out)))
 }
 
-pub async fn get_identity(endpoint: &str, token: &str) -> Result<PeerIdentity, String> {
-    get_identity_tls(endpoint, token, None).await
-}
-
 pub async fn get_identity_tls(
     endpoint: &str,
     token: &str,
@@ -203,14 +199,6 @@ pub async fn get_identity_tls(
             IdentityError::Transport(m) => format!("对端 identity 连接失败：{m}"),
             IdentityError::Decode(m) => format!("identity 解析失败：{m}"),
         })
-}
-
-/// S7.4：配对需要区分 403（错站点令牌）与传输/解码错误。
-pub async fn get_identity_typed(
-    endpoint: &str,
-    token: &str,
-) -> Result<PeerIdentity, IdentityError> {
-    get_identity_typed_tls(endpoint, token, None).await
 }
 
 pub async fn get_identity_typed_tls(
@@ -325,10 +313,6 @@ pub struct RaftPeerStatus {
 /// 成员/配对预检必须有界：旧节点或坏节点不能把成员变更挂住。
 const STATUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-pub async fn get_raft_status(endpoint: &str, token: &str) -> Result<RaftPeerStatus, String> {
-    get_raft_status_tls(endpoint, token, None).await
-}
-
 pub async fn get_raft_status_tls(
     endpoint: &str,
     token: &str,
@@ -382,15 +366,6 @@ pub async fn get_raft_status_tls(
         ext_types: s.ext_types,
         applied_index: s.applied.map(|l| l.index),
     })
-}
-
-/// changelog 出货（切片 1b）：返回 (status, body)。
-pub async fn post_changelog(
-    endpoint: &str,
-    token: &str,
-    body: Bytes,
-) -> Result<(u16, Bytes), String> {
-    post_changelog_tls(endpoint, token, body, None).await
 }
 
 pub async fn post_changelog_tls(

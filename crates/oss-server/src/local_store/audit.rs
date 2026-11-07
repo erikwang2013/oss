@@ -51,12 +51,6 @@ impl AuditLog {
         })
     }
 
-    /// Disables fsync-per-batch (still flushes to the OS on every batch).
-    pub fn without_fsync(mut self) -> Self {
-        self.fsync = false;
-        self
-    }
-
     /// Appends one record to the file for UTC day `ts / 86400`.
     pub fn append(&self, ts: i64, data: &[u8]) -> Result<()> {
         if ts < 0 {

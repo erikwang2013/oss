@@ -4064,26 +4064,10 @@ fn site_json(state: &AppState, with_token: bool) -> serde_json::Value {
         "capabilities": {
             "raft": crate::raft::RAFT_READY && state.cfg.raft.is_some(),
             "sync": crate::raft::SYNC_READY && state.cfg.raft.is_some(),
-            "stretch": crate::raft::STRETCH_READY && state.cfg.stretch.is_some(),
+            "stretch": false,
         },
     });
     // S4/S7 共用形状；fingerprint 只暴露 SHA-256，不回传 secret。
-    if let Some(s) = &state.cfg.stretch {
-        v["stretch"] = serde_json::json!({
-            "node_id": s.node_id,
-            "self_addr": s.self_addr,
-            "peer_node_id": s.peer_node_id,
-            "peer_addr": s.peer_addr,
-            // 本端实盘数；对端声明值不可信（B2）。
-            "drive_count": state.cfg.data_dirs.as_ref().map_or(1, |d| d.len()),
-            "ec": { "data": state.cfg.ec.data, "parity": state.cfg.ec.parity },
-            "placement": s.placement,
-            "mesh_secret_fingerprint": hex::encode({
-                use sha2::Digest as _;
-                sha2::Sha256::digest(s.mesh_secret.as_bytes())
-            }),
-        });
-    }
     if with_token {
         v["site_token"] = serde_json::Value::String(state.site.token.clone());
     }

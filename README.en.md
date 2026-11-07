@@ -106,10 +106,10 @@ Single node (oss-server + console nginx):
 docker compose up --build        # console http://localhost:8080 · S3/API http://localhost:9000
 ```
 
-> **v1.32.0 removes the static `[cluster]`/`[stretch]` topology.** `docker-compose.cluster.yml` and `docker/cluster/n{1..4}/oss.toml` are retained only as historical examples; they are not a supported deployment. Multi-site/Raft deployments use `[site]` + `[raft]` (object control root + `<raft.db_path>.d/`); see the installation docs and the cutover runbook.
+> **v1.32.0 removes the static `[cluster]`/`[stretch]` topology.** The old `docker-compose.cluster.yml` and `docker/cluster/n{1..4}/oss.toml` examples are deleted (the new binary rejects those configs). Multi-site/Raft deployments use `[site]` + `[raft]` (object control root + `<raft.db_path>.d/`); see the installation docs and the cutover runbook.
 
-- Config: single node `docker/oss.toml`; `docker/cluster/n{1..4}/oss.toml` is marked retired and kept for reference only.
-- If `jwt_secret` / `[site].token` / `[raft].cluster_token` / the admin password are unset, they are generated on first start and written to `./docker/secrets/generated.env` (mode **0600**, owner `oss`, directory 0700); rotate by deleting that file and restarting. Read it with `docker compose exec oss cat /secrets/generated.env` (cluster: `docker compose -f docker-compose.cluster.yml exec n1 cat /secrets/generated.env`), or `sudo cat docker/secrets/generated.env` on the host.
+- Config: single node `docker/oss.toml`.
+- If `jwt_secret` / `[site].token` / `[raft].cluster_token` / the admin password are unset, they are generated on first start and written to `./docker/secrets/generated.env` (mode **0600**, owner `oss`, directory 0700); rotate by deleting that file and restarting. Read it with `docker compose exec oss cat /secrets/generated.env`, or `sudo cat docker/secrets/generated.env` on the host.
 - Published ports bind `127.0.0.1` by default (9000 S3/API, 8080 console). To expose externally, remove the `127.0.0.1:` prefix from the compose port mapping and add TLS/reverse proxy plus access control yourself; inter-container traffic still uses the `oss:9000` service name and is unaffected.
 - The console image still runs `nginx:alpine` with its default root master process on :80; making it non-root requires a non-privileged base image/port and matching compose/healthcheck changes (not done here).
 - Data/staging live in named volumes (cleared only by `docker compose down -v`); each cluster node has its own volume.

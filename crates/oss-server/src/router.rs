@@ -144,8 +144,7 @@ pub fn build_router_with_trust(
     // 对象后端 standalone 没有 SQLite 账本表：QuotaBackend 直接读/写根账本，
     // 此时不能再注入 `ControlPlane`（其 Local apply 走占位库）。对象 + raft 仍走
     // 复制命令（账本经对象状态机 apply）。
-    let object_standalone = state.db.control_backend() == crate::config::ControlBackend::Objects
-        && !state.control.is_raft();
+    let object_standalone = !state.control.is_raft();
     let cluster_quota = (state.cfg.quota.strict && !object_standalone)
         .then(|| Arc::clone(&state.control) as Arc<dyn xl_s3::account_quota::ClusterQuota>);
     let oss_s3 = OssS3::new(
@@ -169,12 +168,7 @@ pub fn build_router_with_trust(
     // M9 S3（I3）：S3 面的 sync 建桶要求 SYNC_READY + RAFT_READY + [raft]（与 console 同口径）。
     // “恰好 1 个数据 peer”是运行期 DB 条件（sites 行会变），在建桶入口按请求校验：
     // service.rs 的 site_peer_count / console 的 list_sites。
-    .with_sync_ready(
-        crate::raft::SYNC_READY
-            && crate::raft::RAFT_READY
-            && state.cfg.stretch.is_none()
-            && state.cfg.raft.is_some(),
-    )
+    .with_sync_ready(crate::raft::SYNC_READY && crate::raft::RAFT_READY && state.cfg.raft.is_some())
     // M9：sync 摄入 token 校验（无 [site] = None → 一律 403）
     .with_site_token(state.site_enabled.then(|| state.site.token.clone()))
     // M9 S3：S3/lifecycle/batch/console 删除统一走远端优先服务。
@@ -310,7 +304,7 @@ pub fn build_router_with_trust(
                 handle,
                 token,
                 state.cfg.site.is_some(),
-                state.cfg.stretch.is_some(),
+                false,
             ))
         }
         None => app,
@@ -713,10 +707,9 @@ fn forwarded_ip(
 
 async fn raft_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let mut v = state.control.status_json(state.cfg.raft.is_some());
-    // 与 /api/v1/site 同口径：stretch 能力要求实际配置了 [stretch]，而非仅有 [raft]。
+    // v1.32: [stretch] is rejected at startup; the capability is always off.
     if let Some(caps) = v.get_mut("capabilities") {
-        caps["stretch"] =
-            serde_json::json!(crate::raft::STRETCH_READY && state.cfg.stretch.is_some());
+        caps["stretch"] = serde_json::json!(false);
     }
     Json(v)
 }
@@ -956,12 +949,8 @@ async fn metrics(State(state): State<AppState>) -> impl axum::response::IntoResp
         "# HELP oss_slot_count 全局槽位数（单机 = 本机盘数）\n# TYPE oss_slot_count gauge\n",
     );
     out.push_str(&format!("oss_slot_count {slot_count}\n"));
-    // stretch 数据面信号：未配置 [stretch] 时为 0（本机可达槽数此时无 stretch 语义）。
-    let stretch_slots_ok = if state.cfg.stretch.is_some() {
-        local.slots.iter().filter(|(_, up)| *up).count()
-    } else {
-        0
-    };
+    // v1.32: [stretch] is rejected at startup; this signal is always 0.
+    let stretch_slots_ok = 0;
     out.push_str(
         "# HELP oss_stretch_slots_ok 本机可达盘/槽数（stretch 数据面信号；未配置 [stretch] = 0）\n\
          # TYPE oss_stretch_slots_ok gauge\n",

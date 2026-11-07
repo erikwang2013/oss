@@ -19,7 +19,7 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "1"
       RUST_BACKTRACE: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: 检测 workspace 是否就绪
         id: detect
         run: echo "ready=$([ -f Cargo.toml ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
@@ -47,18 +47,18 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: No-database guard
         run: scripts/check_no_db.sh
 
   web:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: 检测 web 是否就绪
         id: detect
         run: echo "ready=$([ -f web/package.json ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: steps.detect.outputs.ready == 'true'
         with:
           node-version: 22

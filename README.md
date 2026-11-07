@@ -135,14 +135,12 @@ curl -s -X POST localhost:9000/api/v1/access-keys -H "authorization: Bearer $TOK
 docker compose up --build        # 控制台 http://localhost:8080 · S3/API http://localhost:9000
 ```
 
-> **v1.32.0 移除静态 `[cluster]`/`[stretch]` 拓扑。** `docker-compose.cluster.yml` 与 `docker/cluster/n{1..4}/oss.toml` 仅作为历史示例保留，不再构成受支持的部署；多站点/Raft 部署使用 `[site]` + `[raft]`（对象控制根 + `<raft.db_path>.d/`），见安装文档与割接 runbook。
+> **v1.32.0 移除静态 `[cluster]`/`[stretch]` 拓扑。** 旧的 `docker-compose.cluster.yml` 与 `docker/cluster/n{1..4}/oss.toml` 示例已删除（其配置会被新版本拒绝）；多站点/Raft 部署使用 `[site]` + `[raft]`（对象控制根 + `<raft.db_path>.d/`），见安装文档与割接 runbook。
 
-- 配置：单机 `docker/oss.toml`；`docker/cluster/n{1..4}/oss.toml` 已标记退役，仅归档参考。
+- 配置：单机 `docker/oss.toml`。
 - `jwt_secret` / `[site].token` / `[raft].cluster_token` / 管理员口令未填时首次启动自动生成，落盘
   `./docker/secrets/generated.env`（容器内权限 **0600**、属主 `oss`，目录 0700）；轮换 = 删除
-  该文件重启。查看口令：`docker compose exec oss cat /secrets/generated.env`（集群用
-  `docker compose -f docker-compose.cluster.yml exec n1 cat /secrets/generated.env`）；
-  宿主机上仅 root 可读：`sudo cat docker/secrets/generated.env`。
+  该文件重启。查看口令：`docker compose exec oss cat /secrets/generated.env`；宿主机上仅 root 可读：`sudo cat docker/secrets/generated.env`。
 - 端口默认只绑 `127.0.0.1`（9000 S3/API、8080 控制台）。需要对外暴露时，去掉 compose 端口
   映射里的 `127.0.0.1:` 前缀，并自行加 TLS/反向代理与访问控制；容器间仍按服务名
   `oss:9000` 互通，不受宿主绑定影响。

@@ -350,11 +350,6 @@ fn list_key_versions(dir: &Path) -> Result<Vec<u32>> {
 }
 
 impl KmsFileProvider {
-    /// 默认目录：`<data_root>/.oss.sys/kms/`（env `OSS_KMS_DIR` 的接线同模块头注口径）。
-    pub fn default_dir(data_root: &Path) -> PathBuf {
-        crate::layout::sys_dir(data_root, "kms")
-    }
-
     /// 目录为空（**真**空）→ 生成 `key-0`（首启）；否则当前钥 = 最大编号。幂等。
     /// `cmk/` 子目录不参与默认环扫描，但**逐个校验**（见 [`Self::validate_cmk_root`]）：
     /// 命名 CMK 绝不在读路径自动生成，损坏/异名目录一律拒启（fail-closed）。

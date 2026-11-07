@@ -475,25 +475,6 @@ pub async fn request_tls(
     request_inner(endpoint, token, op, false, None, tls, feature).await
 }
 
-/// 节点内部转发：带单跳标记，目标若已非 leader 直接 409，不再二次转发。
-pub async fn request_forwarded(
-    endpoint: &str,
-    token: &str,
-    op: &MembershipOp,
-    target: Option<u64>,
-) -> Result<MemberView, MembershipError> {
-    request_inner(
-        endpoint,
-        token,
-        op,
-        true,
-        target,
-        None,
-        crate::raft::compat::MIN_FEATURE_LEVEL,
-    )
-    .await
-}
-
 /// TLS 变体（节点内转发）。
 pub async fn request_forwarded_tls(
     endpoint: &str,

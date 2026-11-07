@@ -155,12 +155,6 @@ pub fn bucket_account_id(owner_id: Option<i64>, owner_is_admin: bool) -> String 
     }
 }
 
-/// `arn:aws:iam::<12位>:root` 是否对应用户 uid（v1：账户 = 用户）。
-/// 匿名/uid=0/越界 uid 恒 false；LEGACY_ACCOUNT 永不匹配任何真实用户。
-pub fn account_arn_matches(arn: &str, uid: i64) -> bool {
-    account_principal_matches(arn, uid, None)
-}
-
 /// 账户 ARN 主体匹配（AC-0/AC-3 的账户根语义）：
 /// - 用户有成员行（`account_id` = Some）→ 账户根 ARN 映射到该账户的**全部成员**；
 /// - 无成员行 → 沿用 uid 派生账户（存量/新用户的 legacy 兼容路径）。
@@ -400,11 +394,6 @@ impl Acl {
             .or_else(|| self.control_provider.as_ref().map(|f| f()))
             .or_else(|| self.control.clone())
             .ok_or_else(|| ControlError::Backend("control view missing".into()))
-    }
-
-    /// 默认构造（无配额/无审计/无写缝）：仅用于测试与显式装配。
-    pub fn default_unwired() -> Self {
-        Self::new()
     }
 
     /// 注入账户硬配额后端（对象后端复制账本）。

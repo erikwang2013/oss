@@ -139,7 +139,6 @@ pub struct SqlReplSink {
     store: Arc<Store>,
     /// M9 S4：stretch 站点关闭 M7 异步**站点**对象复制（数据面已由 EC 双站点承担，
     /// 再复制一份是浪费且单站点本就写不成功）；M6 规则复制不受影响。
-    site_data_replication: bool,
     /// 4.19：显式配置 `site_token` 的远端——版本定向删除只投递给这些目标（同源 id）。
     versioned_remotes: Vec<String>,
 }
@@ -149,17 +148,11 @@ impl SqlReplSink {
         Self {
             db,
             store,
-            site_data_replication: true,
             versioned_remotes: Vec::new(),
         }
     }
 
     /// M9 S4：`[stretch]` 传 false——`enqueue_sites` 整体短路（不写 `target_kind='site'` 行）。
-    pub fn with_site_data_replication(mut self, on: bool) -> Self {
-        self.site_data_replication = on;
-        self
-    }
-
     /// 4.19：`[[remotes]]` 中配置了 `site_token` 的远端 id。
     pub fn with_versioned_remotes(mut self, ids: Vec<String>) -> Self {
         self.versioned_remotes = ids;
@@ -335,9 +328,6 @@ impl SqlReplSink {
     /// M7 切片 2a：逐 peer 入队。删除写要求源桶 versioning=Enabled
     /// （Off/Suspended 不入队——记档；marker 带版本，硬删版本列为空）。
     async fn enqueue_sites(&self, info: &WriteInfo<'_>) -> bool {
-        if !self.site_data_replication {
-            return false;
-        }
         // 版本定向删除必须是真实 UUID 版本（站点 PUT 强制同源 id）；
         // "null"/空版本无法在目标定点命中，不跨界（fail-closed）。
         if info.is_version_delete && info.version_id.is_none_or(|v| v.is_empty() || v == "null") {
@@ -934,15 +924,6 @@ async fn process_repl_once_backend(
         }
     }
     (sent, failed)
-}
-
-/// 单轮处理入口（集成测试与既有调用方共用）。
-pub async fn process_repl_once(
-    db: &crate::db::Db,
-    store: &Store,
-    client: &ReplClient,
-) -> (usize, usize) {
-    process_repl_once_backend(ReplBackend::new(db), store, client).await
 }
 
 // ---------- M7 遗留未映射 REPLICA 的人工对账 ----------

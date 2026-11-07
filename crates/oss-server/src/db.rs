@@ -2219,12 +2219,6 @@ impl Db {
             .await;
     }
 
-    /// 单节点/M7 入口：不带 fencing token（见 [`Self::delete_restore_fenced`]）。
-    pub async fn delete_restore(&self, bucket: &str, key: &str, version_id: &str) -> Result<()> {
-        self.delete_restore_fenced(bucket, key, version_id, FencingEpoch::UNFENCED)
-            .await
-    }
-
     /// M8-1：行已被更高 term 接管（`fence_term > token.term`）→ 不删除（留给新 leader）。
     pub async fn delete_restore_fenced(
         &self,

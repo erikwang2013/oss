@@ -22,7 +22,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=build /oss-server-bin /usr/local/bin/oss-server
 COPY docker/entrypoint.sh /usr/local/bin/oss-entrypoint
-# 默认单机配置（compose 可只读挂载覆盖：docker/oss.toml 或 docker/cluster/n*/oss.toml）
+# 默认单机配置（compose 可只读挂载覆盖 docker/oss.toml）
 COPY docker/oss.toml /app/oss.toml
 RUN chmod +x /usr/local/bin/oss-entrypoint \
     && mkdir -p /data /staging && chown -R oss:oss /data /staging /app

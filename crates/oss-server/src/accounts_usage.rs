@@ -17,8 +17,7 @@ use xl_store::store::ListRequest;
 use std::time::Duration;
 
 use crate::accounts_support::{bad, require_member};
-use crate::console::{control_write_status, forbidden, internal_error, who};
-use crate::raft::ControlCommand;
+use crate::console::{forbidden, internal_error, who};
 use crate::state::AppState;
 
 /// 硬配额用量采样间隔：跨节点缓存的最大陈旧度（另有写入路径 30s 惰性刷新兜底）。
@@ -178,42 +177,23 @@ pub(crate) async fn set_hard_quota(
         return bad("object_quota 必须 >= 0 或 null");
     };
     // 对象后端：账户行写入走根 CAS（ControlPlane::Local 的 SQLite apply 不适用）。
-    if state.db.control_backend() == crate::config::ControlBackend::Objects {
-        let id_owned = id.clone();
-        let r = state
-            .db
-            .control_write("console", move |txn| {
-                let id = id_owned.clone();
-                Box::pin(async move {
-                    txn.account_set_hard_limits(
-                        &id,
-                        hard_byte_quota,
-                        object_quota,
-                        crate::db::now(),
-                    )
+    let id_owned = id.clone();
+    let r = state
+        .db
+        .control_write("console", move |txn| {
+            let id = id_owned.clone();
+            Box::pin(async move {
+                txn.account_set_hard_limits(&id, hard_byte_quota, object_quota, crate::db::now())
                     .await
-                })
             })
-            .await;
-        return match r {
-            Ok(true) => StatusCode::NO_CONTENT.into_response(),
-            Ok(false) => StatusCode::NOT_FOUND.into_response(),
-            Err(e) => {
-                tracing::error!(error = %e, "硬配额更新失败");
-                internal_error()
-            }
-        };
+        })
+        .await;
+    match r {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "硬配额更新失败");
+            internal_error()
+        }
     }
-    control_write_status(
-        state
-            .control
-            .write(ControlCommand::AccountHardQuotaSet {
-                id,
-                hard_byte_quota,
-                object_quota,
-                updated_at: crate::db::now(),
-            })
-            .await,
-        "硬配额更新冲突",
-    )
 }

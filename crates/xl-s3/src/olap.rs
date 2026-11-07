@@ -213,11 +213,6 @@ pub async fn acquire_transform_slot() -> Result<tokio::sync::SemaphorePermit<'st
         .map_err(|_| "transform gate closed".to_string())
 }
 
-/// 当前空闲槽数（诊断/测试用）。
-pub fn available_transform_slots() -> usize {
-    transform_gate().available_permits()
-}
-
 impl OlapTransform {
     /// 预加载失败占位（GET 500，而不是静默返回未变换内容）。
     pub fn broken(reason: String) -> Self {

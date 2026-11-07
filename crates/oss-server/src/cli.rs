@@ -672,32 +672,6 @@ impl crate::jobs::TaskExecutor for ServeTaskExecutor {
     }
 }
 
-/// M3/M9：`host:port`（可带 `http://` 前缀）→ 可绑定地址，并做绑定期检（失败即启动失败，
-/// 不假活）。地址支持主机名（docker compose 服务名 / DNS 名）：先按 IP:port 解析，
-/// 失败走一次解析取首个结果。
-async fn bind_addr(
-    raw: &str,
-    what: &str,
-) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
-    let raw = raw
-        .strip_prefix("http://")
-        .or_else(|| raw.strip_prefix("https://"))
-        .unwrap_or(raw);
-    let addr: std::net::SocketAddr = match raw.parse() {
-        Ok(a) => a,
-        Err(_) => tokio::net::lookup_host(raw)
-            .await
-            .map_err(|e| format!("{what} 地址解析失败（{raw}）: {e}"))?
-            .next()
-            .ok_or_else(|| format!("{what} 地址无解析结果（{raw}）"))?,
-    };
-    let probe = tokio::net::TcpListener::bind(addr)
-        .await
-        .map_err(|e| format!("{what} 监听 {addr} 绑定失败: {e}"))?;
-    drop(probe);
-    Ok(addr)
-}
-
 /// 跑一条命令，返回进程退出码（0 成功 / 1 失败 / serve 正常退出为 0）。
 pub async fn run(
     cmd: Command,
@@ -741,98 +715,6 @@ pub async fn run(
                 && let Some(rx) = q.take_rx()
             {
                 crate::audit_queue::spawn_worker(state.db.clone(), rx);
-            }
-
-            // M3 集群：起节点间 gRPC（独立端口）。绑定期检同 HTTP——失败即退出，不假活。
-            if let Some(cl) = state.cfg.cluster.as_ref() {
-                let self_node = cl
-                    .nodes
-                    .iter()
-                    .find(|n| n.id == cl.node_id)
-                    .ok_or_else(|| format!("cluster.node_id «{}» 不在节点表内", cl.node_id))?;
-                // 对端拨号仍用配置原串（tonic 自带 DNS）。
-                let addr = bind_addr(&self_node.addr, "cluster 节点").await?;
-
-                // 启动探活（防错接线）：可达且 node_id 不符 → 拒启；不可达只 warn——
-                // 滚动启动时对端可能尚未就绪，RPC 时由 health 面持续暴露。
-                if let Some(c) = state.store.cluster() {
-                    for n in &cl.nodes {
-                        if n.id == cl.node_id {
-                            continue;
-                        }
-                        match tokio::time::timeout(
-                            Duration::from_millis(800),
-                            c.transport.health(&n.id),
-                        )
-                        .await
-                        {
-                            Ok(Ok(h)) if h.node_id == n.id => {}
-                            Ok(Ok(h)) => {
-                                return Err(format!(
-                                    "对端 {} 实报 node_id «{}»（错接线？）",
-                                    n.id, h.node_id
-                                )
-                                .into());
-                            }
-                            Ok(Err(e)) => {
-                                tracing::warn!(node = %n.id, error = %e, "启动探活失败（滚动启动时正常）")
-                            }
-                            Err(_) => {
-                                tracing::warn!(node = %n.id, "启动探活超时（滚动启动时正常）")
-                            }
-                        }
-                    }
-                }
-
-                let store = Arc::clone(&state.store);
-                let secret = cl.secret.clone();
-                // 入站 TLS 每连接热加载（明文部署不订阅，行为不变）。
-                let tls = state.tls.peer_tls().then(|| state.tls.mesh_server_watch());
-                tokio::spawn(async move {
-                    if let Err(e) = xl_client::serve_tls_watch(store, addr, secret, tls).await {
-                        // 进程不随 gRPC 退（HTTP 面继续）：对端会将其标 down、quorum 收窄；
-                        // 监督/自动重启归 M4 运维面。
-                        tracing::error!(error = %e, "mesh gRPC server 退出");
-                    }
-                });
-            }
-
-            // M9 S4：stretch 的 mesh gRPC 独立监听 `self_addr`（与主 HTTP/Raft 端口分离），
-            // 与 [cluster] 互斥不会双起；secret 走 `x-oss-cluster-token` 拦截器。
-            if let Some(st) = state.cfg.stretch.as_ref() {
-                let addr = bind_addr(&st.self_addr, "[stretch].self_addr").await?;
-                // 启动探活（防错接线）：可达且 node_id 不符 → 拒启；不可达只 warn。
-                if let Some(c) = state.store.cluster() {
-                    match tokio::time::timeout(
-                        Duration::from_millis(800),
-                        c.transport.health(&st.peer_node_id),
-                    )
-                    .await
-                    {
-                        Ok(Ok(h)) if h.node_id == st.peer_node_id => {}
-                        Ok(Ok(h)) => {
-                            return Err(format!(
-                                "stretch 对端 {} 实报 node_id «{}»（错接线？）",
-                                st.peer_node_id, h.node_id
-                            )
-                            .into());
-                        }
-                        Ok(Err(e)) => {
-                            tracing::warn!(node = %st.peer_node_id, error = %e, "stretch 启动探活失败（滚动启动时正常）")
-                        }
-                        Err(_) => {
-                            tracing::warn!(node = %st.peer_node_id, "stretch 启动探活超时（滚动启动时正常）")
-                        }
-                    }
-                }
-                let store = Arc::clone(&state.store);
-                let secret = st.mesh_secret.clone();
-                let tls = state.tls.peer_tls().then(|| state.tls.mesh_server_watch());
-                tokio::spawn(async move {
-                    if let Err(e) = xl_client::serve_tls_watch(store, addr, secret, tls).await {
-                        tracing::error!(error = %e, "stretch mesh gRPC server 退出");
-                    }
-                });
             }
 
             // M3 shrink：maintenance 下不启动任何后台 worker/恢复（写路径必须静止）；
