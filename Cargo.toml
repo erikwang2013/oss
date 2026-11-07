@@ -4,7 +4,7 @@ members = ["crates/xl-store", "crates/xl-s3", "crates/oss-server", "crates/xl-pr
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.96"
 license = "Apache-2.0"
 
 [workspace.dependencies]

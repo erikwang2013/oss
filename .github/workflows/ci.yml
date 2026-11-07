@@ -61,7 +61,7 @@ jobs:
       - uses: actions/setup-node@v7
         if: steps.detect.outputs.ready == 'true'
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: web 构建与单测
