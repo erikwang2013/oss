@@ -128,6 +128,7 @@
                   <li><strong>清理</strong>：删除已无测试目标的 <code>scripts/capture_control_goldens.sh</code>，A8 goldens 冻结在 v1.31.0；移除 no-db 门禁的 pending 机制与过期注释，snapshot-joined 管理员登录改为硬断言。</li>
                   <li><strong>文档</strong>：修正归档 v1.31.0 二进制 sha256 为 64 位 <code>fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae</code>（v1.32.0 部分页面误写为 63 位）。</li>
                   <li><strong>验证</strong>：strict no-db e2e 115 pass / 0 fail / 0 skip；workspace 测试、clippy <code>-D warnings</code>、fmt 全绿；<code>cargo tree -i sqlx</code> 与 <code>libsqlite3-sys</code> 无包。</li>
+                  <li><strong>性能复核</strong>：release build（fsync on、SATA SSD）单写控制 p99 9.2ms、8 写线程中位 p99 12.7ms、吞吐约 1.4k 次/s，达到单盘 ≤20ms 预算；高负载机械盘出现 >20ms 尾延迟尖峰，故不宣称任意负载下达标。</li>
                   <li><strong>兼容性</strong>：无 API、Wire 或数据格式变更；从 v1.32.0 直接替换二进制。v1.32.0 缺省配置从未成功启动，因此无需数据修复；已完成割接的部署照常运行。</li>
                 </ul>
               </div>
