@@ -31,7 +31,7 @@ uses the archived v1.31.0 binary (`oss-server-v1.31.0-linux-x86_64`, sha256
 | 3 | Full suite + crash matrix | `cargo test --workspace --locked --no-fail-fast`: 1405 passed / 0 failed / 3 ignored; F1/F3 root-CAS crash suites and e2e kill-9 restarts green | **PASS** (the separate 100-iteration commit-phase loop was not re-run; F1/F3 crash tests and e2e kill9 cover the same boundary) |
 | 4 | Golden parity | A8 goldens byte-identical versus the last-SQLite commit; F1/F3 snapshot export/install parity tests green | **PASS** |
 | 5 | Concurrency | E2/F1 conflict, fence and `Indeterminate` suites green | **PASS** |
-| 6 | Performance budgets | Release build, `fsync=true`, SATA SSD: 1 writer p99 9.2 ms; 8 writers median p99 12.7 ms (17.96/62.3/12.67/10.95/12.03 per round), 929–1466 commits/s; startup 144–208 ms; snapshot import 8.3 s, export 1.5 s | **PASS** (single-writer and median multi-writer meet ≤20 ms; a loaded mechanical drive produced >20 ms tail spikes, so no any-load p99 claim) |
+| 6 | Performance budgets | Release build, `fsync=true`, SATA SSD: 1 writer p99 9.2 ms; 8 writers median p99 12.7 ms (17.96/62.3/12.67/10.95/12.03 per round), 929–1466 commits/s; fresh-root startup 144–208 ms; snapshot import 8.3 s, export 1.5 s | **PASS** (single-writer and median multi-writer meet ≤20 ms; a loaded mechanical drive produced >20 ms tail spikes, so no any-load p99 claim) |
 | 7 | Security and operability | `.oss.sys` remains S3-invisible; cutover runbook written; v1.31 pre-removal binary archived and checksummed; fresh/migrated smoke and kill9 covered by the strict gate; `cargo audit --no-fetch` reviewed (1 advisory + 3 warnings, all in transitive deps with no reachable untrusted input; see below) | **PASS** (post-removal cutover was rehearsed on pre-H1 G3; the final binary cannot run the legacy migrator by design) |
 
 ## Acceptance matrix (design §9)
@@ -135,7 +135,8 @@ Release build, object-only standalone, `fsync=true`, SATA SSD; 500 policy writes
 | Control write throughput | 929–1466 /s | ≥ 200 commits/s | **PASS** |
 | Snapshot import (100k rows) | 8.3 s | ≤ 10 s | within budget |
 | Snapshot export (100k rows) | 1.5 s | ≤ 10 s | within budget |
-| Startup hot-cache load (100k users/AKs/buckets) | 0.14–0.21 s | ≤ 5 s | within budget |
+| Startup, fresh empty root | 0.14–0.21 s | ≤ 5 s | within budget |
+| Startup hot-cache load (100k users/AKs/buckets) | 1.0 s (G3, not re-run) | ≤ 5 s | within budget |
 
 The multi-writer tail is dominated by host I/O contention; the single-writer and median values
 meet the written budget. No budget was weakened to make this table green.
