@@ -90,9 +90,11 @@ is superseded.
 `cargo audit --no-fetch`: no direct dependency changes; 1 vulnerability and 3 warnings remain
 in transitive crates:
 
-- `protobuf 2.28.0` (RUSTSEC-2024-0437) via `prometheus` → `ecat-metrics` → `ecat-transport-http`.
-  The process only encodes Prometheus text; it never parses untrusted protobuf. Upgrading
-  requires the ecat 9 ecosystem, which is out of scope for a patch release.
+- `protobuf 2.28.0` (RUSTSEC-2024-0437) via `prometheus 0.13.4` → `ecat-metrics` →
+  `ecat-transport-http`. The process only encodes Prometheus text; it never parses untrusted
+  protobuf. No current ecat release removes it: ecat 9.0.0 still uses ecat-metrics 9.0.0 →
+  prometheus 0.13.4 → protobuf 2.28.0. Removal needs upstream ecat-metrics to move to
+  prometheus 0.14 (protobuf 3.7.2) or a vendored patch, both out of scope for a patch release.
 - `lru 0.7.8` (RUSTSEC-2026-0253) via `reed-solomon-erasure 6.0.0`. The affected `pop()` path
   stores integer-vector keys whose `Drop` cannot panic, so the UAF precondition is unreachable;
   replacing the erasure-code implementation would risk on-disk encoding compatibility.
