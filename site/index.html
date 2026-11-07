@@ -36,7 +36,7 @@
         "alternateName": "oss",
         "applicationCategory": "DeveloperApplication",
         "operatingSystem": "Linux, macOS, Docker",
-        "softwareVersion": "1.32.1",
+        "softwareVersion": "1.32.2",
         "license": "https://www.apache.org/licenses/LICENSE-2.0",
         "codeRepository": "https://github.com/erikwang2013/oss",
         "downloadUrl": "https://github.com/erikwang2013/oss/releases",
@@ -90,7 +90,7 @@
         <a href="usage.html">使用</a>
         <a href="api.html">API 文档</a>
         <a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.32.1</a>
+        <a href="https://github.com/erikwang2013/oss/releases" target="_blank" rel="noopener">下载 v1.32.2</a>
       </nav>
     </header>
     <div id="top-sentinel" aria-hidden="true"></div>
@@ -130,7 +130,7 @@
           <div><strong>5 个 crate</strong><span>oss-server · xl-s3 · xl-store · xl-client · xl-proto</span></div>
           <div><strong>EC 8+4</strong><span>多盘分片、quorum 写与读时修复</span></div>
           <div><strong>3 voters</strong><span>A/B 数据站点 + C control witness</span></div>
-          <div><strong>v1.32.1 对象控制根（唯一后端）</strong><span>2026-11-07 · 单根 CAS · 文件 Raft · 无 SQLite</span></div>
+          <div><strong>v1.32.2 对象控制根（唯一后端）</strong><span>2026-11-07 · 单根 CAS · 文件 Raft · 无 SQLite</span></div>
         </div>
       </div>
 
@@ -152,7 +152,7 @@
               <div><dt>对外协议</dt><dd>S3 compatible</dd></div>
               <div><dt>实现语言</dt><dd>Rust 2024</dd></div>
               <div><dt>许可证</dt><dd>Apache-2.0</dd></div>
-              <div><dt>当前版本</dt><dd>v1.32.1（最新发布）</dd></div>
+              <div><dt>当前版本</dt><dd>v1.32.2（最新发布）</dd></div>
               <div><dt>最新发布</dt><dd>v1.32.1 修复默认配置启动；对象控制根为唯一后端（2026-11-07）</dd></div>
               <div><dt>部署形态</dt><dd>单盘 / 多盘 EC / 多站点 / 3-voter Raft · 全链路 TLS</dd></div>
               <div><dt>源码</dt><dd><a href="https://github.com/erikwang2013/oss" target="_blank" rel="noopener">github.com/erikwang2013/oss</a></dd></div>
@@ -401,6 +401,11 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
           <div class="release-list">
             <article class="release-row" data-reveal>
               <time datetime="2026-11-07">2026-11-07</time>
+              <div><strong>v1.32.2</strong><p>依赖安全补丁：vendor 修复移除 protobuf 2.28、lru 0.7.8 与 unmaintained instant，<code>cargo audit</code> 退出 0；同时修正站点/贡献者文档中的旧版本与已删除脚本引用。无 API/数据格式变更。</p></div>
+              <a href="changelog.html#v1-32-2">查看</a>
+            </article>
+            <article class="release-row" data-reveal>
+              <time datetime="2026-11-07">2026-11-07</time>
               <div><strong>v1.32.1</strong><p>修复 v1.32.0 缺省配置仍选择已删除 SQLite 后端导致的启动 panic：对象控制根无条件装配，显式 <code>control_backend = "sqlite"</code> 以迁移指引拒绝；清理冻结 goldens 与 no-db 门禁，修正归档 v1.31.0 二进制 sha256。</p></div>
               <a href="changelog.html#v1-32-1">查看</a>
             </article>
@@ -578,12 +583,12 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
         <div class="wrap">
           <div class="download-band" data-reveal>
             <div>
-              <h2>下载 v1.32.1</h2>
+              <h2>下载 v1.32.2</h2>
               <p>Release 提供源码归档，以及用于 v1.32.0 割接的归档二进制 <a href="https://github.com/erikwang2013/oss/releases/download/v1.31.0/oss-server-v1.31.0-linux-x86_64"><code>oss-server-v1.31.0-linux-x86_64</code></a>（sha256 <code>fc2ea96fd0eb1777724da7b9ad07b4ad6520da7373bc9780099d8a211560b1ae</code>）；割接步骤见 <a href="https://github.com/erikwang2013/oss/blob/main/docs/superpowers/runbooks/2026-11-05-object-control-cutover.md">runbook</a>。日常部署仍推荐 Docker Compose 或按安装文档从源码构建。</p>
             </div>
             <div class="download-actions">
-              <a class="btn btn-primary btn-lg" href="https://github.com/erikwang2013/oss/releases/tag/v1.32.1" target="_blank" rel="noopener">打开 Release</a>
-              <a class="btn btn-ghost btn-lg" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.32.1.tar.gz" target="_blank" rel="noopener">源码包</a>
+              <a class="btn btn-primary btn-lg" href="https://github.com/erikwang2013/oss/releases/tag/v1.32.2" target="_blank" rel="noopener">打开 Release</a>
+              <a class="btn btn-ghost btn-lg" href="https://github.com/erikwang2013/oss/archive/refs/tags/v1.32.2.tar.gz" target="_blank" rel="noopener">源码包</a>
               <a class="btn btn-ghost btn-lg" href="install.html">安装文档</a>
             </div>
           </div>
@@ -625,7 +630,7 @@ aws --endpoint-url http://127.0.0.1:9000 s3 rm s3://backup/data.tar</code></pre>
         <div class="footer-brand">
           <img src="assets/img/pet/smile.svg" data-static="assets/img/pet/static/smile.png" width="360" height="400" alt="" decoding="async">
           <p>吞吞（oss）：Rust 编写的 S3 兼容分布式对象存储。把对象吞进桶里，也把一致性守住。</p>
-          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.32.1</p>
+          <p class="footer-meta">Apache-2.0 · Rust 2024 · v1.32.2</p>
         </div>
         <div class="footer-links">
           <h2>文档</h2>
